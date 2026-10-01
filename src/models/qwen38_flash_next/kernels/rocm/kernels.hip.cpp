@@ -6341,6 +6341,10 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
       return LaunchRoutedF16<64>(w, type, x, tiles, n_tiles, pad_bounds,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
+    case 128:
+      return LaunchRoutedF16<128>(w, type, x, tiles, n_tiles, pad_bounds,
+                                  rows_in, rows_out, swiglu_gate, out, out_half,
+                                  m, k, stream);
     default:
       return false;
   }
