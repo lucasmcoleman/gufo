@@ -2701,7 +2701,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
         n_tokens >= 1024 && routed_tile_rows_ == 48
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
-                  s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
+                  s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_, 128,
                   s_.routed_bounds, s_.rows_token, s_.rows_slot, up_half,
                   c.expert_ff, c.hidden_size, stream_)
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
