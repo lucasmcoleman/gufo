@@ -1458,6 +1458,8 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
     frontier = std::min(frontier, impl_->boundaries.front());
   const auto model_prompt =
       std::span<const TextRunnerToken>(impl_->prompt).first(frontier);
+  // The state is next used, captured or shared at the frontier.
+  impl_->runner->SetDraftContextHorizon(state, frontier);
   std::unique_ptr<TextRunnerSnapshot> captured;
   const std::function<std::unique_ptr<TextRunnerSnapshot>()> capture =
       in_pass && impl_->lease.component()

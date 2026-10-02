@@ -520,12 +520,30 @@ public:
     return verifier_ != nullptr;
   }
 
+  /// First prompt position whose features the draft still needs before
+  /// `horizon`, the next position the state is used at; zero keeps them all.
+  [[nodiscard]] std::uint32_t KeepDraftContextFrom(
+      std::size_t horizon) const noexcept {
+    const std::size_t window =
+        draft_backend_ != nullptr ? draft_backend_->TargetContextWindow() : 0;
+    return window != 0 && horizon > window
+               ? static_cast<std::uint32_t>(horizon - window)
+               : 0U;
+  }
+
+  void set_draft_context_horizon(std::size_t position) noexcept {
+    draft_context_horizon_ = position;
+  }
+  [[nodiscard]] std::size_t TakeDraftContextHorizon() noexcept {
+    return std::exchange(draft_context_horizon_, 0);
+  }
+
   void PrimeSpeculative(std::span<const TextRunnerToken> prompt,
-                        bool decode_ready) {
+                        bool decode_ready, std::uint32_t keep_context_from) {
     if (verifier_ == nullptr) {
       throw std::logic_error("Qwen state has no speculative verifier");
     }
-    frontier_ = verifier_->Prime(prompt, decode_ready);
+    frontier_ = verifier_->Prime(prompt, decode_ready, keep_context_from);
     frontier_logits_.clear();
     if (decode_ready) {
       const auto logits = verifier_->CopyLastTargetLogits();
@@ -585,7 +603,7 @@ public:
   }
 
   void ExtendSpeculative(std::span<const TextRunnerToken> suffix,
-                         bool decode_ready) {
+                         bool decode_ready, std::uint32_t keep_context_from) {
     if (verifier_ == nullptr || !frontier_.has_value()) {
       throw std::logic_error("Qwen speculative prefix is not initialized");
     }
@@ -593,8 +611,9 @@ public:
       throw std::logic_error(
           "Qwen speculative sequence does not match retained position");
     }
-    frontier_ = verifier_->ExtendPrompt(
-        suffix, static_cast<std::uint32_t>(position_), decode_ready);
+    frontier_ =
+        verifier_->ExtendPrompt(suffix, static_cast<std::uint32_t>(position_),
+                                decode_ready, keep_context_from);
     sequence_.insert(sequence_.end(), suffix.begin(), suffix.end());
     position_ += suffix.size();
     frontier_logits_.clear();
@@ -836,6 +855,7 @@ private:
   std::unique_ptr<speculative::SpeculativeVerifier> verifier_;
   // Owned by verifier_; used only to account the session's draft allocations.
   hip::QwenDFlashGpuDraftBackend* draft_backend_{nullptr};
+  std::size_t draft_context_horizon_{0};
   std::vector<TextRunnerToken> sequence_;
   std::size_t position_{0};
   std::optional<TextRunnerToken> frontier_;
@@ -1153,6 +1173,11 @@ public:
     qwen.PreparePrefixReuse(prefix);
   }
 
+  void SetDraftContextHorizon(TextRunnerState& state,
+                              std::size_t position) const override {
+    RequireQwenState(state).set_draft_context_horizon(position);
+  }
+
   [[nodiscard]] TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const override {
@@ -1166,6 +1191,8 @@ public:
     }
     max_input_tokens = std::min<std::size_t>(
         max_input_tokens, qwen.executor().GetMaxPromptBatch());
+    const std::uint32_t keep_context_from =
+        qwen.KeepDraftContextFrom(qwen.TakeDraftContextHorizon());
     if (max_input_tokens != 0 && offset != 0 &&
         qwen.ResumeGeneratedToken(prompt[offset],
                                   offset + 1 == prompt.size())) {
@@ -1179,8 +1206,8 @@ public:
           throw std::logic_error(
               "Qwen prefill requires a nonzero token budget");
         }
-        qwen.PrimeSpeculative(prompt.first(consumed),
-                              consumed == prompt.size());
+        qwen.PrimeSpeculative(prompt.first(consumed), consumed == prompt.size(),
+                              keep_context_from);
         return {.consumed_tokens = consumed,
                 .decode_ready = consumed == prompt.size()};
       }
@@ -1191,7 +1218,8 @@ public:
             "Qwen DFlash retained prefix has no suffix to prefill");
       }
       qwen.ExtendSpeculative(prompt.subspan(offset, consumed),
-                             offset + consumed == prompt.size());
+                             offset + consumed == prompt.size(),
+                             keep_context_from);
       return {
           .consumed_tokens = consumed,
           .decode_ready = offset + consumed == prompt.size(),
