@@ -192,7 +192,8 @@ QwenDFlashGpuDraftBackend::QwenDFlashGpuDraftBackend(
           // The tied output tensor distinguishes the qualified Q8 target
           // (Q8_0 head) from Q4 (Q6_K head) for verification cost selection.
           executor_->GetModel().GetWeights().output.type ==
-              core::GgmlType::kQ8_0) {}
+              core::GgmlType::kQ8_0,
+          executor_->GetModel().TargetIsMoE()) {}
 
 std::unique_ptr<QwenDFlashGpuDraftBackend> QwenDFlashGpuDraftBackend::Create(
     std::shared_ptr<const QwenDFlashGpuModel> model,
