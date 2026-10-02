@@ -621,14 +621,17 @@ __launch_bounds__(32) __global__ void QwenDecodeSplitKAttentionPartialsKernel(
   }
 }
 
-template<bool ShareKv = false, unsigned Lanes = 32>
-__launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
+// Heads is the number of query heads of one KV head a block covers; above one
+// they share each staged KV tile.
+template<unsigned Heads = 1, unsigned Lanes = 32>
+__launch_bounds__(Heads* Lanes) __global__
     void QwenDecodeSplitKAttentionHalfPartialsKernel(
         const float* __restrict__ q, const __half* __restrict__ k_cache,
         const __half* __restrict__ v_cache, float* __restrict__ scratch,
         std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
         std::uint32_t num_heads, std::uint32_t num_kv_heads,
         std::uint32_t split_count) {
+  constexpr bool ShareKv = Heads > 1;
   static_assert(Lanes == 32 || (ShareKv && Lanes == 16));
   constexpr std::uint32_t head_dim = 256;
   constexpr std::uint32_t vector_width = head_dim / 4;
@@ -640,7 +643,7 @@ __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
              (head_dim + 2);
   pos += blockIdx.y;
 
-  constexpr std::uint32_t heads_per_block = ShareKv ? 6 : 1;
+  constexpr std::uint32_t heads_per_block = Heads;
   const std::uint32_t head = blockIdx.x * heads_per_block + threadIdx.x / Lanes;
   const std::uint32_t split = blockIdx.z;
   const std::uint32_t lane = threadIdx.x % Lanes;
@@ -733,8 +736,8 @@ __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
     }
   };
   if constexpr (ShareKv) {
-    // Six query heads share each KV head. Stage the encoded KV once without
-    // changing any head's score, softmax or value accumulation order.
+    // The block's query heads share one KV head. Stage the encoded KV once
+    // without changing any head's score, softmax or value accumulation order.
     constexpr unsigned tile = 4;
     __shared__ __align__(16) __half keys[tile][head_dim];
     __shared__ __align__(16) __half values[tile][head_dim];
@@ -870,20 +873,34 @@ static void LaunchSplitKAttentionHalfPartials(
     float* scratch, std::uint32_t layer_idx, std::uint32_t start_pos,
     unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream) {
-  // Share each KV tile across its six query heads in both scalar decoding
-  // and verification. Rows retain independent causal endpoints and scratch.
-  if (num_heads == 6 * num_kv_heads &&
-      static_cast<std::size_t>(start_pos) + 1 >= 512) {
+  // Share each KV tile across the query heads of its KV head (six on the
+  // 27B, eight on the 35B-A3B) in both scalar decoding and verification.
+  // Rows retain independent causal endpoints and scratch.
+  const bool deep = static_cast<std::size_t>(start_pos) + 1 >= 512;
+  const dim3 shared_grid(num_kv_heads, rows, splits);
+  if (num_heads == 6 * num_kv_heads && deep) {
     if (rows > 1) {
-      QwenDecodeSplitKAttentionHalfPartialsKernel<true, 16>
-          <<<dim3(num_kv_heads, rows, splits), 96, 0, stream>>>(
-              q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
-              num_heads, num_kv_heads, splits);
+      QwenDecodeSplitKAttentionHalfPartialsKernel<6, 16>
+          <<<shared_grid, 96, 0, stream>>>(q, k_cache, v_cache, scratch,
+                                           layer_idx, start_pos, max_context,
+                                           num_heads, num_kv_heads, splits);
     } else {
-      QwenDecodeSplitKAttentionHalfPartialsKernel<true>
-          <<<dim3(num_kv_heads, rows, splits), 192, 0, stream>>>(
-              q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
-              num_heads, num_kv_heads, splits);
+      QwenDecodeSplitKAttentionHalfPartialsKernel<6>
+          <<<shared_grid, 192, 0, stream>>>(q, k_cache, v_cache, scratch,
+                                            layer_idx, start_pos, max_context,
+                                            num_heads, num_kv_heads, splits);
+    }
+  } else if (num_heads == 8 * num_kv_heads && deep) {
+    if (rows > 1) {
+      QwenDecodeSplitKAttentionHalfPartialsKernel<8, 16>
+          <<<shared_grid, 128, 0, stream>>>(q, k_cache, v_cache, scratch,
+                                            layer_idx, start_pos, max_context,
+                                            num_heads, num_kv_heads, splits);
+    } else {
+      QwenDecodeSplitKAttentionHalfPartialsKernel<8>
+          <<<shared_grid, 256, 0, stream>>>(q, k_cache, v_cache, scratch,
+                                            layer_idx, start_pos, max_context,
+                                            num_heads, num_kv_heads, splits);
     }
   } else {
     QwenDecodeSplitKAttentionHalfPartialsKernel<>
