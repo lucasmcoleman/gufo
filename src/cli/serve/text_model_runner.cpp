@@ -1522,8 +1522,17 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
     frontier = std::min(frontier, impl_->boundaries.front());
   const auto model_prompt =
       std::span<const TextRunnerToken>(impl_->prompt).first(frontier);
-  // The state is next used, captured or shared at the frontier.
-  impl_->runner->SetDraftContextHorizon(state, frontier);
+  // The draft's context window must be complete where the state is next
+  // used: the cache snapshot, a shared-prefix boundary or the prompt end.
+  // Grid checkpoints are optional copies for late edits; they keep whatever
+  // context the draft has, and a restore from one drafts less until the
+  // window refills.
+  auto horizon = impl_->prefill_offset < snapshot_position
+                     ? snapshot_position
+                     : impl_->prompt.size();
+  if (!impl_->boundaries.empty())
+    horizon = std::min(horizon, impl_->boundaries.front());
+  impl_->runner->SetDraftContextHorizon(state, horizon);
   std::unique_ptr<TextRunnerSnapshot> captured;
   const std::function<std::unique_ptr<TextRunnerSnapshot>()> capture =
       in_pass && impl_->lease.component()
