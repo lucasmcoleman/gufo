@@ -313,6 +313,8 @@ template<typename T>
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
+  /// Most prompt tokens one prefill chunk processes.
+  static constexpr std::uint32_t kMaxPromptBatch = 4096;
   explicit QwenGpuArena(
       const core::ModelConfig& config, std::uint32_t max_context = 4096,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
