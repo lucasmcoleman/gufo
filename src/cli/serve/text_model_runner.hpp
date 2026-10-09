@@ -140,6 +140,9 @@ struct TextRunnerDescriptor {
   std::uint32_t max_context{0};
   TextRunnerCapabilities capabilities;
   std::optional<TextRunnerPersistenceDescriptor> persistence;
+  /// Largest prompt step a lone request runs. Intermediate checkpoints sit on
+  /// its multiples so they never shorten a step; zero means unknown.
+  std::size_t prefill_step_tokens{0};
 };
 
 /// Optional byte claims made before state allocation.

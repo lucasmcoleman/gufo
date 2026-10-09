@@ -18,7 +18,6 @@
 namespace gufo::hip {
 namespace {
 
-constexpr std::uint32_t kMaxPromptBatch = 4096;
 /// Target hidden-layer taps a DFlash2 draft may request: the Qwen3.8 27B draft
 /// uses 5, the Qwen3.6 35B-A3B draft 8. Each tap costs one hidden row.
 constexpr std::size_t kMaxTargetLayerTaps = 16;
@@ -441,7 +440,8 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
     const core::ModelConfig& config, std::uint32_t max_context,
     QwenExecutionPolicy policy) {
   const std::size_t context = std::max(max_context, 1U);
-  const std::size_t batch = std::min<std::size_t>(context, kMaxPromptBatch);
+  const std::size_t batch =
+      std::min<std::size_t>(context, QwenGpuArena::kMaxPromptBatch);
   const std::size_t hidden = config.hidden_size;
   const std::size_t intermediate = config.intermediate_size;
   const std::size_t attention = config.AttentionSize();
