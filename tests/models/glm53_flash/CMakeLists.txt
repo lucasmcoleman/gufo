@@ -12,3 +12,18 @@ endfunction()
 
 add_glm53_flash_test(weights gufo_glm53_flash "cpu;model")
 set_tests_properties(glm53_flash.weights PROPERTIES SKIP_RETURN_CODE 77)
+
+# HF-generated hyper-connection fixture (fixtures/make_hc_fixture.py).
+set(GLM53_HC_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hc_fixture.bin")
+add_glm53_flash_test(hc_reference gufo_glm53_flash_reference "cpu")
+target_compile_definitions(glm53_flash_hc_reference_test PRIVATE
+  GLM53_HC_FIXTURE="${GLM53_HC_FIXTURE}")
+
+if (ENGINE_ENABLE_HIP)
+  add_glm53_flash_test(hc_ops gufo_glm53_flash_reference "hip;gpu;gfx1151")
+  target_compile_definitions(glm53_flash_hc_ops_test PRIVATE
+    GLM53_HC_FIXTURE="${GLM53_HC_FIXTURE}")
+endif()
+
+# Lane B tests (owned by the Lane B fragment).
+include(${CMAKE_CURRENT_SOURCE_DIR}/lane_b_tests.cmake OPTIONAL)

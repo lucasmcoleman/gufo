@@ -172,6 +172,36 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
   c.indexer_head_dim = r.U32(key("attention.indexer.key_length"));
   c.indexer_top_k = r.U32(key("attention.indexer.top_k"));
   c.indexer_kpool = r.U32(key("attention.indexer.kpool"));
+  // Variants this runtime does not implement. Absent keys take llama.cpp's
+  // defaults (tail selected, a full indexer on every layer), which is what
+  // the Maya-S artifact relies on; an explicit other value is rejected
+  // instead of silently computed as the default.
+  if (gguf.FindMetadata(key("attention.indexer.kpool_select_tail")) !=
+          nullptr &&
+      !r.Bool(key("attention.indexer.kpool_select_tail"), true))
+    r.Fail("indexer kpool_select_tail=false is not supported");
+  if (const auto* types = gguf.FindMetadata(key("attention.indexer.types"))) {
+    bool all_full = false;
+    if (const auto* u = std::get_if<std::uint64_t>(&types->value)) {
+      all_full = *u == 1;
+    } else if (const auto* b = std::get_if<bool>(&types->value)) {
+      all_full = *b;
+    } else if (const auto* a =
+                   std::get_if<std::vector<std::uint64_t>>(&types->value)) {
+      all_full = !a->empty();
+      for (auto v : *a)
+        all_full = all_full && v == 1;
+    } else if (const auto* s = std::get_if<std::int64_t>(&types->value)) {
+      all_full = *s == 1;
+    } else if (const auto* sa =
+                   std::get_if<std::vector<std::int64_t>>(&types->value)) {
+      all_full = !sa->empty();
+      for (auto v : *sa)
+        all_full = all_full && v == 1;
+    }
+    if (!all_full)
+      r.Fail("only a full (non-shared) indexer on every layer is supported");
+  }
 
   c.leading_dense_layers = r.U32(key("leading_dense_block_count"));
   c.dense_ff = r.U32(key("feed_forward_length"));
@@ -201,6 +231,8 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
   // that differs is rejected instead of computed wrong.
   if (c.hidden_size == 0 || c.vocab_size == 0 || c.num_heads == 0)
     r.Fail("embedding, vocabulary and head counts must be non-zero");
+  if (!(c.rms_eps > 0.0F) || !(c.norm_eps > 0.0F) || !(c.hc_eps > 0.0F))
+    r.Fail("normalization epsilons must be positive");
   if (c.hc_count != 4)
     r.Fail("hyper-connections are implemented for exactly 4 streams");
   if (c.hc_sinkhorn_iters == 0)

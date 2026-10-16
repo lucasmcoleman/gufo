@@ -84,8 +84,20 @@ struct MlaCache {
   std::uint32_t capacity{0};  ///< Max positions this cache can hold.
 };
 
+/// A device buffer reported to a tap. Shape follows ggml order: ne0 is the
+/// contiguous dimension, then ne1 (usually tokens); unused dims are 1.
+struct TapView {
+  enum class Dtype : std::uint8_t { kF32, kF16, kI32 };
+  const void* device{nullptr};
+  Dtype dtype{Dtype::kF32};
+  std::uint64_t ne0{0};
+  std::uint64_t ne1{1};
+  std::uint64_t ne2{1};
+  [[nodiscard]] std::uint64_t count() const noexcept { return ne0 * ne1 * ne2; }
+};
+
 using TapFn = std::function<void(std::string_view name, std::uint32_t layer,
-                                 const float* device, std::size_t count)>;
+                                 const TapView& view)>;
 
 struct OpContext {
   Stream stream{};
