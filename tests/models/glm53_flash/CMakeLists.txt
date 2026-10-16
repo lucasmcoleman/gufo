@@ -35,5 +35,12 @@ if (ENGINE_ENABLE_HIP)
   add_glm53_flash_test(kda_ops gufo_glm53_flash_reference "hip;gpu;gfx1151")
 endif()
 
+# Full CPU reference forward vs the HF tiny e2e fixture
+# (fixtures/make_e2e_fixture.py).
+set(GLM53_E2E_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/e2e_fixture.bin")
+add_glm53_flash_test(reference_e2e gufo_glm53_flash_reference "cpu")
+target_compile_definitions(glm53_flash_reference_e2e_test PRIVATE
+  GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
+
 # Lane B tests (owned by the Lane B fragment).
 include(${CMAKE_CURRENT_SOURCE_DIR}/lane_b_tests.cmake OPTIONAL)
