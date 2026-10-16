@@ -11,9 +11,10 @@ target_link_libraries(gufo_glm53_flash PUBLIC gufo_core)
 # configuration, as for the qwen38_flash_next reference.
 add_library(gufo_glm53_flash_reference STATIC EXCLUDE_FROM_ALL
   reference_hc.cpp
-  reference_kda.cpp)
+  reference_kda.cpp
+  reference.cpp)
 target_link_libraries(gufo_glm53_flash_reference PUBLIC gufo_glm53_flash)
-set_source_files_properties(reference_hc.cpp reference_kda.cpp
+set_source_files_properties(reference_hc.cpp reference_kda.cpp reference.cpp
   PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
