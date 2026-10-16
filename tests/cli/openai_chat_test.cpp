@@ -6384,6 +6384,21 @@ void TestGlmQuotedExamplesAndParallelCalls() {
 
   for (const bool stream : {false, true}) {
     const std::string label = stream ? "GLM stream: " : "GLM: ";
+    {  // One literal backtick in each of two calls' arguments is not a quote.
+      const std::string a =
+          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pa`ris"
+          "</arg_value></tool_call>";
+      const std::string b =
+          "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Ro`me"
+          "</arg_value></tool_call>";
+      const auto result = run(a + b, stream, true);
+      Expect(result.calls.size() == 2,
+             label + "backtick arguments keep both calls, got " +
+                 std::to_string(result.calls.size()));
+      if (!stream)
+        Expect(result.content.empty(),
+               label + "no call becomes content, got '" + result.content + "'");
+    }
     {  // A quoted copy after a real call is prose.
       const std::string text = call + " Example: `" + call + "`";
       const auto result = run(text, stream, std::nullopt);

@@ -455,6 +455,22 @@ void TestQuotedExampleAfterCall() {
   Require(nested.tool_calls.size() == 1 && nested.content.empty(),
           "nested value stays one call");
 
+  // Argument bytes are not prose: one literal backtick in each of two real
+  // calls must not pair up and quote the second call.
+  const std::string tick_a =
+      "<tool_call>write<arg_key>s</arg_key><arg_value>a`b"
+      "</arg_value></tool_call>";
+  const std::string tick_b =
+      "<tool_call>write<arg_key>s</arg_key><arg_value>c`d"
+      "</arg_value></tool_call>";
+  const auto ticks = glm::ParseResponse(tick_a + tick_b, {}, false);
+  Require(ticks.tool_calls.size() == 2 && ticks.content.empty(),
+          "backtick in each argument keeps both calls, got " +
+              std::to_string(ticks.tool_calls.size()));
+  Require(glm::ParseResponse(tick_a + "\n" + tick_b, {}, false, true)
+                  .tool_calls.size() == 2,
+          "backtick in each argument keeps both calls while streaming");
+
   // A stream never reports the quoted copy, at any prefix.
   std::string seen_content;
   for (std::size_t n = 0; n <= text.size(); ++n) {
