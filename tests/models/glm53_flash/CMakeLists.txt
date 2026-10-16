@@ -58,6 +58,15 @@ add_glm53_flash_test(reference_e2e gufo_glm53_flash_reference "cpu")
 target_compile_definitions(glm53_flash_reference_e2e_test PRIVATE
   GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
 
+if (ENGINE_ENABLE_HIP)
+  # GPU layer loop (executor.hpp Executor) with host MLA / FFN stand-ins vs
+  # ReferenceModel on the e2e fixture model (KDA layers at head dim 128).
+  add_glm53_flash_test(executor_loop gufo_glm53_flash_reference
+    "hip;gpu;gfx1151")
+  target_compile_definitions(glm53_flash_executor_loop_test PRIVATE
+    GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
+endif()
+
 # V3 probe (not a test): CPU ReferenceModel on a real GGUF, dumping every tap
 # for comparison with llama.cpp (tools/glm53/reference_probe.cpp).
 add_executable(glm53_flash_reference_probe
@@ -75,6 +84,18 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(glm53_flash_kda_executor_probe PRIVATE
     gufo_glm53_flash_reference)
   set_target_properties(glm53_flash_kda_executor_probe PROPERTIES
+    EXCLUDE_FROM_ALL ON)
+endif()
+
+# Layer-loop parity probe (not a test): GPU Executor on layers 0-2 plus the
+# embedding of a real GGUF, host FFN stand-in, vs the CPU ReferenceModel
+# (tools/glm53/executor_loop_probe.cpp, see /server/staging/glm53-gufo/a3/loop).
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_executor_loop_probe
+    ${PROJECT_SOURCE_DIR}/tools/glm53/executor_loop_probe.cpp)
+  target_link_libraries(glm53_flash_executor_loop_probe PRIVATE
+    gufo_glm53_flash_reference)
+  set_target_properties(glm53_flash_executor_loop_probe PROPERTIES
     EXCLUDE_FROM_ALL ON)
 endif()
 
