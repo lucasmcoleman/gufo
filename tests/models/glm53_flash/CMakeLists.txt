@@ -42,5 +42,13 @@ add_glm53_flash_test(reference_e2e gufo_glm53_flash_reference "cpu")
 target_compile_definitions(glm53_flash_reference_e2e_test PRIVATE
   GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
 
+# V3 probe (not a test): CPU ReferenceModel on a real GGUF, dumping every tap
+# for comparison with llama.cpp (tools/glm53/reference_probe.cpp).
+add_executable(glm53_flash_reference_probe
+  ${PROJECT_SOURCE_DIR}/tools/glm53/reference_probe.cpp)
+target_link_libraries(glm53_flash_reference_probe PRIVATE
+  gufo_glm53_flash_reference)
+set_target_properties(glm53_flash_reference_probe PROPERTIES EXCLUDE_FROM_ALL ON)
+
 # Lane B tests (owned by the Lane B fragment).
 include(${CMAKE_CURRENT_SOURCE_DIR}/lane_b_tests.cmake OPTIONAL)
