@@ -26,6 +26,10 @@ namespace gufo::models::qwen38_flash_next {
 class Model;
 }
 
+namespace gufo::models::glm53_flash {
+class Model;
+}
+
 namespace gufo::tokenization {
 class QwenTokenizer;
 }
@@ -107,6 +111,17 @@ public:
   /// request-owned sessions, the model's tokenizer, and host-memory
   /// continuation snapshots.
   bool load(std::shared_ptr<models::qwen38_flash_next::Model> model,
+            std::string* error, std::uint32_t max_context = 0,
+            std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
+
+  /// Installs a previously loaded GLM-5.3-Flash model. It has one sequence
+  /// and no snapshots: one session, no speculative decoding, no disk cache.
+  bool load(std::shared_ptr<models::glm53_flash::Model> model,
             std::string* error, std::uint32_t max_context = 0,
             std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},

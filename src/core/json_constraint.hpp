@@ -22,7 +22,10 @@ namespace gufo::sampling {
 // verification.
 class JsonConstraint {
 public:
-  enum class ToolFormat { kJson, kQwen, kDeepSeek };
+  /// kGlm (GLM-5.3 <arg_key>/<arg_value> calls) has no native grammar: its
+  /// tools are parsed after generation, never constrained, and the tool
+  /// grammar builders reject it.
+  enum class ToolFormat { kJson, kQwen, kDeepSeek, kGlm };
   struct Stack {
     std::vector<std::uint32_t> symbols;
     std::string lexeme;

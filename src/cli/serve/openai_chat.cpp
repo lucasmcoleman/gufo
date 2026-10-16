@@ -31,6 +31,7 @@
 #include "src/core/utf8.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/tool_calls.hpp"
+#include "src/models/glm53_flash/chat_template.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::server {
@@ -95,6 +96,15 @@ constexpr std::array<std::string_view, 7> kToolMarkers{
 };
 using ToolMarkerSet = std::span<const std::string_view>;
 
+// GLM-5.3 opens a call with the same bytes as Qwen; this array's identity, not
+// its text, selects the GLM dialect (IsGlmMarkers).
+constexpr std::array<std::string_view, 1> kGlmToolMarkers{
+    models::glm53_flash::ToolSyntax::kCallOpen};
+
+bool IsGlmMarkers(ToolMarkerSet markers) noexcept {
+  return markers.data() == kGlmToolMarkers.data();
+}
+
 ToolMarkerSet ToolMarkers(
     std::optional<sampling::JsonConstraint::ToolFormat> format) {
   using Format = sampling::JsonConstraint::ToolFormat;
@@ -111,6 +121,8 @@ ToolMarkerSet ToolMarkers(
   // their native call syntax; keep recognizing every opener there.
   if (!format || *format == Format::kJson)
     return kToolMarkers;
+  if (*format == Format::kGlm)
+    return kGlmToolMarkers;
   // Match the canonical opener selected by JsonConstraint::WithTools. Other
   // dialects are ordinary prose under that grammar, not additional calls.
   return *format == Format::kDeepSeek ? ToolMarkerSet(deepseek)
@@ -120,6 +132,9 @@ ToolMarkerSet ToolMarkers(
 // A native function header, rather than a bare marker mentioned in prose,
 // permits the implicit reasoning boundary used by llama.cpp's native parsers.
 ToolMarkerSet ReasoningToolMarkers(ToolMarkerSet markers) {
+  // GLM reasoning ends only at </think>, as in its ParseResponse.
+  if (IsGlmMarkers(markers))
+    return {};
   static constexpr std::array<std::string_view, 1> qwen{
       tokenization::QwenToolSyntax::kNativeCallOpen};
   static constexpr std::array<std::string_view, 2> deepseek{
@@ -170,7 +185,8 @@ ToolCloserSet ToolClosers(
   // As in llama.cpp, DeepSeek content is everything outside its native call
   // block, which ends the output: there is no echo to strip, and client
   // envelope syntax the model writes stays visible text.
-  if (*format == Format::kDeepSeek)
+  // GLM's scanner consumes each call through </tool_call> in the same way.
+  if (*format == Format::kDeepSeek || *format == Format::kGlm)
     return {};
   // Mirror ToolMarkers: stripping follows the dialect the request admitted,
   // and another dialect's closing tags are ordinary prose like its openers —
@@ -1755,6 +1771,67 @@ void ParseDsmlCalls(
     break;
   }
 }
+
+// GLM-5.3 calls, <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>
+// ...</tool_call>, scanned and typed by the model package as its
+// ParseResponse does. `text` begins at the first marker; spans are relative
+// to it. A stream reports an unfinished call with its finished arguments, and
+// a string-only argument as it grows.
+void ParseGlmCalls(std::string_view text,
+                   std::span<const tokenization::ChatTool> tools,
+                   std::vector<ParsedToolCall>* calls,
+                   std::vector<std::pair<std::size_t, std::size_t>>* spans,
+                   bool partial) {
+  namespace glm = models::glm53_flash;
+  std::vector<glm::ChatTool> glm_tools;
+  glm_tools.reserve(tools.size());
+  for (const auto& tool : tools)
+    glm_tools.push_back({.name = tool.name,
+                         .description = tool.description,
+                         .parameters_json = tool.parameters_json,
+                         .definition_json = {}});
+  const auto convert = [](const glm::ParsedToolCall& typed) {
+    ParsedToolCall call;
+    call.id = RandomId("call_");
+    call.name = typed.name;
+    for (const auto& argument : typed.arguments)
+      call.arguments.push_back({.name = argument.name,
+                                .value = argument.value,
+                                .is_string = argument.is_string});
+    return call;
+  };
+  std::size_t cursor = 0;
+  while ((cursor = text.find(glm::ToolSyntax::kCallOpen, cursor)) !=
+         std::string_view::npos) {
+    const auto scan = glm::ScanToolCall(text.substr(cursor));
+    if (scan.call && scan.call->complete) {
+      calls->push_back(convert(glm::InterpretToolCall(*scan.call, glm_tools)));
+      if (spans)
+        spans->emplace_back(cursor, cursor + scan.end);
+      cursor += scan.end;
+      continue;
+    }
+    if (!scan.call || scan.malformed) {
+      if (!partial || scan.malformed) {
+        cursor += glm::ToolSyntax::kCallOpen.size();
+        continue;
+      }
+      break;  // The name is still arriving.
+    }
+    if (partial && !scan.call->name.empty()) {
+      auto call = convert(glm::InterpretToolCall(*scan.call, glm_tools));
+      const auto& unfinished = scan.call->unfinished;
+      if (unfinished && !unfinished->name.empty() &&
+          glm::IsStringArgument(glm_tools, call.name, unfinished->name))
+        PartialStringArgument(call, unfinished->name, unfinished->value);
+      if (!call.partial_arguments)
+        call.partial_arguments = ArgumentsPrefix(call);
+      calls->push_back(std::move(call));
+    }
+    break;
+  }
+}
+
 ParsedGeneration ParseGeneration(
     std::string_view raw,
     TextGenerationBackend::InitialOutputState initial_output_state,
@@ -1862,7 +1939,12 @@ ParsedGeneration ParseGeneration(
     // The outer envelope selects the format, as in llama.cpp's model parsers.
     // Scanning both dialects would turn a literal call inside an argument into
     // an additional API invocation.
-    if (text_from_tools.starts_with(tokenization::QwenToolSyntax::kCallOpen))
+    if (IsGlmMarkers(markers))
+      ParseGlmCalls(
+          text_from_tools, tools, &parsed.tool_calls, &spans,
+          partial && !unfinished_reasoning_quote && !quotes.UnclosedAt(marker));
+    else if (text_from_tools.starts_with(
+                 tokenization::QwenToolSyntax::kCallOpen))
       ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, nullptr,
                      unfinished_reasoning_quote, partial);
     else
@@ -1940,6 +2022,11 @@ ParsedGeneration ParseStructuredGeneration(
     ChatRequest::ToolChoice choice, bool enforce_required, bool tool_only,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
     bool partial = false) {
+  // No grammar shapes GLM output (ConstrainChatRequest): parse it natively.
+  if (IsGlmMarkers(markers) && !tools.empty() &&
+      choice != ChatRequest::ToolChoice::kNone)
+    return ParseGeneration(raw, initial, tools, choice, enforce_required,
+                           markers, closers, quotes, partial);
   ParsedGeneration parsed;
   if (initial == TextGenerationBackend::InitialOutputState::kAuto) {
     const auto leading = raw.find_first_not_of(" \t\r\n");
@@ -2858,6 +2945,16 @@ private:
   bool unfinished_tool_{false};
 };
 
+// A dialect without a grammar (GLM) was not constrained, so its output is
+// parsed as unconstrained text even though the request declared tools.
+ChatRequest NativeToolParsing(
+    ChatRequest chat,
+    std::optional<sampling::JsonConstraint::ToolFormat> format) {
+  if (format == sampling::JsonConstraint::ToolFormat::kGlm)
+    chat.constrained_tools = false;
+  return chat;
+}
+
 HttpResponse NonStreamingResponse(
     const ParsedChatRequest& request, TextGenerationBackend& backend,
     const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
@@ -3758,8 +3855,8 @@ HttpResponse CreateCompatibilityResponse(
   const auto closers = ToolClosers(format);
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
-  const auto run = [generation, initial, chat, markers, closers,
-                    model = backend.model_id(), stream_log,
+  const auto run = [generation, initial, chat = NativeToolParsing(chat, format),
+                    markers, closers, model = backend.model_id(), stream_log,
                     timing](const HttpResponse::BodyWriter& writer) {
     Output output(model, writer, chat);
     bool started = false;
@@ -3925,6 +4022,8 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     auto generation =
         backend.start_chat(parsed.chat, parsed.max_tokens, parsed.sampling,
                            request.is_cancelled, parsed.stream);
+    parsed.chat =
+        NativeToolParsing(std::move(parsed.chat), generation->ToolFormat());
     if (parsed.stream) {
       return StreamingResponse(parsed, backend, std::move(generation),
                                initial_output_state);

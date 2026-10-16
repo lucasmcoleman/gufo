@@ -20,6 +20,9 @@
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/glm53_flash/chat_template.hpp"
+#include "src/models/glm53_flash/engine.hpp"
+#include "src/models/glm53_flash/generator.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -305,6 +308,162 @@ void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
   opt->sampling = sampling::ResolveTextSampling(
       preset, PromptReasoningOptions(*opt).enabled, opt->sampling,
       opt->sampling_supplied);
+}
+
+// ---- GLM-5.3-Flash ----
+
+constexpr std::uint32_t kGlm53CliContext = 4096;
+
+std::shared_ptr<models::glm53_flash::Model> LoadGlm53Model(
+    const PromptOptions& opt,
+    std::chrono::steady_clock::time_point load_start) {
+  std::string error;
+  // A build without the model's GPU operators refuses first.
+  if (!models::glm53_flash::RuntimeAvailable(&error)) {
+    std::cerr << "Error: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  if (opt.force_cpu || !opt.speculative_backend.empty() ||
+      !opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+    std::cerr << "GLM-5.3-Flash runs on ROCm without speculative decoding or "
+                 "image input\n";
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  auto model = models::glm53_flash::Model::Load(
+      opt.model_path,
+      models::glm53_flash::ModelOptions{
+          .max_context = kGlm53CliContext,
+          .prefill_chunk = models::glm53_flash::ModelOptions{}.prefill_chunk,
+      },
+      &error);
+  if (model == nullptr) {
+    std::cerr << "Error creating GLM-5.3-Flash model: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  PrintModelLoadTime(load_start);
+  return model;
+}
+
+/// Streams the reply to `prompt` as raw text; `*reply` receives it.
+int GenerateGlm53Response(const PromptOptions& opt,
+                          models::glm53_flash::Generator& generator,
+                          std::span<const models::glm53_flash::TokenId> prompt,
+                          std::string* reply = nullptr) {
+  if (opt.verbose) {
+    std::cout << "[Engine]: GLM-5.3-Flash ROCm (gfx1151)\n"
+              << "Prompt tokens: " << prompt.size() << '\n'
+              << "Max tokens: " << opt.max_tokens << '\n'
+              << "--- Generation Output ---\n";
+  }
+  models::glm53_flash::GenerationOptions options;
+  options.max_tokens = opt.max_tokens;
+  options.sampling = opt.sampling;
+  models::glm53_flash::GenerationResult result;
+  std::string error;
+  const auto start = std::chrono::steady_clock::now();
+  const bool ok = generator.Generate(
+      prompt, options,
+      [](models::glm53_flash::TokenId, std::string_view piece) {
+        std::cout << piece << std::flush;
+        return true;
+      },
+      &result, &error);
+  std::cout << '\n';
+  if (!ok) {
+    std::cerr << "GLM-5.3-Flash generation failed: " << error << '\n';
+    return 1;
+  }
+  if (reply != nullptr)
+    *reply = result.text;
+  if (opt.verbose && !result.tokens.empty()) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    std::cout << "Generated " << result.tokens.size() << " tokens on ROCm in "
+              << seconds << "s ("
+              << static_cast<double>(result.tokens.size()) / seconds
+              << " tok/s)\n";
+    PrintTokenTrace(result.tokens);
+  }
+  return 0;
+}
+
+int RunGlm53(const PromptOptions& opt,
+             std::chrono::steady_clock::time_point load_start,
+             bool interactive) {
+  namespace glm = models::glm53_flash;
+  if (interactive && !opt.use_chat_template) {
+    std::cerr << "GLM-5.3-Flash interactive chat requires chat framing; use "
+                 "prompt --raw for raw text\n";
+    return 1;
+  }
+  auto model = LoadGlm53Model(opt, load_start);
+  if (!model)
+    return 1;
+  std::string error;
+  auto session = model->CreateSession(&error);
+  if (!session) {
+    std::cerr << "GLM-5.3-Flash session creation failed: " << error << '\n';
+    return 1;
+  }
+  glm::Generator generator(*session, model->stop_tokens(), &model->tokenizer());
+  const auto template_options =
+      glm::ResolveChatOptions(PromptReasoningOptions(opt));
+  std::vector<glm::ChatMessage> history;
+  if (!opt.system_prompt.empty()) {
+    history.emplace_back();
+    history.back().role = glm::ChatRole::kSystem;
+    history.back().content = opt.system_prompt;
+  }
+  const auto turn = [&](std::string_view user, std::string* reply) {
+    history.emplace_back();
+    history.back().role = glm::ChatRole::kUser;
+    history.back().content = std::string(user);
+    const auto prompt = glm::PrepareChat(model->tokenizer(), history, {},
+                                         template_options, &error);
+    if (!prompt) {
+      std::cerr << "GLM-5.3-Flash chat template: " << error << '\n';
+      return 1;
+    }
+    return GenerateGlm53Response(opt, generator, prompt->tokens, reply);
+  };
+  if (!interactive) {
+    if (!opt.use_chat_template) {
+      const auto tokens =
+          model->tokenizer().Encode(opt.prompt_text, /*parse_special=*/true);
+      if (tokens.empty()) {
+        std::cerr << "GLM-5.3-Flash prompt produced no tokens\n";
+        return 1;
+      }
+      return GenerateGlm53Response(opt, generator, tokens);
+    }
+    return turn(opt.prompt_text, nullptr);
+  }
+  std::cout << "=== Gufo Interactive Chat (GLM-5.3-Flash) ===\n"
+            << "Type 'exit' or Ctrl+D to quit.\n\n";
+  for (std::string input;;) {
+    std::cout << ">>> User: " << std::flush;
+    if (!std::getline(std::cin, input) || input == "exit" || input == "quit")
+      break;
+    if (input.empty())
+      continue;
+    std::cout << "<<< Assistant: ";
+    std::string reply;
+    if (turn(input, &reply) != 0)
+      return 1;
+    const auto parsed =
+        glm::ParseResponse(reply, {}, template_options.enable_thinking);
+    glm::ChatMessage response;
+    response.role = glm::ChatRole::kAssistant;
+    response.reasoning_content = parsed.reasoning;
+    response.content = parsed.content;
+    history.push_back(std::move(response));
+    std::cout << '\n';
+  }
+  return 0;
 }
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -994,6 +1153,8 @@ int RunPrompt(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
   ResolvePromptSampling(*reader, &opt);
+  if (models::glm53_flash::IsGlm53Flash(*reader))
+    return RunGlm53(opt, model_load_start, /*interactive=*/false);
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
@@ -1217,6 +1378,8 @@ int RunChat(std::span<const char* const> args) {
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
   ResolvePromptSampling(*reader, &opt);
+  if (models::glm53_flash::IsGlm53Flash(*reader))
+    return RunGlm53(opt, model_load_start, /*interactive=*/true);
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {

@@ -2112,6 +2112,42 @@ void TestServerInstructionsAreFraming() {
              "plain and JSON answers retain the native output dialect");
     }
   }
+  {
+    // GLM calls have no grammar: tools leave the request unconstrained, and
+    // only a response format binds a constraint.
+    const ConstraintRunner glm_runner(
+        gufo::sampling::JsonConstraint::ToolFormat::kGlm);
+    for (const bool json : {false, true}) {
+      ChatRequest request;
+      request.tool_choice = ChatRequest::ToolChoice::kRequired;
+      request.tools.push_back({.name = "record",
+                               .description = {},
+                               .parameters_json = R"({"type":"object"})",
+                               .definition_json = {}});
+      if (json)
+        request.response_format = gufo::sampling::JsonConstraint::Compile(
+            gufo::json::parse(
+                R"({"type":"object","properties":{},"additionalProperties":false})"),
+            false);
+      gufo::sampling::SamplingConfig sampling;
+      std::optional<gufo::sampling::JsonConstraint::ToolFormat> observed;
+      const auto constrained = gufo::server::ConstrainChatRequest(
+          request, glm_runner, &sampling, &observed);
+      Expect(observed == gufo::sampling::JsonConstraint::ToolFormat::kGlm &&
+                 constrained.has_value() == json &&
+                 (sampling.constraint != nullptr) == json,
+             "GLM tools are parsed, not constrained");
+    }
+    bool rejected = false;
+    try {
+      (void)gufo::sampling::JsonConstraint::ToolParameters(
+          gufo::json::parse(R"({"type":"object"})"), false,
+          gufo::sampling::JsonConstraint::ToolFormat::kGlm);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    Expect(rejected, "the tool grammar builder rejects the GLM format");
+  }
   std::vector<std::string> vocab;
   for (int i = 0; i < 256; ++i)
     vocab.emplace_back(1, static_cast<char>(i));

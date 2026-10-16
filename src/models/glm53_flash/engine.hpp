@@ -1,0 +1,110 @@
+#ifndef GUFO_MODELS_GLM53_FLASH_ENGINE_HPP_
+#define GUFO_MODELS_GLM53_FLASH_ENGINE_HPP_
+
+// GLM-5.3-Flash runtime: a GGUF with general.architecture = glm5-next loads
+// into one resident GPU Executor (executor.hpp) with its tokenizer, and
+// hands out a ForwardSession for generator.hpp. The Executor owns weights and
+// sequence state together, so a Model serves one session at a time.
+//
+// The MLA / MoE sub-layers are Lane B's GPU operators (layer_ops.hpp). A
+// build without them (GLM53_LANE_B_OPS undefined) refuses every load with
+// kLaneBMissingError before reading weights; nothing falls back to a slower
+// or partial path.
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include "src/core/gguf_reader.hpp"
+#include "src/models/glm53_flash/config.hpp"
+#include "src/models/glm53_flash/generator.hpp"
+#include "src/models/glm53_flash/tokenizer.hpp"
+
+namespace gufo::models::glm53_flash {
+
+class Executor;
+
+/// `general.architecture` of a GLM-5.3-Flash GGUF.
+inline constexpr std::string_view kArchitecture = "glm5-next";
+
+/// Why a build without Lane B's GPU operators cannot load the model.
+inline constexpr std::string_view kLaneBMissingError =
+    "GLM-5.3-Flash: GPU MLA/MoE operators not built yet (Lane B)";
+
+/// True for a GGUF whose architecture is kArchitecture.
+[[nodiscard]] bool IsGlm53Flash(const core::GgufReader& reader);
+
+/// True when this build can run GLM-5.3-Flash: ROCm and Lane B's operators.
+/// Otherwise false, with the reason (kLaneBMissingError first).
+[[nodiscard]] bool RuntimeAvailable(std::string* error = nullptr);
+
+struct ModelOptions {
+  /// Positions per sequence (MLA cache capacity). 0 = the GGUF's context
+  /// length.
+  std::uint32_t max_context{4096};
+  /// Tokens per executor pass; longer prefills run in several passes.
+  std::uint32_t prefill_chunk{256};
+};
+
+class Model final : public std::enable_shared_from_this<Model> {
+public:
+  ~Model();
+  Model(const Model&) = delete;
+  Model& operator=(const Model&) = delete;
+  Model(Model&&) = delete;
+  Model& operator=(Model&&) = delete;
+
+  /// Opens `model_path`, checks the architecture and that this build has the
+  /// runtime (RuntimeAvailable), then reads config, tokenizer and weights and
+  /// uploads them. nullptr with `error` on any failure.
+  [[nodiscard]] static std::shared_ptr<Model> Load(
+      const std::string& model_path, const ModelOptions& options,
+      std::string* error = nullptr);
+
+  /// The model's only sequence. nullptr (with `error`) while another session
+  /// is alive. The session keeps the model alive.
+  [[nodiscard]] std::unique_ptr<ForwardSession> CreateSession(
+      std::string* error = nullptr);
+
+  [[nodiscard]] const Tokenizer& tokenizer() const noexcept {
+    return *tokenizer_;
+  }
+  [[nodiscard]] const Config& config() const noexcept;
+  [[nodiscard]] const StopTokens& stop_tokens() const noexcept {
+    return stops_;
+  }
+  [[nodiscard]] std::uint32_t MaxContext() const noexcept {
+    return max_context_;
+  }
+  [[nodiscard]] std::uint32_t VocabSize() const noexcept;
+  /// `general.name`, else kArchitecture.
+  [[nodiscard]] std::string ModelName() const { return name_; }
+  [[nodiscard]] std::size_t DeviceBytes() const noexcept;
+
+private:
+  struct Impl;
+  class Session;
+  Model();
+
+  std::unique_ptr<Impl> impl_;
+  std::unique_ptr<Tokenizer> tokenizer_;
+  StopTokens stops_;
+  std::uint32_t max_context_{0};
+  std::string name_;
+  std::atomic<bool> session_alive_{false};
+};
+
+#if defined(ENGINE_ENABLE_HIP)
+/// `executor` (embedding and head uploaded) as a ForwardSession of
+/// `capacity` positions and `vocab` logits. The executor must outlive it.
+/// Used by Model and by GPU tests with stand-in operators.
+[[nodiscard]] std::unique_ptr<ForwardSession> MakeExecutorSession(
+    Executor& executor, std::uint32_t capacity, std::uint32_t vocab);
+#endif
+
+}  // namespace gufo::models::glm53_flash
+
+#endif  // GUFO_MODELS_GLM53_FLASH_ENGINE_HPP_
