@@ -46,6 +46,9 @@ target_compile_definitions(glm53_flash_kda_reference_test PRIVATE
 
 if (ENGINE_ENABLE_HIP)
   add_glm53_flash_test(kda_ops gufo_glm53_flash_reference "hip;gpu;gfx1151")
+  # GPU KDA mixer (executor.hpp) vs ReferenceModel on a synthetic layer.
+  add_glm53_flash_test(kda_executor gufo_glm53_flash_reference
+    "hip;gpu;gfx1151")
 endif()
 
 # Full CPU reference forward vs the HF tiny e2e fixture
@@ -62,6 +65,18 @@ add_executable(glm53_flash_reference_probe
 target_link_libraries(glm53_flash_reference_probe PRIVATE
   gufo_glm53_flash_reference)
 set_target_properties(glm53_flash_reference_probe PROPERTIES EXCLUDE_FROM_ALL ON)
+
+# KDA executor parity probe (not a test): GPU KdaMixerForward vs the CPU
+# ReferenceModel on layers 0-2 of a real GGUF
+# (tools/glm53/kda_executor_probe.cpp, see /server/staging/glm53-gufo/a3).
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_kda_executor_probe
+    ${PROJECT_SOURCE_DIR}/tools/glm53/kda_executor_probe.cpp)
+  target_link_libraries(glm53_flash_kda_executor_probe PRIVATE
+    gufo_glm53_flash_reference)
+  set_target_properties(glm53_flash_kda_executor_probe PROPERTIES
+    EXCLUDE_FROM_ALL ON)
+endif()
 
 # Tokenizer parity probe (not a test): encodes a hex-line corpus for
 # comparison with llama-tokenize (see /server/staging/glm53-gufo/a6).
