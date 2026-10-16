@@ -1812,14 +1812,19 @@ void ParseGlmCalls(std::string_view text,
                                 .is_string = argument.is_string});
     return call;
   };
+  // After an accepted call, prose quote state restarts at its end: argument
+  // bytes belong to the call, so an unmatched backtick in one value must not
+  // quote the next call (as ParseCalls does for Qwen).
+  QuoteTracker after_call;
+  const QuoteTracker* active = &quotes;
   std::size_t cursor = 0;
   while ((cursor = text.find(glm::ToolSyntax::kCallOpen, cursor)) !=
          std::string_view::npos) {
-    if (quotes.QuotedAt(origin + cursor)) {
+    if (active->QuotedAt(origin + cursor)) {
       cursor += glm::ToolSyntax::kCallOpen.size();
       continue;
     }
-    if (partial && quotes.UnclosedAt(origin + cursor))
+    if (partial && active->UnclosedAt(origin + cursor))
       break;  // A closing delimiter may still quote it.
     const auto scan = glm::ScanToolCall(text.substr(cursor));
     if (scan.call && scan.call->complete) {
@@ -1827,6 +1832,9 @@ void ParseGlmCalls(std::string_view text,
       if (spans)
         spans->emplace_back(cursor, cursor + scan.end);
       cursor += scan.end;
+      after_call.Reset(text, cursor);
+      active = &after_call;
+      origin = 0;
       const bool declared = std::ranges::any_of(tools, [&](const auto& tool) {
         return tool.name == calls->back().name;
       });

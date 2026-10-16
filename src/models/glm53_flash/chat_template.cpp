@@ -1286,6 +1286,9 @@ ParsedResponse ParseResponse(std::string_view text,
     if (scan.call && scan.call->complete) {
       response.tool_calls.push_back(InterpretCall(*scan.call, tools));
       cursor = open + scan.end;
+      // Argument bytes belong to the call: restart prose quote state after
+      // it, so an unmatched backtick in a value cannot quote the next call.
+      quotes.Reset(rest, cursor);
       continue;
     }
     if (scan.malformed) {
