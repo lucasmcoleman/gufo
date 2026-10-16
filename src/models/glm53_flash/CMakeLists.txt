@@ -27,6 +27,9 @@ if (ENGINE_ENABLE_HIP)
   target_compile_options(gufo_glm53_flash PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-command-line-argument>)
   target_link_libraries(gufo_glm53_flash PUBLIC hip::host)
+  # GPU executor (host code). Projections use gufo_core's quant GEMMs
+  # (src/models/qwen/hip/ops/gemm.hpp), linked through gufo_core above.
+  target_sources(gufo_glm53_flash PRIVATE executor.cpp)
 endif()
 
 # Lane B (MLA, DSA indexer, MoE) sources live in a fragment its owner edits;
