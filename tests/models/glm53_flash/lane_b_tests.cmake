@@ -20,3 +20,7 @@ if (Python3_Interpreter_FOUND)
     LABELS "glm53_flash;cpu;external-fixture"
     SKIP_RETURN_CODE 77)
 endif()
+
+if (ENGINE_ENABLE_HIP)
+  add_glm53_flash_test(lane_b_dense gufo_glm53_flash "hip;gpu;gfx1151")
+endif()
