@@ -282,6 +282,7 @@ ReferenceModel::ReferenceModel(const Config& config,
 
 void ReferenceModel::Reset() {
   position_ = 0;
+  failed_ = false;
   kda_.assign(config_.num_layers, {});
   mla_.assign(config_.num_layers, {});
   const std::size_t kda_dim = config_.KdaDim();
@@ -302,6 +303,10 @@ ReferenceModel::Output ReferenceModel::Forward(
   const std::size_t hidden = config_.hidden_size;
   const std::size_t hc_dim = config_.HcDim();
   Output out;
+  if (failed_) {
+    throw std::logic_error(
+        "ReferenceModel: a previous Forward failed partway; call Reset()");
+  }
   if (n == 0) {
     return out;
   }
@@ -319,6 +324,10 @@ ReferenceModel::Output ReferenceModel::Forward(
     HcInit(config_, e.data(), H.data() + (t * hc_dim));
   }
 
+  // The layers append to the KDA and MLA caches before position_ advances.
+  // If anything below throws, those caches no longer match position_, so the
+  // model is marked failed instead of silently computing from mixed state.
+  failed_ = true;
   for (std::uint32_t il = 0; il < config_.num_layers; ++il) {
     Layer(il, n, H, tap);
   }
@@ -351,6 +360,7 @@ ReferenceModel::Output ReferenceModel::Forward(
     }
   }
   position_ += n;
+  failed_ = false;
   return out;
 }
 

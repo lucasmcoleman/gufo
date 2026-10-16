@@ -502,6 +502,54 @@ int CheckLogits(const glm::Config& config, const Fixture& fx) {
 
 }  // namespace
 
+// (e): a Forward that throws partway (here from a tap at layer 3's
+// attention, after earlier layers already appended to their caches) must
+// leave the model unusable until Reset(); after Reset() it matches a fresh
+// model exactly (review #653).
+int CheckFailedForward(const glm::Config& config, const Fixture& fx,
+                       const ref::WeightSource& src,
+                       const std::vector<float>& full) {
+  const auto ids = Tokens(fx);
+  ref::ReferenceModel model(config, src);
+  const ref::TapFn thrower = [](std::string_view name, int layer, const float*,
+                                std::size_t, std::uint32_t) {
+    if (layer == 3 && name == "self_attn.out") {
+      throw std::runtime_error("injected failure");
+    }
+  };
+  int failures = 0;
+  bool threw = false;
+  try {
+    (void)model.Forward(ids, false, thrower);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  if (!threw || !model.Failed() || model.Position() != 0) {
+    std::cout << "FAIL failed-forward: injected throw not observed\n";
+    ++failures;
+  }
+  bool refused = false;
+  try {
+    (void)model.Forward(ids, false);
+  } catch (const std::logic_error&) {
+    refused = true;
+  }
+  if (!refused) {
+    std::cout << "FAIL failed-forward: retry without Reset() was accepted\n";
+    ++failures;
+  }
+  model.Reset();
+  const auto again = model.Forward(ids, false).hidden;
+  const double r = RelL2(again.data(), full.data(), full.size());
+  std::cout << "failed-forward: refused until Reset, then vs fresh rel_l2 " << r
+            << "\n";
+  if (!(r == 0.0) || model.Failed()) {
+    std::cout << "FAIL failed-forward: Reset() did not restore a fresh state\n";
+    ++failures;
+  }
+  return failures;
+}
+
 int main() {
   try {
     const glm::Config config = TinyConfig();
@@ -510,6 +558,7 @@ int main() {
     std::vector<float> hidden;
     int failures = CheckPrefill(config, fx, src, hidden);
     failures += CheckIncremental(config, fx, src, hidden);
+    failures += CheckFailedForward(config, fx, src, hidden);
     failures += CheckGgufSource(config, fx, hidden);
     failures += CheckLogits(config, fx);
     if (failures != 0) {
