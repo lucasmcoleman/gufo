@@ -204,7 +204,8 @@ int main() {
     }
     for (std::uint32_t t : {1U, 7U, 64U})
       Run(RandomCase(t, 4096, 100 + t));
-    Run(RandomCase(5, 4100, 7));  // generic path, scalar HcPost
+    Run(RandomCase(5, 4100, 7));  // generic HcPre path, Vec4 HcPost
+    Run(RandomCase(5, 4101, 9));  // generic HcPre path, scalar HcPost
 
     const auto fx = glm53_hc_fixture::Load(GLM53_HC_FIXTURE);
     Case k;

@@ -73,6 +73,14 @@ void ExpectNear(const float* got, const float* want, std::size_t n, double tol,
   double worst = 0.0;
   std::size_t at = 0;
   for (std::size_t i = 0; i < n; ++i) {
+    // NaN compares false against any bound, so a non-finite value must be
+    // rejected explicitly or it would pass silently.
+    if (!std::isfinite(got[i]) || !std::isfinite(want[i])) {
+      std::cerr << "FAIL: " << what << " [" << i << "] non-finite got "
+                << got[i] << " want " << want[i] << "\n";
+      ++failures;
+      return;
+    }
     const double err = std::abs(static_cast<double>(got[i]) - want[i]) /
                        std::max(1.0, std::abs(static_cast<double>(want[i])));
     if (err > worst) {

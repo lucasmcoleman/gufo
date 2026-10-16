@@ -25,5 +25,15 @@ if (ENGINE_ENABLE_HIP)
     GLM53_HC_FIXTURE="${GLM53_HC_FIXTURE}")
 endif()
 
+# HF-generated KDA fixture (fixtures/make_kda_fixture.py).
+set(GLM53_KDA_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/kda_fixture.bin")
+add_glm53_flash_test(kda_reference gufo_glm53_flash_reference "cpu")
+target_compile_definitions(glm53_flash_kda_reference_test PRIVATE
+  GLM53_KDA_FIXTURE="${GLM53_KDA_FIXTURE}")
+
+if (ENGINE_ENABLE_HIP)
+  add_glm53_flash_test(kda_ops gufo_glm53_flash_reference "hip;gpu;gfx1151")
+endif()
+
 # Lane B tests (owned by the Lane B fragment).
 include(${CMAKE_CURRENT_SOURCE_DIR}/lane_b_tests.cmake OPTIONAL)
