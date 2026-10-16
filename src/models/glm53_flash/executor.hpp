@@ -1,28 +1,38 @@
 #ifndef GUFO_MODELS_GLM53_FLASH_EXECUTOR_HPP_
 #define GUFO_MODELS_GLM53_FLASH_EXECUTOR_HPP_
 
-// GPU executor for GLM-5.3-Flash (Lane A). First milestone: the KDA mixer
-// sub-layer. The full executor (layer loop, hyper-connections, embedding,
-// head, Lane B's MlaForward / FfnForward) grows from the pieces here:
+// GPU executor for GLM-5.3-Flash (Lane A): the decoder layer loop with
+// hyper-connections, the KDA mixer, embedding and head, around Lane B's
+// MlaForward / FfnForward. Pieces, bottom up:
 //   DeviceArena     owns every device allocation (weights, state, scratch);
 //   UploadMatrix    copies one GGUF tensor to the device in its encoding;
-//   UploadKdaLayer  fills a KdaLayerDevice the way MLA / FFN layers will fill
-//                   MlaLayerDevice / FfnLayerDevice (layer_ops.hpp);
+//   UploadKdaLayer  fills a KdaLayerDevice; UploadMlaLayer / UploadFfnLayer
+//                   fill MlaLayerDevice / FfnLayerDevice (layer_ops.hpp);
 //   KdaMixerForward is the KDA counterpart of MlaForward, with the same
-//                   OpContext and call conventions (layer_ops.hpp).
-// The scalar contract is ReferenceModel::Kda (reference.cpp) on top of
-// reference_kda.hpp; the kernels between the projections are
-// kernels/kda.hpp.
+//                   OpContext and call conventions (layer_ops.hpp);
+//   LayerOps        the injectable MLA / FFN operator table;
+//   Executor        uploads a layer range plus embedding / head and runs
+//                   Forward (prefill, then incremental decode) on one
+//                   sequence.
+// The scalar contract is ReferenceModel (reference.cpp) on top of
+// reference_{hc,kda}.hpp; the kernels are kernels/{hc,kda}.hpp, gufo's
+// batched embedding lookup (any block format, Q6_K included) and RMSNorm.
 //
 // Projections run through gufo's GEMMs with F32 activations: Q8_0, Q8_K and
 // the in-kernel K-quant/IQ formats (Q3_K..Q6_K, IQ4_NL, IQ4_XS, IQ3_S) via
 // LaunchBatchedQuantGEMMFp32, F32 and BF16 via LaunchGEMV per token. Other
 // encodings are refused at upload. Every KDA projection of the Maya-S GGUF is
-// Q8_0 or Q6_K.
+// Q8_0 or Q6_K, and so are the embedding and output.weight (Q6_K). MLA and
+// FFN weights are uploaded in their GGUF encoding without a route check
+// (routed experts are IQ2_XXS etc.); the operators own their formats.
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/models/glm53_flash/config.hpp"
@@ -129,6 +139,195 @@ struct KdaState {
                                    std::uint32_t layer, const KdaLayerDevice& w,
                                    KdaState& state, const float* x,
                                    std::uint32_t tokens, float* y);
+
+// ---- MLA / FFN weights (Lane B's inputs) ----
+
+/// Uploads layer `il`'s MLA + DSA indexer weights into `out` as layer_ops.hpp
+/// lays them out: every matrix in its GGUF encoding (k_b / v_b keep their
+/// per-head stacks as `experts`), norms, the indexer LayerNorm and the ape
+/// table [kpool x indexer_dim] as F32. Fails on a non-MLA layer, a shape
+/// that does not match `config`, or an allocation failure. Synchronous.
+[[nodiscard]] bool UploadMlaLayer(DeviceArena& arena, const Config& config,
+                                  const LayerWeights& layer, std::uint32_t il,
+                                  MlaLayerDevice* out, std::string* error);
+
+/// Uploads layer `il`'s FFN: the dense SwiGLU on the leading dense layers,
+/// else router (F32), selection bias (F32), the routed expert stacks and the
+/// shared expert. Clamps come from config.swiglu_clamp_{exp,shexp}[il] (0
+/// past the end). Matrices keep their GGUF encoding. Synchronous.
+[[nodiscard]] bool UploadFfnLayer(DeviceArena& arena, const Config& config,
+                                  const LayerWeights& layer, std::uint32_t il,
+                                  FfnLayerDevice* out, std::string* error);
+
+// ---- Layer loop ----
+
+/// The MLA / FFN sub-layer operators and their sizing, with the signatures of
+/// the layer_ops.hpp functions. Production binds Lane B's (LaneBOps below);
+/// tests bind stand-ins. `mla` and `mla_cache_bytes` are required when the
+/// uploaded range has an MLA layer, `ffn` always; `op_scratch_bytes` may be
+/// empty (no operator scratch beyond the KDA mixer's).
+struct LayerOps {
+  std::function<std::size_t(const Config&, std::uint32_t)> mla_cache_bytes;
+  std::function<std::size_t(const Config&, std::uint32_t)> op_scratch_bytes;
+  std::function<bool(const OpContext&, const Config&, std::uint32_t,
+                     const MlaLayerDevice&, MlaCache&, const float*,
+                     std::uint32_t, std::uint32_t, float*)>
+      mla;
+  std::function<bool(const OpContext&, const Config&, std::uint32_t,
+                     const FfnLayerDevice&, const float*, std::uint32_t,
+                     float*)>
+      ffn;
+};
+
+// ---- PRODUCTION BINDING (Lane B) ----
+// MlaForward / FfnForward / MlaCacheBytes / OpScratchBytes are declared in
+// layer_ops.hpp but not yet defined (job #647). Once Lane B's sources define
+// them, add GLM53_LANE_B_OPS to gufo_glm53_flash's compile definitions and
+// pass LaneBOps() to Executor::Create. Until then nothing references them,
+// so the library links without Lane B.
+#if defined(GLM53_LANE_B_OPS)
+[[nodiscard]] LayerOps LaneBOps();
+#endif
+
+/// Device weights of one decoder layer. Only the mixer of the layer's kind is
+/// filled.
+struct LayerDevice {
+  struct Hc {
+    const float* fn{nullptr};     ///< [24][hc_dim]
+    const float* base{nullptr};   ///< [24]
+    const float* scale{nullptr};  ///< [3]
+  };
+  Hc hc_attn, hc_ffn;
+  const float* attn_norm{nullptr};  ///< [hidden]
+  const float* ffn_norm{nullptr};   ///< [hidden]
+  KdaLayerDevice kda;
+  MlaLayerDevice mla;
+  FfnLayerDevice ffn;
+};
+
+/// What Executor::Create uploads and how much it allocates.
+struct ExecutorOptions {
+  std::uint32_t first_layer{0};
+  std::uint32_t last_layer{0};  ///< Exclusive; 0 = every trunk layer.
+  bool embed{true};             ///< token_embd; needs first_layer == 0.
+  bool head{true};              ///< output_norm and, if bound, output.weight.
+  /// Tokens per pass (activation and operator scratch). Longer calls run in
+  /// consecutive passes, which is exact (state carries across passes).
+  std::uint32_t max_tokens{64};
+  std::uint32_t capacity{4096};  ///< Positions per MLA cache.
+};
+
+/// Host copies of a Forward's results.
+struct ForwardResult {
+  std::vector<float> hidden;   ///< [T][hidden] final_norm.out (head only)
+  std::vector<float> logits;   ///< [T][vocab] when requested and bound
+  std::vector<float> streams;  ///< [T][hc][hidden] after the last layer run
+};
+
+/// Layer index reported to taps outside any layer ("hc_head.out",
+/// "final_norm.out"; ReferenceModel uses -1).
+inline constexpr std::uint32_t kNoLayer = UINT32_MAX;
+
+/// GPU forward over a layer range of one sequence, with the structure of
+/// ReferenceModel::Forward: 4 embedding copies, per layer [HcPre -> RMSNorm
+/// -> mixer -> HcPost, then the same with the FFN], mean head, final RMSNorm,
+/// output. Owns its stream, weights, per-sequence state (KDA state per KDA
+/// layer, an MlaCache of MlaCacheBytes per MLA layer) and scratch.
+///
+/// Taps (when `tap` is set) use ReferenceModel's names, so a probe can diff
+/// per layer: in, attn_hc.out0 (post [hc]), attn_hc.out1 (comb [hc*hc],
+/// [src][dst]), attn_hc.out2, input_layernorm.out, self_attn.out, ffn_hc.in,
+/// ffn_hc.out0/1/2, post_attention_layernorm.out, mlp.out, out0, then
+/// hc_head.out and final_norm.out (layer kNoLayer). Stream taps (in,
+/// ffn_hc.in, out0) are ne0 = hidden, ne1 = hc, ne2 = tokens; the others
+/// ne0 = width, ne1 = tokens. The executor synchronises its stream before
+/// each of its own taps; operator taps (e.g. "kda_out") follow layer_ops.hpp.
+class Executor {
+public:
+  /// Uploads [first_layer, last_layer) and the requested embedding / head,
+  /// allocates state and scratch. nullptr (with `error`) on a bad range, a
+  /// missing operator, an upload or an allocation failure.
+  [[nodiscard]] static std::unique_ptr<Executor> Create(
+      const ModelWeights& weights, const ExecutorOptions& options, LayerOps ops,
+      std::string* error);
+
+  ~Executor();
+  Executor(const Executor&) = delete;
+  Executor& operator=(const Executor&) = delete;
+
+  /// Zeroes every KDA state and MLA cache; the next call is a fresh prefill.
+  /// Also clears a failed state. False if the reset could not be enqueued.
+  [[nodiscard]] bool Reset();
+  [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
+  /// True after a call failed partway: state no longer matches Position(),
+  /// so calls are refused until Reset().
+  [[nodiscard]] bool Failed() const noexcept { return failed_; }
+  [[nodiscard]] std::size_t DeviceBytes() const noexcept {
+    return arena_.bytes();
+  }
+  [[nodiscard]] const LayerDevice& Layer(std::uint32_t il) const {
+    return layers_.at(il);
+  }
+  [[nodiscard]] Stream stream() const noexcept { return stream_; }
+
+  /// Runs `tokens` at positions Position() .. Position()+T-1 and advances.
+  /// Needs the embedding. Fills `out->hidden` and (with `want_logits` and
+  /// output.weight bound) `out->logits` when the head is uploaded, else
+  /// `out->streams`. Synchronous.
+  [[nodiscard]] bool Forward(std::span<const std::int32_t> tokens,
+                             bool want_logits, ForwardResult* out,
+                             const TapFn* tap, std::string* error);
+
+  /// As Forward, from host residual streams [T][hc][hidden] entering
+  /// first_layer instead of token ids (a layer range starting past 0).
+  [[nodiscard]] bool ForwardStreams(const float* streams,
+                                    std::uint32_t n_tokens, bool want_logits,
+                                    ForwardResult* out, const TapFn* tap,
+                                    std::string* error);
+
+private:
+  Executor(const ModelWeights& weights, const ExecutorOptions& options,
+           LayerOps ops);
+  bool Init(std::string* error);
+  bool Run(const std::int32_t* tokens, const float* streams,
+           std::uint32_t n_tokens, bool want_logits, ForwardResult* out,
+           const TapFn* tap, std::string* error);
+  bool Pass(const std::int32_t* tokens, const float* streams, std::uint32_t n,
+            bool want_logits, ForwardResult* out, const TapFn* tap,
+            std::string* error);
+  bool HalfLayer(std::uint32_t il, bool ffn, std::uint32_t n,
+                 std::uint32_t pos0, const TapFn* tap);
+  void Emit(const TapFn* tap, std::string_view name, std::uint32_t layer,
+            const float* data, std::uint64_t ne0, std::uint64_t ne1,
+            std::uint64_t ne2 = 1);
+
+  const ModelWeights& weights_;
+  const Config& config_;
+  ExecutorOptions options_;
+  LayerOps ops_;
+  DeviceArena arena_;
+  Stream stream_{};
+  std::vector<LayerDevice> layers_;  ///< Indexed by layer; filled in range.
+  std::vector<KdaState> kda_;        ///< Indexed by layer; KDA layers.
+  std::vector<MlaCache> mla_;        ///< Indexed by layer; MLA layers.
+  DeviceMatrix embd_;
+  DeviceMatrix output_;
+  const float* output_norm_{nullptr};
+  // Activations of one pass, [max_tokens] rows each.
+  float* streams_{nullptr};   ///< [T][hc][hidden]
+  float* x_{nullptr};         ///< HcPre collapse, then the embedding row
+  float* xn_{nullptr};        ///< RMS-normalised sub-layer input
+  float* a_{nullptr};         ///< sub-layer output; head mean
+  float* split_{nullptr};     ///< [T][24] pre | post | comb
+  float* tap_post_{nullptr};  ///< [T][hc], taps only
+  float* tap_comb_{nullptr};  ///< [T][hc*hc], taps only
+  float* logits_{nullptr};    ///< [T][vocab]
+  std::uint32_t* ids_{nullptr};
+  void* scratch_{nullptr};
+  std::size_t scratch_bytes_{0};
+  std::uint32_t position_{0};
+  bool failed_{false};
+};
 
 }  // namespace gufo::models::glm53_flash
 
