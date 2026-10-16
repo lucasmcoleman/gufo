@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/quote_tracker.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::models::glm53_flash {
@@ -1036,9 +1037,110 @@ ToolCallScan ScanToolCall(std::string_view text) {
 
 namespace {
 
-// Whether `schema` (a tool's parameters) allows only strings for `name`.
-bool SchemaStringOnly(std::span<const ChatTool> tools, std::string_view tool,
-                      std::string_view name) {
+// JSON value types a schema permits, as a bit set over Node::Kind. Numbers
+// are one bit: the parser keeps int and float spellings apart, a schema does
+// not.
+using TypeMask = unsigned;
+constexpr TypeMask kMaskNull = 1U << 0;
+constexpr TypeMask kMaskBool = 1U << 1;
+constexpr TypeMask kMaskNumber = 1U << 2;
+constexpr TypeMask kMaskString = 1U << 3;
+constexpr TypeMask kMaskArray = 1U << 4;
+constexpr TypeMask kMaskObject = 1U << 5;
+constexpr TypeMask kMaskAny = 0x3FU;
+
+TypeMask MaskOfKind(Node::Kind kind) {
+  switch (kind) {
+    case Node::Kind::kNull:
+      return kMaskNull;
+    case Node::Kind::kBool:
+      return kMaskBool;
+    case Node::Kind::kInt:
+    case Node::Kind::kFloat:
+      return kMaskNumber;
+    case Node::Kind::kString:
+      return kMaskString;
+    case Node::Kind::kArray:
+      return kMaskArray;
+    case Node::Kind::kObject:
+      break;
+  }
+  return kMaskObject;
+}
+
+// The mask of a JSON value in a schema's enum or const.
+TypeMask MaskOfSchemaValue(const json::Value& value) {
+  if (value.is_null())
+    return kMaskNull;
+  if (value.is_bool())
+    return kMaskBool;
+  if (value.is_number())
+    return kMaskNumber;
+  if (value.is_string())
+    return kMaskString;
+  return value.is_array() ? kMaskArray : kMaskObject;
+}
+
+TypeMask MaskOfTypeName(std::string_view name) {
+  if (name == "string")
+    return kMaskString;
+  if (name == "integer" || name == "number")
+    return kMaskNumber;
+  if (name == "boolean")
+    return kMaskBool;
+  if (name == "null")
+    return kMaskNull;
+  if (name == "array")
+    return kMaskArray;
+  if (name == "object")
+    return kMaskObject;
+  return kMaskAny;  // Unknown name: no restriction rather than a guess.
+}
+
+// Types a property schema permits: the intersection of what `type`, `enum`,
+// `const` and `anyOf`/`oneOf` each allow. A keyword that is absent, or that a
+// reader cannot interpret, restricts nothing, so a schema without any of them
+// keeps the unrestricted default.
+TypeMask SchemaTypeMask(const json::Value& schema) {
+  TypeMask mask = kMaskAny;
+  if (!schema.is_object())
+    return mask;
+  if (const auto* type = schema.find("type"); type != nullptr) {
+    if (type->is_string()) {
+      mask &= MaskOfTypeName(type->str());
+    } else if (type->is_array() && !type->items().empty()) {
+      TypeMask named = 0;
+      for (const auto& item : type->items())
+        named |= item.is_string() ? MaskOfTypeName(item.str()) : kMaskAny;
+      mask &= named;
+    }
+  }
+  if (const auto* values = schema.find("enum");
+      values != nullptr && values->is_array() && !values->items().empty()) {
+    TypeMask named = 0;
+    for (const auto& item : values->items())
+      named |= MaskOfSchemaValue(item);
+    mask &= named;
+  }
+  if (const auto* constant = schema.find("const"); constant != nullptr)
+    mask &= MaskOfSchemaValue(*constant);
+  for (const char* keyword : {"anyOf", "oneOf"}) {
+    const auto* branches = schema.find(keyword);
+    if (branches == nullptr || !branches->is_array() ||
+        branches->items().empty())
+      continue;
+    TypeMask joined = 0;
+    for (const auto& branch : branches->items())
+      joined |= SchemaTypeMask(branch);
+    mask &= joined;
+  }
+  return mask;
+}
+
+// The types argument `name` of `tool` may take. Unknown tools and properties
+// are unrestricted.
+TypeMask ArgumentTypeMask(std::span<const ChatTool> tools,
+                          std::string_view tool, std::string_view name) {
   for (const auto& candidate : tools) {
     std::string tool_name = candidate.name;
     std::string parameters = candidate.parameters_json;
@@ -1061,23 +1163,12 @@ bool SchemaStringOnly(std::span<const ChatTool> tools, std::string_view tool,
       const auto* properties = schema.find("properties");
       const auto* property =
           properties != nullptr ? properties->find(std::string(name)) : nullptr;
-      if (property == nullptr)
-        return false;
-      const auto* type = property->find("type");
-      if (type == nullptr)
-        return false;
-      if (type->is_string())
-        return type->str() == "string";
-      if (type->is_array() && !type->items().empty())
-        return std::ranges::all_of(type->items(), [](const json::Value& t) {
-          return t.is_string() && t.str() == "string";
-        });
+      return property != nullptr ? SchemaTypeMask(*property) : kMaskAny;
     } catch (const std::exception&) {
-      return false;
+      return kMaskAny;
     }
-    return false;
   }
-  return false;
+  return kMaskAny;
 }
 
 ParsedToolCall InterpretCall(const ToolCallSyntax& syntax,
@@ -1089,11 +1180,15 @@ ParsedToolCall InterpretCall(const ToolCallSyntax& syntax,
     out.name = arg.name;
     out.value = arg.value;
     out.is_string = true;
-    if (!SchemaStringOnly(tools, syntax.name, arg.name)) {
+    const TypeMask allowed = ArgumentTypeMask(tools, syntax.name, arg.name);
+    if (allowed != kMaskString) {
       const auto trimmed = TrimAscii(arg.value);
       if (!trimmed.empty()) {
         const auto parsed = JsonReader(trimmed).Parse();
-        if (parsed && parsed->kind != Node::Kind::kString) {
+        // The decoded value stands only when the schema permits its type;
+        // otherwise "123" for a ["string","null"] property is the string.
+        if (parsed && parsed->kind != Node::Kind::kString &&
+            (allowed & MaskOfKind(parsed->kind)) != 0) {
           out.value = std::string(trimmed);
           out.is_string = false;
         }
@@ -1113,8 +1208,12 @@ ParsedToolCall InterpretToolCall(const ToolCallSyntax& syntax,
 
 bool IsStringArgument(std::span<const ChatTool> tools, std::string_view tool,
                       std::string_view argument) {
-  return SchemaStringOnly(tools, tool, argument);
+  return ArgumentTypeMask(tools, tool, argument) == kMaskString;
 }
+
+namespace {
+constexpr std::string_view kThinkOpen = "<think>";
+}  // namespace
 
 ParsedResponse ParseResponse(std::string_view text,
                              std::span<const ChatTool> tools,
@@ -1134,17 +1233,33 @@ ParsedResponse ParseResponse(std::string_view text,
     response.reasoning = std::string(rest.substr(0, close));
     response.reasoning_closed = true;
     rest.remove_prefix(close + ToolSyntax::kThinkClose.size());
-  } else if (rest.starts_with("<think>")) {
+  } else if (rest.starts_with(kThinkOpen)) {
     const auto close = rest.find(ToolSyntax::kThinkClose);
     if (close == std::string_view::npos) {
-      response.reasoning = std::string(rest.substr(7));
+      const std::size_t held =
+          partial ? PartialSuffix(rest, ToolSyntax::kThinkClose) : 0;
+      response.reasoning = std::string(rest.substr(
+          kThinkOpen.size(), rest.size() - kThinkOpen.size() - held));
+      response.held_back = held;
       return response;
     }
-    response.reasoning = std::string(rest.substr(7, close - 7));
+    response.reasoning =
+        std::string(rest.substr(kThinkOpen.size(), close - kThinkOpen.size()));
     response.reasoning_closed = true;
     rest.remove_prefix(close + ToolSyntax::kThinkClose.size());
+  } else if (partial && !rest.empty() && rest.size() < kThinkOpen.size() &&
+             kThinkOpen.starts_with(rest)) {
+    // A stream may still be spelling "<think>": it is not content yet.
+    response.held_back = rest.size();
+    return response;
   }
 
+  // A marker inside a backtick span or code fence is the model quoting the
+  // format, not calling it. Every candidate is asked, not just the first;
+  // a call's own argument values are skipped whole, so markup nested in one
+  // never starts a second call.
+  gufo::server::QuoteTracker quotes;
+  quotes.Reset(rest);
   std::size_t cursor = 0;
   while (cursor < rest.size()) {
     const auto open = rest.find(ToolSyntax::kCallOpen, cursor);
@@ -1157,6 +1272,16 @@ ParsedResponse ParseResponse(std::string_view text,
       return response;
     }
     response.content.append(rest.substr(cursor, open - cursor));
+    if (quotes.QuotedAt(open)) {
+      response.content.append(ToolSyntax::kCallOpen);
+      cursor = open + ToolSyntax::kCallOpen.size();
+      continue;
+    }
+    // An unfinished quote may yet cover this marker: a stream waits.
+    if (partial && quotes.UnclosedAt(open)) {
+      response.held_back = rest.size() - open;
+      return response;
+    }
     const auto scan = ScanToolCall(rest.substr(open));
     if (scan.call && scan.call->complete) {
       response.tool_calls.push_back(InterpretCall(*scan.call, tools));

@@ -27,7 +27,9 @@ std::optional<ChatRequest> ConstrainChatRequest(
   // (for example Qwen's whitespace boundary after </think>).
   if (tool_format)
     *tool_format = runner.ToolFormat();
-  // GLM calls have no native grammar; the HTTP layer parses them afterwards.
+  // GLM calls have no native grammar; the HTTP layer parses them afterwards,
+  // and enforces parallel_tool_calls=false there (ParseGlmCalls keeps only the
+  // first call, as the Qwen grammar ends generation after one).
   const bool constrain_tools =
       !request.tools.empty() &&
       request.tool_choice != ChatRequest::ToolChoice::kNone &&
