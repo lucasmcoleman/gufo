@@ -2,6 +2,7 @@
 # kernels, executor and the CPU oracle are added per lane.
 add_library(gufo_glm53_flash STATIC
   config.cpp
+  chat_template.cpp
   tokenizer.cpp
   weights.cpp)
 

@@ -17,6 +17,15 @@ set_tests_properties(glm53_flash.weights PROPERTIES SKIP_RETURN_CODE 77)
 add_glm53_flash_test(tokenizer gufo_glm53_flash "cpu;model")
 set_tests_properties(glm53_flash.tokenizer PROPERTIES SKIP_RETURN_CODE 77)
 
+# Chat template renderer and tool-call parser against jinja2 goldens
+# (fixtures/make_chat_template_fixture.py). The tokenizer part runs only with
+# GLM53_FLASH_GGUF set; the goldens need no model.
+set(GLM53_CHAT_TEMPLATE_GOLDENS
+  "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_template_goldens.json")
+add_glm53_flash_test(chat_template gufo_glm53_flash "cpu")
+target_compile_definitions(glm53_flash_chat_template_test PRIVATE
+  GLM53_CHAT_TEMPLATE_GOLDENS="${GLM53_CHAT_TEMPLATE_GOLDENS}")
+
 # HF-generated hyper-connection fixture (fixtures/make_hc_fixture.py).
 set(GLM53_HC_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hc_fixture.bin")
 add_glm53_flash_test(hc_reference gufo_glm53_flash_reference "cpu")
