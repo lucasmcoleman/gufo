@@ -176,6 +176,17 @@ struct ParsedToolCall {
   std::vector<ChatMessage::ToolArgument> arguments;
 };
 
+/// Types the arguments of a scanned call the way ParseResponse does (see
+/// ParseResponse below).
+[[nodiscard]] ParsedToolCall InterpretToolCall(const ToolCallSyntax& syntax,
+                                               std::span<const ChatTool> tools);
+
+/// True when `tools` restricts argument `argument` of tool `tool` to strings,
+/// so every value of it is a string whatever its spelling.
+[[nodiscard]] bool IsStringArgument(std::span<const ChatTool> tools,
+                                    std::string_view tool,
+                                    std::string_view argument);
+
 /// A generated response split into its parts.
 struct ParsedResponse {
   std::string reasoning;

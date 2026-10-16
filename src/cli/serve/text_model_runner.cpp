@@ -27,16 +27,18 @@ std::optional<ChatRequest> ConstrainChatRequest(
   // (for example Qwen's whitespace boundary after </think>).
   if (tool_format)
     *tool_format = runner.ToolFormat();
-  if (!request.response_format &&
-      (request.tools.empty() ||
-       request.tool_choice == ChatRequest::ToolChoice::kNone))
+  // GLM calls have no native grammar; the HTTP layer parses them afterwards.
+  const bool constrain_tools =
+      !request.tools.empty() &&
+      request.tool_choice != ChatRequest::ToolChoice::kNone &&
+      runner.ToolFormat() != sampling::JsonConstraint::ToolFormat::kGlm;
+  if (!request.response_format && !constrain_tools)
     return std::nullopt;
   auto constrained = request;
   auto instruction = request.response_format ? request.response_format->prompt()
                                              : std::string();
   auto grammar = request.response_format;
-  if (!request.tools.empty() &&
-      request.tool_choice != ChatRequest::ToolChoice::kNone) {
+  if (constrain_tools) {
     std::vector<sampling::JsonConstraint::Tool> tools;
     const bool required =
         request.tool_choice == ChatRequest::ToolChoice::kRequired;

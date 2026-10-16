@@ -218,7 +218,7 @@ endif()
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp)
-target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
+target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_glm53_flash)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
     gufo_qwen38_flash_next)
@@ -252,7 +252,8 @@ add_library(gufo_http STATIC
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21
+  gufo_glm53_flash)
 
 add_executable(gufo
   src/cli/main.cpp
@@ -267,6 +268,7 @@ add_executable(gufo
   src/cli/serve/text_model_runner.cpp
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
+  src/cli/serve/glm53_text_runner.cpp
   src/eval/http_client.cpp
 )
 target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
@@ -429,7 +431,7 @@ if (BUILD_TESTING)
     src/models/deepseek_v4_flash/chat_template.cpp
     src/models/deepseek_v4_flash/tool_calls.cpp
   )
-  target_link_libraries(openai_chat_test PRIVATE gufo_core)
+  target_link_libraries(openai_chat_test PRIVATE gufo_core gufo_glm53_flash)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")

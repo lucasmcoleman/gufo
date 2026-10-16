@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "src/cli/serve/component_text_cache.hpp"
+#include "src/cli/serve/glm53_text_runner.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -41,6 +42,7 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/glm53_flash/engine.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -3374,6 +3376,32 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
+  if (models::glm53_flash::IsGlm53Flash(*reader)) {
+    // A build without the model's GPU operators refuses before validating
+    // serving options or reading weights.
+    if (!models::glm53_flash::RuntimeAvailable(&load_error)) {
+      SetError(error, "Failed to create GLM-5.3-Flash model: " + load_error);
+      return false;
+    }
+    if (!vision_model_path.empty()) {
+      SetError(error, "GLM-5.3-Flash does not support --mmproj");
+      return false;
+    }
+    auto model = models::glm53_flash::Model::Load(
+        model_path,
+        models::glm53_flash::ModelOptions{
+            .max_context = max_context,
+            .prefill_chunk = models::glm53_flash::ModelOptions{}.prefill_chunk,
+        },
+        &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create GLM-5.3-Flash model: " + load_error);
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config), ram_cache_config);
+  }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
@@ -3726,6 +3754,62 @@ bool InferenceBackend::load(
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(std::shared_ptr<models::glm53_flash::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config,
+                            TextRunnerRamCacheOptions ram_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "GLM-5.3-Flash model must not be null");
+    return false;
+  }
+  if (max_context == 0)
+    max_context = model->MaxContext();
+  if (max_context > model->MaxContext()) {
+    SetError(error,
+             "HTTP context exceeds the loaded GLM-5.3-Flash model context");
+    return false;
+  }
+  if (session_count != 1) {
+    SetError(error, "GLM-5.3-Flash runs one sequence; use --sessions 1");
+    return false;
+  }
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+    SetError(error, "GLM-5.3-Flash does not support speculative decoding");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config)) {
+    SetError(error, "GLM-5.3-Flash does not support --cache-disk");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->sampling_defaults.model =
+        sampling::TextModelPreset::kUnspecified;
+    new_state->sampling_defaults.supplied = {};
+    auto runner =
+        MakeGlm53TextRunner(std::move(model), max_context,
+                            models::glm53_flash::ModelOptions{}.prefill_chunk);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = max_context;
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::nullopt, ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

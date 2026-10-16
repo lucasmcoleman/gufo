@@ -1106,6 +1106,16 @@ ParsedToolCall InterpretCall(const ToolCallSyntax& syntax,
 
 }  // namespace
 
+ParsedToolCall InterpretToolCall(const ToolCallSyntax& syntax,
+                                 std::span<const ChatTool> tools) {
+  return InterpretCall(syntax, tools);
+}
+
+bool IsStringArgument(std::span<const ChatTool> tools, std::string_view tool,
+                      std::string_view argument) {
+  return SchemaStringOnly(tools, tool, argument);
+}
+
 ParsedResponse ParseResponse(std::string_view text,
                              std::span<const ChatTool> tools,
                              bool prompt_opened_think, bool partial) {

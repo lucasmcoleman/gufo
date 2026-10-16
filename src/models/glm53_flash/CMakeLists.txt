@@ -3,6 +3,8 @@
 add_library(gufo_glm53_flash STATIC
   config.cpp
   chat_template.cpp
+  engine.cpp
+  generator.cpp
   tokenizer.cpp
   weights.cpp)
 

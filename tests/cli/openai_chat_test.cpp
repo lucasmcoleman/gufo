@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -6139,6 +6140,173 @@ void TestIncrementalToolArguments() {
       }
 }
 
+// GLM-5.3 calls (<arg_key>/<arg_value>) are parsed with the model's own
+// scanner: the opener is Qwen's, so the GLM format, not the bytes, selects
+// the dialect. Its requests are not grammar-constrained, so both transports
+// parse them as native unconstrained text with schema-typed arguments.
+void TestGlmToolCalls() {
+  using Value = gufo::json::Value;
+  using Format = gufo::sampling::JsonConstraint::ToolFormat;
+  const std::string call =
+      "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris"
+      "</arg_value><arg_key>days</arg_key><arg_value>3</arg_value>"
+      "</tool_call>";
+  const auto expected_args = gufo::json::parse(R"({"city":"Paris","days":3})");
+  const auto request_body = [](bool stream, bool thinking) {
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"weather"}],
+      "tools":[{"type":"function","function":{"name":"get_weather",
+        "parameters":{"type":"object","properties":{
+          "city":{"type":"string"},"days":{"type":"integer"}},
+          "required":["city"]}}}]})");
+    body["stream"] = stream;
+    body["chat_template_kwargs"]["enable_thinking"] = thinking;
+    return body;
+  };
+  for (const bool thinking : {false, true})
+    for (const bool stream : {false, true})
+      for (const bool responses : {false, true}) {
+        auto body = request_body(stream, thinking);
+        FakeBackend backend;
+        backend.tool_format = Format::kGlm;
+        const std::string raw =
+            std::string(thinking ? "Check it.</think>" : "") + "Let's look. " +
+            call;
+        for (const char byte : raw)
+          backend.pieces.emplace_back(1, byte);
+        gufo::server::HttpResponse response;
+        if (responses) {
+          auto flat = *body["tools"].items()[0].find("function");
+          flat["type"] = "function";
+          body["tools"] = Value::array();
+          body["tools"].push_back(std::move(flat));
+          gufo::server::ChatRequest chat;
+          chat.reasoning.enabled = thinking;
+          Expect(!gufo::server::ParseOpenAiResponseControls(body, &chat),
+                 "GLM Responses tool controls parse");
+          response = gufo::server::CreateOpenAiResponse(
+              Request(body.dump()), backend, chat, 256, {}, stream);
+        } else {
+          response =
+              gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+        }
+        Expect(response.status == 200, "GLM tool request succeeds");
+        std::vector<Value> output;
+        if (stream) {
+          response.streaming_body([&](std::string_view chunk) {
+            const auto pos = chunk.find("data: ");
+            if (pos != std::string_view::npos &&
+                !chunk.substr(pos + 6).starts_with("[DONE]"))
+              output.push_back(gufo::json::parse(chunk.substr(pos + 6)));
+            return true;
+          });
+        } else {
+          output.push_back(gufo::json::parse(response.body));
+        }
+        std::string reasoning;
+        std::string content;
+        std::string finish;
+        std::vector<Value> calls;
+        for (const auto& event : output) {
+          if (responses) {
+            const auto* result = stream ? event.find("response") : &event;
+            if (!result || result->member_str("status") != "completed")
+              continue;
+            for (const auto& item : result->find("output")->items()) {
+              if (item.member_str("type") == "function_call") {
+                Value call_json = Value::object();
+                call_json["function"]["name"] = item.member_str("name");
+                call_json["function"]["arguments"] =
+                    item.member_str("arguments");
+                calls.push_back(std::move(call_json));
+              } else if (item.member_str("type") == "message") {
+                for (const auto& part : item.find("content")->items())
+                  content += part.member_str("text");
+              } else if (item.member_str("type") == "reasoning") {
+                for (const auto& part : item.find("summary")->items())
+                  reasoning += part.member_str("text");
+              }
+            }
+            continue;
+          }
+          const auto* choices = event.find("choices");
+          if (!choices)
+            continue;
+          for (const auto& choice : choices->items()) {
+            if (!choice.member_str("finish_reason").empty())
+              finish = choice.member_str("finish_reason");
+            const auto* message = choice.find(stream ? "delta" : "message");
+            if (!message)
+              continue;
+            reasoning += message->member_str("reasoning_content");
+            if (const auto* text = message->find("content");
+                text && text->is_string())
+              content += text->str();
+            if (const auto* tools = message->find("tool_calls"))
+              AppendToolDeltas(calls, *tools, stream);
+          }
+        }
+        const std::string label =
+            std::string("GLM ") + (responses ? "responses" : "chat") +
+            (stream ? " stream" : "") + (thinking ? " thinking" : "");
+        Expect(calls.size() == 1, label + ": one call");
+        Expect(calls[0].find("function")->member_str("name") == "get_weather",
+               label + ": call name");
+        Expect(gufo::json::parse(
+                   calls[0].find("function")->member_str("arguments"))
+                       .dump() == expected_args.dump(),
+               label + ": schema-typed arguments");
+        Expect(Trimmed(content) == "Let's look.",
+               label + ": prose outside the call is content, got '" + content +
+                   "'");
+        Expect(Trimmed(reasoning) == (thinking ? "Check it." : ""),
+               label + ": reasoning, got '" + reasoning + "'");
+        if (!responses)
+          Expect(finish == "tool_calls", label + ": finish reason");
+        Expect(content.find("arg_") == std::string::npos &&
+                   reasoning.find("arg_") == std::string::npos,
+               label + ": call markup stays hidden");
+      }
+
+  {  // The dialect follows the format, not the shared opener.
+    const std::string qwen_call =
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n"
+        "</parameter>\n</function>\n</tool_call>";
+    for (const auto& [format, text, calls] :
+         {std::tuple{Format::kGlm, call, std::size_t{1}},
+          std::tuple{Format::kGlm, qwen_call, std::size_t{0}},
+          std::tuple{Format::kQwen, call, std::size_t{0}}}) {
+      FakeBackend backend;
+      backend.tool_format = format;
+      backend.pieces = {text};
+      const auto response = gufo::server::HandleOpenAiChat(
+          Request(request_body(false, false).dump()), backend);
+      const auto parsed = gufo::json::parse(response.body);
+      const auto* message = parsed.find("choices")->items()[0].find("message");
+      const auto* tools = message->find("tool_calls");
+      Expect((tools ? tools->size() : 0) == calls,
+             "tool dialect is selected by the backend's format");
+    }
+  }
+
+  {  // A truncated GLM call is never reported as a call.
+    for (std::size_t length = 0; length < call.size(); ++length) {
+      FakeBackend backend;
+      backend.tool_format = Format::kGlm;
+      backend.pieces = {call.substr(0, length)};
+      backend.finish_reason =
+          gufo::server::TextGenerationBackend::FinishReason::kLength;
+      const auto response = gufo::server::HandleOpenAiChat(
+          Request(request_body(false, false).dump()), backend);
+      Expect(response.status == 200, "truncated GLM call completes");
+      const auto parsed = gufo::json::parse(response.body);
+      Expect(!parsed.find("choices")->items()[0].find("message")->find(
+                 "tool_calls"),
+             "truncated GLM call is not a call");
+    }
+  }
+}
+
 int main() {
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();
@@ -6203,6 +6371,7 @@ int main() {
   TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();
   TestDeepSeekRepeatedToolParameters();
+  TestGlmToolCalls();
   TestDeepSeekSchemaCheckedArguments();
   TestStreamingStopsAtRejectedParameter();
   TestWrongModelIsRejected();

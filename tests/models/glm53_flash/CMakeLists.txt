@@ -26,6 +26,11 @@ add_glm53_flash_test(chat_template gufo_glm53_flash "cpu")
 target_compile_definitions(glm53_flash_chat_template_test PRIVATE
   GLM53_CHAT_TEMPLATE_GOLDENS="${GLM53_CHAT_TEMPLATE_GOLDENS}")
 
+# Generation loop (generator.hpp) on a scripted ForwardSession and a synthetic
+# tokenizer: stop tokens, prefix reuse, streaming tool calls, and the load
+# refusal without Lane B's operators (also on GLM53_FLASH_GGUF when set).
+add_glm53_flash_test(generator gufo_glm53_flash "cpu")
+
 # HF-generated hyper-connection fixture (fixtures/make_hc_fixture.py).
 set(GLM53_HC_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hc_fixture.bin")
 add_glm53_flash_test(hc_reference gufo_glm53_flash_reference "cpu")
@@ -64,6 +69,13 @@ if (ENGINE_ENABLE_HIP)
   add_glm53_flash_test(executor_loop gufo_glm53_flash_reference
     "hip;gpu;gfx1151")
   target_compile_definitions(glm53_flash_executor_loop_test PRIVATE
+    GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
+  # Generation loop (generator.hpp) on that executor through
+  # MakeExecutorSession: greedy tokens, prefix reuse and stop tokens vs the
+  # ReferenceModel.
+  add_glm53_flash_test(generator_gpu gufo_glm53_flash_reference
+    "hip;gpu;gfx1151")
+  target_compile_definitions(glm53_flash_generator_gpu_test PRIVATE
     GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
 endif()
 
