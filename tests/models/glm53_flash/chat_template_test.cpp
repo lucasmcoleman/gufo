@@ -309,8 +309,10 @@ void TestParseResponse() {
   Require(!args[2].is_string && args[2].value == "[1, \"a\"]",
           "undeclared JSON array");
   Require(args[3].is_string && args[3].value == "plain text", "plain string");
-  Require(!args[4].is_string && args[4].value == "7",
-          "string-or-null admits JSON");
+  // A ["string","null"] property permits a string or null, never a number:
+  // "7" is the string "7".
+  Require(args[4].is_string && args[4].value == "7",
+          "string-or-null keeps a numeric spelling as a string");
   Require(parsed.tool_calls[1].arguments[0].value == "Rome", "second call");
   Require(parsed.held_back == 0, "nothing held back");
 
@@ -357,6 +359,158 @@ void TestParseResponse() {
   Require(parsed.reasoning == "r" && parsed.content == "a", "explicit think");
   parsed = glm::ParseResponse("abc</thi", {}, true, true);
   Require(parsed.reasoning == "abc" && parsed.held_back == 5, "held </thi");
+}
+
+// An argument's decoded JSON is used only when the schema permits its type.
+void TestSchemaTypedArguments() {
+  const auto make_tool = [](const std::string& property) {
+    glm::ChatTool tool;
+    tool.definition_json =
+        "{\"type\":\"function\",\"function\":{\"name\":\"f\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"p\":" +
+        property + "}}}}";
+    return tool;
+  };
+  // {schema, value, expect the value stays a string}
+  struct Case {
+    std::string schema;
+    std::string value;
+    bool is_string;
+  };
+  const std::vector<Case> cases{
+      {R"({"type":["string","null"]})", "123", true},
+      {R"({"type":["string","null"]})", "null", false},
+      {R"({"type":["string","null"]})", "true", true},
+      {R"({"type":["string","null"]})", "[1]", true},
+      {R"({"type":["integer","null"]})", "5", false},
+      {R"({"type":["integer","null"]})", "null", false},
+      {R"({"type":"boolean"})", "7", true},
+      {R"({"type":"boolean"})", "true", false},
+      {R"({"type":"object"})", "123", true},
+      {R"({"type":"object"})", "{\"a\":1}", false},
+      {R"({"type":"array"})", "{\"a\":1}", true},
+      {R"({"enum":["a","b"]})", "123", true},
+      {R"({"enum":["a",null]})", "5", true},
+      {R"({"enum":["a",null]})", "null", false},
+      {R"({"enum":[1,2]})", "2", false},
+      {R"({"enum":["1","2"]})", "2", true},
+      {R"({"const":"7"})", "7", true},
+      {R"({"const":7})", "7", false},
+      {R"({"anyOf":[{"type":"string"},{"type":"null"}]})", "123", true},
+      {R"({"anyOf":[{"type":"string"},{"type":"null"}]})", "null", false},
+      {R"({"anyOf":[{"type":"string"},{"type":"integer"}]})", "123", false},
+      {R"({"oneOf":[{"type":"string"},{"enum":["x"]}]})", "123", true},
+      {R"({"anyOf":[{"type":"string"},{"description":"anything"}]})", "123",
+       false},
+      {R"({"description":"no type"})", "123", false},
+  };
+  for (const auto& c : cases) {
+    const std::vector<glm::ChatTool> tools{make_tool(c.schema)};
+    const auto parsed =
+        glm::ParseResponse("<tool_call>f<arg_key>p</arg_key><arg_value>" +
+                               c.value + "</arg_value></tool_call>",
+                           tools, false);
+    Require(parsed.tool_calls.size() == 1, "call for " + c.schema);
+    const auto& arg = parsed.tool_calls[0].arguments.at(0);
+    Require(arg.is_string == c.is_string && arg.value == c.value,
+            "schema " + c.schema + " value " + c.value +
+                ": is_string=" + (arg.is_string ? "true" : "false"));
+  }
+  const std::vector<glm::ChatTool> plain{make_tool(R"({"type":"string"})")};
+  Require(glm::IsStringArgument(plain, "f", "p"), "string-only property");
+  Require(
+      glm::IsStringArgument({{make_tool(R"({"enum":["a","b"]})")}}, "f", "p"),
+      "string enum is string-only");
+  Require(!glm::IsStringArgument({{make_tool(R"({"type":["string","null"]})")}},
+                                 "f", "p"),
+          "nullable string is not string-only");
+}
+
+// A call quoted after a real call is documentation, not a second call.
+void TestQuotedExampleAfterCall() {
+  const std::string call =
+      "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris"
+      "</arg_value></tool_call>";
+  const std::string text = call + " Example: `" + call + "`";
+  const auto parsed = glm::ParseResponse(text, {}, false);
+  Require(parsed.tool_calls.size() == 1,
+          "quoted copy is not a call, got " +
+              std::to_string(parsed.tool_calls.size()));
+  Require(parsed.content == " Example: `" + call + "`",
+          "quoted copy stays content: " + parsed.content);
+
+  const std::string fenced = call + "\n```\n" + call + "\n```\n";
+  Require(glm::ParseResponse(fenced, {}, false).tool_calls.size() == 1,
+          "fenced copy is not a call");
+  // A quoted call that opens the response is prose as well.
+  Require(glm::ParseResponse("`" + call + "`", {}, false).tool_calls.empty(),
+          "quoted first call is not a call");
+  // Two real calls, and markup nested in an argument value, are unchanged.
+  Require(glm::ParseResponse(call + call, {}, false).tool_calls.size() == 2,
+          "two real calls");
+  const auto nested = glm::ParseResponse(
+      "<tool_call>f<arg_key>a</arg_key><arg_value>see <tool_call>g"
+      "</arg_value></tool_call>",
+      {}, false);
+  Require(nested.tool_calls.size() == 1 && nested.content.empty(),
+          "nested value stays one call");
+
+  // A stream never reports the quoted copy, at any prefix.
+  std::string seen_content;
+  for (std::size_t n = 0; n <= text.size(); ++n) {
+    const auto p = glm::ParseResponse(text.substr(0, n), {}, false, true);
+    Require(p.tool_calls.size() <= 1,
+            "quoted copy streamed as a call at " + std::to_string(n));
+    Require(p.content.starts_with(seen_content), "content only grows");
+    seen_content = p.content;
+  }
+  Require(glm::ParseResponse(text, {}, false, true).content ==
+              " Example: `" + call + "`",
+          "stream end content");
+}
+
+// Without a prompt-opened <think>, byte-wise streaming of an explicit
+// reasoning block yields what the final parse does, whatever the split.
+void TestExplicitThinkPrefixes() {
+  for (const std::string& text :
+       {std::string("<think>reason</think>answer"),
+        std::string("<think>a</b></think>x"), std::string("<think>r"),
+        std::string("<th")}) {
+    const auto whole = glm::ParseResponse(text, {}, false, false);
+    std::string reasoning;
+    std::string content;
+    for (std::size_t n = 0; n <= text.size(); ++n) {
+      const auto p = glm::ParseResponse(text.substr(0, n), {}, false, true);
+      Require(p.reasoning.starts_with(reasoning),
+              "reasoning only grows at " + std::to_string(n) + " of " + text);
+      Require(p.content.starts_with(content),
+              "content only grows at " + std::to_string(n) + " of " + text);
+      Require(p.reasoning.find('<') == std::string::npos ||
+                  whole.reasoning.find('<') != std::string::npos,
+              "partial tag in reasoning at " + std::to_string(n));
+      Require(p.content.find("<think") == std::string::npos ||
+                  whole.content.find("<think") != std::string::npos,
+              "partial tag in content at " + std::to_string(n));
+      reasoning = p.reasoning;
+      content = p.content;
+    }
+    const auto end = glm::ParseResponse(text, {}, false, false);
+    Require(reasoning == end.reasoning || text == "<th",
+            "stream reasoning '" + reasoning + "' vs '" + end.reasoning + "'");
+    Require(content == end.content || text == "<th",
+            "stream content '" + content + "' vs '" + end.content + "'");
+  }
+  const auto split = glm::ParseResponse("<think>reason</thi", {}, false, true);
+  Require(split.reasoning == "reason" && split.content.empty() &&
+              split.held_back == 5,
+          "closing tag held: '" + split.reasoning + "'");
+  const auto opening = glm::ParseResponse("<thi", {}, false, true);
+  Require(opening.reasoning.empty() && opening.content.empty() &&
+              opening.held_back == 4,
+          "opening tag held");
+  // Finished text that merely looks like the start of a tag is content.
+  Require(glm::ParseResponse("<thi", {}, false, false).content == "<thi",
+          "finished prefix is content");
 }
 
 // What the template writes for a call must parse back to the same call.
@@ -430,6 +584,9 @@ int main() {
     TestOptionsAndErrors();
     TestScanner();
     TestParseResponse();
+    TestSchemaTypedArguments();
+    TestQuotedExampleAfterCall();
+    TestExplicitThinkPrefixes();
     TestRoundTrip();
     std::cout << "goldens matched byte-for-byte: " << goldens << "\n";
     if (const char* path = std::getenv("GLM53_FLASH_GGUF");

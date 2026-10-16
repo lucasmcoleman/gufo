@@ -6307,6 +6307,129 @@ void TestGlmToolCalls() {
   }
 }
 
+// GLM output has no grammar, so the HTTP layer enforces what one would:
+// quoted examples are prose, and parallel_tool_calls:false allows one call.
+void TestGlmQuotedExamplesAndParallelCalls() {
+  using Value = gufo::json::Value;
+  using Format = gufo::sampling::JsonConstraint::ToolFormat;
+  const std::string call =
+      "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris"
+      "</arg_value></tool_call>";
+  const std::string other =
+      "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome"
+      "</arg_value></tool_call>";
+  struct Result {
+    std::vector<Value> calls;
+    std::string content;
+    int status{0};
+    std::string body;
+  };
+  const auto run = [&](const std::string& text, bool stream,
+                       std::optional<bool> parallel,
+                       const char* choice = "auto") {
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"weather"}],
+      "tools":[{"type":"function","function":{"name":"get_weather",
+        "parameters":{"type":"object","properties":{
+          "city":{"type":"string"}}}}}]})");
+    body["stream"] = stream;
+    body["tool_choice"] = choice;
+    body["chat_template_kwargs"]["enable_thinking"] = false;
+    if (parallel)
+      body["parallel_tool_calls"] = *parallel;
+    FakeBackend backend;
+    backend.tool_format = Format::kGlm;
+    for (const char byte : text)
+      backend.pieces.emplace_back(1, byte);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Result result;
+    result.status = response.status;
+    result.body = response.body;
+    std::vector<Value> output;
+    if (stream && response.streaming_body) {
+      response.streaming_body([&](std::string_view chunk) {
+        result.body += chunk;
+        const auto pos = chunk.find("data: ");
+        if (pos != std::string_view::npos &&
+            !chunk.substr(pos + 6).starts_with("[DONE]"))
+          output.push_back(gufo::json::parse(chunk.substr(pos + 6)));
+        return true;
+      });
+    } else if (response.status == 200) {
+      output.push_back(gufo::json::parse(response.body));
+    }
+    for (const auto& event : output) {
+      const auto* choices = event.find("choices");
+      if (!choices)
+        continue;
+      for (const auto& item : choices->items()) {
+        const auto* message = item.find(stream ? "delta" : "message");
+        if (!message)
+          continue;
+        if (const auto* text_part = message->find("content");
+            text_part && text_part->is_string())
+          result.content += text_part->str();
+        if (const auto* tools = message->find("tool_calls"))
+          AppendToolDeltas(result.calls, *tools, stream);
+      }
+    }
+    return result;
+  };
+  const auto city = [](const Value& tool_call) {
+    return gufo::json::parse(
+               tool_call.find("function")->member_str("arguments"))
+        .member_str("city");
+  };
+
+  for (const bool stream : {false, true}) {
+    const std::string label = stream ? "GLM stream: " : "GLM: ";
+    {  // A quoted copy after a real call is prose.
+      const std::string text = call + " Example: `" + call + "`";
+      const auto result = run(text, stream, std::nullopt);
+      Expect(result.calls.size() == 1,
+             label + "quoted copy is not a second call, got " +
+                 std::to_string(result.calls.size()));
+      // A stream hides everything after its first call (the same for every
+      // unconstrained dialect), so only the buffered response carries it.
+      if (!stream)
+        Expect(
+            result.content == " Example: `" + call + "`",
+            label + "quoted copy stays content, got '" + result.content + "'");
+      const auto fenced =
+          run(call + "\n```\n" + other + "\n```\n", stream, std::nullopt);
+      Expect(fenced.calls.size() == 1 && city(fenced.calls[0]) == "Paris",
+             label + "fenced copy is not a second call");
+    }
+    {  // parallel_tool_calls controls how many real calls survive.
+      const std::string text = "Looking. " + call + other;
+      const auto both = run(text, stream, true);
+      Expect(both.calls.size() == 2, label + "parallel calls kept");
+      const auto defaulted = run(text, stream, std::nullopt);
+      Expect(defaulted.calls.size() == 2, label + "parallel by default");
+      const auto single = run(text, stream, false);
+      Expect(single.calls.size() == 1 && city(single.calls[0]) == "Paris",
+             label + "only the first call without parallel calls, got " +
+                 std::to_string(single.calls.size()));
+      Expect(
+          single.content == "Looking. ",
+          label + "dropped call is not content, got '" + single.content + "'");
+      const auto trailing =
+          run(call + " then " + other + " done", stream, false);
+      Expect(trailing.calls.size() == 1 &&
+                 trailing.content.find("arg_") == std::string::npos &&
+                 trailing.content.find("tool_call") == std::string::npos,
+             label + "later calls vanish, got '" + trailing.content + "'");
+    }
+    {  // required with no call is the shared tool_choice_unsatisfied error.
+      const auto result = run("just text", stream, false, "required");
+      Expect(result.body.find("tool_choice_unsatisfied") != std::string::npos &&
+                 (stream || result.status == 502),
+             label + "required without a call is an error");
+    }
+  }
+}
+
 int main() {
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();
@@ -6372,6 +6495,7 @@ int main() {
   TestDeepSeekToolCallsAreStructured();
   TestDeepSeekRepeatedToolParameters();
   TestGlmToolCalls();
+  TestGlmQuotedExamplesAndParallelCalls();
   TestDeepSeekSchemaCheckedArguments();
   TestStreamingStopsAtRejectedParameter();
   TestWrongModelIsRejected();

@@ -675,8 +675,43 @@ void TestLoadRefusal() {
 
 }  // namespace
 
+// Bytes fed one at a time through ResponseStream add up to the final parse,
+// for an explicit <think> block (the prompt did not open one) and for a quoted
+// example after a real call, which must never be streamed as a second call.
+void TestResponseStreamSplits() {
+  const std::string call =
+      "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris"
+      "</arg_value></tool_call>";
+  for (const std::string& text :
+       {std::string("<think>reason</think>answer"),
+        std::string("<think>a<b</think>x<y"), call + " Example: `" + call + "`",
+        std::string("<think>r</think>see `") + call + "` and " + call}) {
+    const auto whole = glm::ParseResponse(text, {}, false, false);
+    glm::ResponseStream stream({}, false);
+    std::string reasoning;
+    std::string content;
+    std::size_t calls = 0;
+    const auto take = [&](const glm::ChatDelta& d) {
+      reasoning += d.reasoning;
+      content += d.content;
+      calls += d.tool_calls.size();
+    };
+    for (const char byte : text)
+      take(stream.Push(std::string_view(&byte, 1)));
+    take(stream.Finish());
+    Require(reasoning == whole.reasoning, "stream reasoning '" + reasoning +
+                                              "' vs '" + whole.reasoning + "'");
+    Require(content == whole.content,
+            "stream content '" + content + "' vs '" + whole.content + "'");
+    Require(calls == whole.tool_calls.size(),
+            "stream calls " + std::to_string(calls) + " vs " +
+                std::to_string(whole.tool_calls.size()) + " for " + text);
+  }
+}
+
 int main() {
   try {
+    TestResponseStreamSplits();
     const Vocab v;
     TestStopTokens(v);
     TestPrefixReuse(v);

@@ -1777,11 +1777,23 @@ void ParseDsmlCalls(
 // ParseResponse does. `text` begins at the first marker; spans are relative
 // to it. A stream reports an unfinished call with its finished arguments, and
 // a string-only argument as it grows.
+//
+// `quotes` has scanned the whole response and `origin` is where `text` begins
+// in it. Every candidate opener is asked, not only the first: a call the model
+// writes inside a backtick span or fence after a real call is documentation.
+// Arguments of an accepted call are skipped whole, so markup nested in a value
+// never opens a second call.
+//
+// Without `parallel`, scanning stops after the first accepted call and
+// `*stop` is set to the end of its closing tag. This is how a Qwen grammar
+// ends generation after one call: nothing the model writes later exists, so
+// later calls are dropped, not exposed as content.
 void ParseGlmCalls(std::string_view text,
                    std::span<const tokenization::ChatTool> tools,
                    std::vector<ParsedToolCall>* calls,
                    std::vector<std::pair<std::size_t, std::size_t>>* spans,
-                   bool partial) {
+                   bool partial, const QuoteTracker& quotes, std::size_t origin,
+                   bool parallel, std::size_t* stop) {
   namespace glm = models::glm53_flash;
   std::vector<glm::ChatTool> glm_tools;
   glm_tools.reserve(tools.size());
@@ -1803,12 +1815,25 @@ void ParseGlmCalls(std::string_view text,
   std::size_t cursor = 0;
   while ((cursor = text.find(glm::ToolSyntax::kCallOpen, cursor)) !=
          std::string_view::npos) {
+    if (quotes.QuotedAt(origin + cursor)) {
+      cursor += glm::ToolSyntax::kCallOpen.size();
+      continue;
+    }
+    if (partial && quotes.UnclosedAt(origin + cursor))
+      break;  // A closing delimiter may still quote it.
     const auto scan = glm::ScanToolCall(text.substr(cursor));
     if (scan.call && scan.call->complete) {
       calls->push_back(convert(glm::InterpretToolCall(*scan.call, glm_tools)));
       if (spans)
         spans->emplace_back(cursor, cursor + scan.end);
       cursor += scan.end;
+      const bool declared = std::ranges::any_of(tools, [&](const auto& tool) {
+        return tool.name == calls->back().name;
+      });
+      if (!parallel && declared) {
+        *stop = cursor;
+        break;
+      }
       continue;
     }
     if (!scan.call || scan.malformed) {
@@ -1838,7 +1863,7 @@ ParsedGeneration ParseGeneration(
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
-    bool partial = false) {
+    bool partial = false, bool parallel_calls = true) {
   quotes.Reset(raw);
   ParsedGeneration parsed;
   std::string_view content = raw;
@@ -1939,12 +1964,16 @@ ParsedGeneration ParseGeneration(
     // The outer envelope selects the format, as in llama.cpp's model parsers.
     // Scanning both dialects would turn a literal call inside an argument into
     // an additional API invocation.
-    if (IsGlmMarkers(markers))
+    std::size_t glm_stop = std::string_view::npos;
+    if (IsGlmMarkers(markers)) {
       ParseGlmCalls(
           text_from_tools, tools, &parsed.tool_calls, &spans,
-          partial && !unfinished_reasoning_quote && !quotes.UnclosedAt(marker));
-    else if (text_from_tools.starts_with(
-                 tokenization::QwenToolSyntax::kCallOpen))
+          partial && !unfinished_reasoning_quote && !quotes.UnclosedAt(marker),
+          quotes, marker, parallel_calls, &glm_stop);
+      if (glm_stop != std::string_view::npos)
+        parsed.text.resize(marker + glm_stop);
+    } else if (text_from_tools.starts_with(
+                   tokenization::QwenToolSyntax::kCallOpen))
       ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, nullptr,
                      unfinished_reasoning_quote, partial);
     else
@@ -1964,7 +1993,8 @@ ParsedGeneration ParseGeneration(
         parsed = ParseGeneration(
             reasoning_call_context.substr(end + kThinkEnd.size()),
             TextGenerationBackend::InitialOutputState::kContent, tools, choice,
-            enforce_required, markers, closers, quotes, partial);
+            enforce_required, markers, closers, quotes, partial,
+            parallel_calls);
       } else {
         parsed.text.clear();
       }
@@ -2021,12 +2051,12 @@ ParsedGeneration ParseStructuredGeneration(
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required, bool tool_only,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
-    bool partial = false) {
+    bool partial = false, bool parallel_calls = true) {
   // No grammar shapes GLM output (ConstrainChatRequest): parse it natively.
   if (IsGlmMarkers(markers) && !tools.empty() &&
       choice != ChatRequest::ToolChoice::kNone)
     return ParseGeneration(raw, initial, tools, choice, enforce_required,
-                           markers, closers, quotes, partial);
+                           markers, closers, quotes, partial, parallel_calls);
   ParsedGeneration parsed;
   if (initial == TextGenerationBackend::InitialOutputState::kAuto) {
     const auto leading = raw.find_first_not_of(" \t\r\n");
@@ -2679,10 +2709,11 @@ ParsedGeneration StreamingGeneration(
                    filter.raw(), initial, chat.tools, chat.tool_choice,
                    enforce_required,
                    chat.constrained_tools && !chat.response_format, markers,
-                   closers, quotes, partial)
+                   closers, quotes, partial, chat.parallel_tool_calls)
              : ParseGeneration(filter.raw(), initial, chat.tools,
                                chat.tool_choice, enforce_required, markers,
-                               closers, quotes, partial);
+                               closers, quotes, partial,
+                               chat.parallel_tool_calls);
 }
 
 // Responses uses semantic SSE events, rather than Chat Completions chunks.
@@ -2974,12 +3005,14 @@ HttpResponse NonStreamingResponse(
                 result.finish_reason ==
                     TextGenerationBackend::FinishReason::kStop,
                 request.chat.constrained_tools && !request.chat.response_format,
-                markers, closers, quotes)
+                markers, closers, quotes, false,
+                request.chat.parallel_tool_calls)
           : ParseGeneration(decoded, initial_output_state, request.chat.tools,
                             request.chat.tool_choice,
                             result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kStop,
-                            markers, closers, quotes);
+                            markers, closers, quotes, false,
+                            request.chat.parallel_tool_calls);
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
