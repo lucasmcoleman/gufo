@@ -159,13 +159,17 @@ public:
   /// `config` and `weights` must outlive the model.
   ReferenceModel(const Config& config, const WeightSource& weights);
 
-  /// Clears every cache; the next Forward is a fresh prefill.
+  /// Clears every cache and any failed state; the next Forward is a fresh
+  /// prefill.
   void Reset();
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
+  /// True after a Forward threw partway through: caches were partly updated,
+  /// so the model refuses further Forward calls until Reset().
+  [[nodiscard]] bool Failed() const noexcept { return failed_; }
 
   /// Runs `tokens` at positions Position() .. Position()+T-1, advancing the
   /// state. Logits are produced only if `want_logits` and "output.weight"
-  /// exists.
+  /// exists. Throws std::logic_error if the model is Failed().
   Output Forward(std::span<const std::int32_t> tokens, bool want_logits = false,
                  const TapFn& tap = {});
 
@@ -179,6 +183,7 @@ private:
   const Config& config_;
   const WeightSource& weights_;
   std::uint32_t position_{0};
+  bool failed_{false};
   std::vector<KdaLayerState> kda_;  ///< Indexed by layer; empty on MLA layers.
   std::vector<MlaLayerState> mla_;  ///< Indexed by layer; empty on KDA layers.
 };
