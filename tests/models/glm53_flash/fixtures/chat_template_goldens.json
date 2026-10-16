@@ -1,0 +1,1731 @@
+[
+ {
+  "name": "system_user",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are helpful."
+   },
+   {
+    "role": "user",
+    "content": "Hi there"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are helpful.<|user|>Hi there<|assistant|><think>"
+ },
+ {
+  "name": "user_only",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hello<|assistant|><think>"
+ },
+ {
+  "name": "multi_turn",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "And 3+3?"
+   },
+   {
+    "role": "assistant",
+    "content": "6"
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>Be brief.<|user|>What is 2+2?<|assistant|><think></think>4<|user|>And 3+3?<|assistant|><think></think>6<|user|>Thanks<|assistant|><think>"
+ },
+ {
+  "name": "no_generation_prompt",
+  "options": {
+   "add_generation_prompt": false,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": "hello"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think></think>hello"
+ },
+ {
+  "name": "reasoning_history",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why is the sky blue?"
+   },
+   {
+    "role": "assistant",
+    "content": "Rayleigh scattering.",
+    "reasoning_content": "Short wavelengths scatter more."
+   },
+   {
+    "role": "user",
+    "content": "And sunsets?"
+   },
+   {
+    "role": "assistant",
+    "content": "Longer path, more scattering.",
+    "reasoning_content": "Light travels farther."
+   },
+   {
+    "role": "user",
+    "content": "ok"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Why is the sky blue?<|assistant|><think>Short wavelengths scatter more.</think>Rayleigh scattering.<|user|>And sunsets?<|assistant|><think>Light travels farther.</think>Longer path, more scattering.<|user|>ok<|assistant|><think>"
+ },
+ {
+  "name": "reasoning_history_clear",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": true
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why is the sky blue?"
+   },
+   {
+    "role": "assistant",
+    "content": "Rayleigh scattering.",
+    "reasoning_content": "Short wavelengths scatter more."
+   },
+   {
+    "role": "user",
+    "content": "And sunsets?"
+   },
+   {
+    "role": "assistant",
+    "content": "Longer path.",
+    "reasoning_content": "Light travels farther."
+   },
+   {
+    "role": "user",
+    "content": "ok"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Why is the sky blue?<|assistant|><think></think>Rayleigh scattering.<|user|>And sunsets?<|assistant|><think></think>Longer path.<|user|>ok<|assistant|><think>"
+ },
+ {
+  "name": "reasoning_history_clear_last_turn",
+  "options": {
+   "add_generation_prompt": false,
+   "reasoning_effort": null,
+   "clear_thinking": true
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "q1"
+   },
+   {
+    "role": "assistant",
+    "content": "a1",
+    "reasoning_content": "r1"
+   },
+   {
+    "role": "user",
+    "content": "q2"
+   },
+   {
+    "role": "assistant",
+    "content": "a2",
+    "reasoning_content": "r2"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q1<|assistant|><think></think>a1<|user|>q2<|assistant|><think>r2</think>a2"
+ },
+ {
+  "name": "reasoning_history_noclear_explicit",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": false
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "q1"
+   },
+   {
+    "role": "assistant",
+    "content": "a1",
+    "reasoning_content": "r1"
+   },
+   {
+    "role": "user",
+    "content": "q2"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q1<|assistant|><think>r1</think>a1<|user|>q2<|assistant|><think>"
+ },
+ {
+  "name": "inline_think_split",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>pondering</think>The answer."
+   },
+   {
+    "role": "user",
+    "content": "next"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>pondering</think>The answer.<|user|>next<|assistant|><think>"
+ },
+ {
+  "name": "inline_think_multi",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": "pre<think>a<think>b</think>mid</think>post </think> tail"
+   },
+   {
+    "role": "user",
+    "content": "next"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>b</think>tail<|user|>next<|assistant|><think>"
+ },
+ {
+  "name": "inline_think_clear",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": true
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>pondering</think>The answer."
+   },
+   {
+    "role": "user",
+    "content": "next"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think></think>The answer.<|user|>next<|assistant|><think>"
+ },
+ {
+  "name": "reasoning_field_and_inline",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>inline</think>body",
+    "reasoning_content": "field"
+   },
+   {
+    "role": "user",
+    "content": "n"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>field</think><think>inline</think>body<|user|>n<|assistant|><think>"
+ },
+ {
+  "name": "reasoning_empty_string",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": "body",
+    "reasoning_content": ""
+   },
+   {
+    "role": "user",
+    "content": "n"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think></think>body<|user|>n<|assistant|><think>"
+ },
+ {
+  "name": "no_reasoning_inline_absent",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": "plain no tags"
+   },
+   {
+    "role": "user",
+    "content": "n"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think></think>plain no tags<|user|>n<|assistant|><think>"
+ },
+ {
+  "name": "assistant_whitespace_content",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": "  \n padded \t\n"
+   },
+   {
+    "role": "user",
+    "content": "n"
+   },
+   {
+    "role": "assistant",
+    "content": "\u00a0\u3000nbsp and ideographic\u2003\u3000"
+   },
+   {
+    "role": "user",
+    "content": "m"
+   },
+   {
+    "role": "assistant",
+    "content": "   "
+   },
+   {
+    "role": "user",
+    "content": "last"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think></think>padded<|user|>n<|assistant|><think></think>nbsp and ideographic<|user|>m<|assistant|><think></think><|user|>last<|assistant|><think>"
+ },
+ {
+  "name": "empty_system",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "system",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "hello"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|><|user|>hello<|assistant|><think>"
+ },
+ {
+  "name": "empty_user_and_assistant",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": ""
+   },
+   {
+    "role": "assistant",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "x"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|><|assistant|><think></think><|user|>x<|assistant|><think>"
+ },
+ {
+  "name": "effort_low",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": "low",
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>hi<|assistant|><think>"
+ },
+ {
+  "name": "effort_high",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": "high",
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>hi<|assistant|><think>"
+ },
+ {
+  "name": "effort_max",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": "max",
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
+ },
+ {
+  "name": "effort_invalid_is_max",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": "medium",
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>"
+ },
+ {
+  "name": "tools_defined",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [
+   "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Caf\u00e9 \u2603 \\\"quoted\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"default\": 3, \"minimum\": 1}, \"scale\": {\"type\": \"number\", \"default\": 2.0}, \"tiny\": {\"type\": \"number\", \"default\": 1e-07}, \"units\": {\"enum\": [\"c\", \"f\"], \"default\": null}}, \"required\": [\"city\"]}, \"strict\": true}}",
+   "{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}"
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Caf\u00e9 \u2603 \\\"quoted\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"default\": 3, \"minimum\": 1}, \"scale\": {\"type\": \"number\", \"default\": 2.0}, \"tiny\": {\"type\": \"number\", \"default\": 1e-07}, \"units\": {\"enum\": [\"c\", \"f\"], \"default\": null}}, \"required\": [\"city\"]}}\n{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>Use tools.<|user|>Weather in Paris?<|assistant|><think>"
+ },
+ {
+  "name": "tools_deferred_and_extra",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [
+   "{\"type\": \"function\", \"function\": {\"name\": \"lazy\", \"description\": \"Not shown\", \"parameters\": {\"type\": \"object\", \"properties\": {}}, \"defer_loading\": true}}",
+   "{\"type\":\"function\",\"function\":{\"name\":\"ping\",\"parameters\":{\"type\":\"object\",\"properties\":{}},\"defer_loading\":false,\"extra_field\":[1,2.50,{\"z\":null,\"a\":true}]}}",
+   "{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}"
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"ping\", \"parameters\": {\"type\": \"object\", \"properties\": {}}, \"extra_field\": [1, 2.5, {\"z\": null, \"a\": true}]}\n{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>go<|assistant|><think>"
+ },
+ {
+  "name": "tools_all_deferred",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [
+   "{\"type\": \"function\", \"function\": {\"name\": \"lazy\", \"description\": \"Not shown\", \"parameters\": {\"type\": \"object\", \"properties\": {}}, \"defer_loading\": true}}"
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>go<|assistant|><think>"
+ },
+ {
+  "name": "tools_no_system",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [
+   "{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}"
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>x<|assistant|><think>"
+ },
+ {
+  "name": "tool_call_roundtrip",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [
+   "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Caf\u00e9 \u2603 \\\"quoted\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"default\": 3, \"minimum\": 1}, \"scale\": {\"type\": \"number\", \"default\": 2.0}, \"tiny\": {\"type\": \"number\", \"default\": 1e-07}, \"units\": {\"enum\": [\"c\", \"f\"], \"default\": null}}, \"required\": [\"city\"]}, \"strict\": true}}",
+   "{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}"
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris and 1.5+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "Checking.",
+    "reasoning_content": "I need two tools.",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_2",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1.5",
+        "is_string": false
+       },
+       {
+        "name": "b",
+        "value": "2",
+        "is_string": false
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "Sunny, 21C",
+    "tool_call_id": "call_1"
+   },
+   {
+    "role": "tool",
+    "content": "3.5",
+    "tool_call_id": "call_2"
+   },
+   {
+    "role": "assistant",
+    "content": "It is sunny and the sum is 3.5."
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Caf\u00e9 \u2603 \\\"quoted\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"default\": 3, \"minimum\": 1}, \"scale\": {\"type\": \"number\", \"default\": 2.0}, \"tiny\": {\"type\": \"number\", \"default\": 1e-07}, \"units\": {\"enum\": [\"c\", \"f\"], \"default\": null}}, \"required\": [\"city\"]}}\n{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Paris and 1.5+2?<|assistant|><think>I need two tools.</think>Checking.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>add<arg_key>a</arg_key><arg_value>1.5</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response>Sunny, 21C</tool_response><tool_response>3.5</tool_response><|assistant|><think></think>It is sunny and the sum is 3.5.<|assistant|><think>"
+ },
+ {
+  "name": "tool_results_resorted",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [
+   "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Caf\u00e9 \u2603 \\\"quoted\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"default\": 3, \"minimum\": 1}, \"scale\": {\"type\": \"number\", \"default\": 2.0}, \"tiny\": {\"type\": \"number\", \"default\": 1e-07}, \"units\": {\"enum\": [\"c\", \"f\"], \"default\": null}}, \"required\": [\"city\"]}, \"strict\": true}}",
+   "{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}"
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_2",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1.5",
+        "is_string": false
+       },
+       {
+        "name": "b",
+        "value": "2",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_3",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Tokyo",
+        "is_string": true
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "third",
+    "tool_call_id": "call_3"
+   },
+   {
+    "role": "tool",
+    "content": "first",
+    "tool_call_id": "call_1"
+   },
+   {
+    "role": "tool",
+    "content": "second",
+    "tool_call_id": "call_2"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Caf\u00e9 \u2603 \\\"quoted\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"default\": 3, \"minimum\": 1}, \"scale\": {\"type\": \"number\", \"default\": 2.0}, \"tiny\": {\"type\": \"number\", \"default\": 1e-07}, \"units\": {\"enum\": [\"c\", \"f\"], \"default\": null}}, \"required\": [\"city\"]}}\n{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>go<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>add<arg_key>a</arg_key><arg_value>1.5</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call><|observation|><tool_response>first</tool_response><tool_response>second</tool_response><tool_response>third</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_results_no_ids",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_2",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1.5",
+        "is_string": false
+       },
+       {
+        "name": "b",
+        "value": "2",
+        "is_string": false
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "b"
+   },
+   {
+    "role": "tool",
+    "content": "a"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>go<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>add<arg_key>a</arg_key><arg_value>1.5</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response>b</tool_response><tool_response>a</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_results_dup_ids",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_2",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1.5",
+        "is_string": false
+       },
+       {
+        "name": "b",
+        "value": "2",
+        "is_string": false
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "x",
+    "tool_call_id": "call_2"
+   },
+   {
+    "role": "tool",
+    "content": "y",
+    "tool_call_id": "call_2"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>go<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>add<arg_key>a</arg_key><arg_value>1.5</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response>x</tool_response><tool_response>y</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_results_unknown_id",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_2",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1.5",
+        "is_string": false
+       },
+       {
+        "name": "b",
+        "value": "2",
+        "is_string": false
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "x",
+    "tool_call_id": "call_2"
+   },
+   {
+    "role": "tool",
+    "content": "y",
+    "tool_call_id": "nope"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>go<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>add<arg_key>a</arg_key><arg_value>1.5</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response>x</tool_response><tool_response>y</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_results_call_missing_id",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_2",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1.5",
+        "is_string": false
+       },
+       {
+        "name": "b",
+        "value": "2",
+        "is_string": false
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "x",
+    "tool_call_id": "call_2"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>go<|assistant|><think></think><tool_call>add<arg_key>a</arg_key><arg_value>1</arg_value></tool_call><tool_call>add<arg_key>a</arg_key><arg_value>1.5</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response>x</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_results_dup_call_ids",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "x",
+    "tool_call_id": "call_1"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>go<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><|observation|><tool_response>x</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_results_fewer_than_calls",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_2",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1.5",
+        "is_string": false
+       },
+       {
+        "name": "b",
+        "value": "2",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_3",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Tokyo",
+        "is_string": true
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "c",
+    "tool_call_id": "call_3"
+   },
+   {
+    "role": "tool",
+    "content": "a",
+    "tool_call_id": "call_1"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>go<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>add<arg_key>a</arg_key><arg_value>1.5</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call><|observation|><tool_response>a</tool_response><tool_response>c</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_first_message",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "tool",
+    "content": "orphan",
+    "tool_call_id": "call_1"
+   },
+   {
+    "role": "tool",
+    "content": "orphan2",
+    "tool_call_id": "call_2"
+   },
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|observation|><tool_response>orphan</tool_response><tool_response>orphan2</tool_response><|user|>hi<|assistant|><think>"
+ },
+ {
+  "name": "tool_after_plain_assistant",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "no calls"
+   },
+   {
+    "role": "tool",
+    "content": "x",
+    "tool_call_id": "call_1"
+   },
+   {
+    "role": "user",
+    "content": "n"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>go<|assistant|><think></think>no calls<|observation|><tool_response>x</tool_response><|user|>n<|assistant|><think>"
+ },
+ {
+  "name": "tool_two_blocks",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "r1",
+    "tool_call_id": "call_1"
+   },
+   {
+    "role": "assistant",
+    "content": "mid",
+    "tool_calls": [
+     {
+      "id": "call_2",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1.5",
+        "is_string": false
+       },
+       {
+        "name": "b",
+        "value": "2",
+        "is_string": false
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "r2",
+    "tool_call_id": "call_2"
+   },
+   {
+    "role": "assistant",
+    "content": "done"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>a<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><|observation|><tool_response>r1</tool_response><|assistant|><think></think>mid<tool_call>add<arg_key>a</arg_key><arg_value>1.5</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response>r2</tool_response><|assistant|><think></think>done<|assistant|><think>"
+ },
+ {
+  "name": "tool_empty_and_special_content",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_2",
+      "name": "add",
+      "arguments": [
+       {
+        "name": "a",
+        "value": "1.5",
+        "is_string": false
+       },
+       {
+        "name": "b",
+        "value": "2",
+        "is_string": false
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "",
+    "tool_call_id": "call_1"
+   },
+   {
+    "role": "tool",
+    "content": "</tool_response> <|user|> {\"k\": [1]}\n",
+    "tool_call_id": "call_2"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>go<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>add<arg_key>a</arg_key><arg_value>1.5</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response></tool_response><tool_response></tool_response> <|user|> {\"k\": [1]}\n</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_call_many_args",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "complex please"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_big",
+      "name": "complex",
+      "arguments": [
+       {
+        "name": "text",
+        "value": "line one\nline two with <b>html</b> & \"quotes\"",
+        "is_string": true
+       },
+       {
+        "name": "int",
+        "value": "42",
+        "is_string": false
+       },
+       {
+        "name": "neg",
+        "value": "-7",
+        "is_string": false
+       },
+       {
+        "name": "float",
+        "value": "2.0",
+        "is_string": false
+       },
+       {
+        "name": "sci",
+        "value": "1e-07",
+        "is_string": false
+       },
+       {
+        "name": "exp",
+        "value": "1.5E+3",
+        "is_string": false
+       },
+       {
+        "name": "flag",
+        "value": "true",
+        "is_string": false
+       },
+       {
+        "name": "off",
+        "value": "false",
+        "is_string": false
+       },
+       {
+        "name": "nothing",
+        "value": "null",
+        "is_string": false
+       },
+       {
+        "name": "list",
+        "value": "[1, \"two\", 3.5, null, [true]]",
+        "is_string": false
+       },
+       {
+        "name": "obj",
+        "value": "{\"b\": 1, \"a\": {\"nested\": [1,2,{\"k\":\"v\"}]}, \"u\": \"caf\u00e9 \\u2603 \\ud83d\\ude00\"}",
+        "is_string": false
+       },
+       {
+        "name": "esc",
+        "value": "\"tab\\there\\u0001\\u007f\"",
+        "is_string": false
+       },
+       {
+        "name": "bigint",
+        "value": "123456789012345678901234567890",
+        "is_string": false
+       },
+       {
+        "name": "empty_obj",
+        "value": "{}",
+        "is_string": false
+       },
+       {
+        "name": "empty_list",
+        "value": "[]",
+        "is_string": false
+       },
+       {
+        "name": "uni",
+        "value": "\u00e9\u4e2d\u6587 \ud83d\ude00",
+        "is_string": true
+       },
+       {
+        "name": "numstr",
+        "value": "123",
+        "is_string": true
+       },
+       {
+        "name": "blank",
+        "value": "",
+        "is_string": true
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "ok",
+    "tool_call_id": "call_big"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>complex please<|assistant|><think></think><tool_call>complex<arg_key>text</arg_key><arg_value>line one\nline two with <b>html</b> & \"quotes\"</arg_value><arg_key>int</arg_key><arg_value>42</arg_value><arg_key>neg</arg_key><arg_value>-7</arg_value><arg_key>float</arg_key><arg_value>2.0</arg_value><arg_key>sci</arg_key><arg_value>1e-07</arg_value><arg_key>exp</arg_key><arg_value>1500.0</arg_value><arg_key>flag</arg_key><arg_value>true</arg_value><arg_key>off</arg_key><arg_value>false</arg_value><arg_key>nothing</arg_key><arg_value>null</arg_value><arg_key>list</arg_key><arg_value>[1, \"two\", 3.5, null, [true]]</arg_value><arg_key>obj</arg_key><arg_value>{\"b\": 1, \"a\": {\"nested\": [1, 2, {\"k\": \"v\"}]}, \"u\": \"caf\u00e9 \u2603 \ud83d\ude00\"}</arg_value><arg_key>esc</arg_key><arg_value>tab\there\u0001\u007f</arg_value><arg_key>bigint</arg_key><arg_value>123456789012345678901234567890</arg_value><arg_key>empty_obj</arg_key><arg_value>{}</arg_value><arg_key>empty_list</arg_key><arg_value>[]</arg_value><arg_key>uni</arg_key><arg_value>\u00e9\u4e2d\u6587 \ud83d\ude00</arg_value><arg_key>numstr</arg_key><arg_value>123</arg_value><arg_key>blank</arg_key><arg_value></arg_value></tool_call><|observation|><tool_response>ok</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_call_no_args",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "ping"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c0",
+      "name": "ping",
+      "arguments": []
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "pong",
+    "tool_call_id": "c0"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>ping<|assistant|><think></think><tool_call>ping</tool_call><|observation|><tool_response>pong</tool_response><|assistant|><think>"
+ },
+ {
+  "name": "tool_call_with_content_and_reasoning",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": true
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "  Let me check.  ",
+    "reasoning_content": "think first",
+    "tool_calls": [
+     {
+      "id": "call_3",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Tokyo",
+        "is_string": true
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "rain",
+    "tool_call_id": "call_3"
+   },
+   {
+    "role": "assistant",
+    "content": "Rainy."
+   },
+   {
+    "role": "user",
+    "content": "thanks"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>go<|assistant|><think></think>Let me check.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call><|observation|><tool_response>rain</tool_response><|assistant|><think></think>Rainy.<|user|>thanks<|assistant|><think>"
+ },
+ {
+  "name": "mid_system",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": null,
+   "clear_thinking": null
+  },
+  "tools": [],
+  "messages": [
+   {
+    "role": "system",
+    "content": "a"
+   },
+   {
+    "role": "user",
+    "content": "b"
+   },
+   {
+    "role": "system",
+    "content": "c"
+   },
+   {
+    "role": "assistant",
+    "content": "d"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>a<|user|>b<|system|>c<|assistant|><think></think>d<|assistant|><think>"
+ },
+ {
+  "name": "kitchen_sink",
+  "options": {
+   "add_generation_prompt": true,
+   "reasoning_effort": "high",
+   "clear_thinking": true
+  },
+  "tools": [
+   "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Caf\u00e9 \u2603 \\\"quoted\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"default\": 3, \"minimum\": 1}, \"scale\": {\"type\": \"number\", \"default\": 2.0}, \"tiny\": {\"type\": \"number\", \"default\": 1e-07}, \"units\": {\"enum\": [\"c\", \"f\"], \"default\": null}}, \"required\": [\"city\"]}, \"strict\": true}}",
+   "{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}",
+   "{\"type\": \"function\", \"function\": {\"name\": \"lazy\", \"description\": \"Not shown\", \"parameters\": {\"type\": \"object\", \"properties\": {}}, \"defer_loading\": true}}"
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are an agent."
+   },
+   {
+    "role": "user",
+    "content": "Plan a trip."
+   },
+   {
+    "role": "assistant",
+    "content": "Looking up.",
+    "reasoning_content": "Need weather.",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Paris",
+        "is_string": true
+       },
+       {
+        "name": "days",
+        "value": "3",
+        "is_string": false
+       }
+      ]
+     },
+     {
+      "id": "call_3",
+      "name": "get_weather",
+      "arguments": [
+       {
+        "name": "city",
+        "value": "Tokyo",
+        "is_string": true
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "Paris sunny",
+    "tool_call_id": "call_1"
+   },
+   {
+    "role": "tool",
+    "content": "Tokyo rain",
+    "tool_call_id": "call_3"
+   },
+   {
+    "role": "assistant",
+    "content": "Paris is better.",
+    "reasoning_content": "Compare."
+   },
+   {
+    "role": "user",
+    "content": "Book it"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Call a tool.",
+    "tool_calls": [
+     {
+      "id": "call_big",
+      "name": "complex",
+      "arguments": [
+       {
+        "name": "text",
+        "value": "line one\nline two with <b>html</b> & \"quotes\"",
+        "is_string": true
+       },
+       {
+        "name": "int",
+        "value": "42",
+        "is_string": false
+       },
+       {
+        "name": "neg",
+        "value": "-7",
+        "is_string": false
+       },
+       {
+        "name": "float",
+        "value": "2.0",
+        "is_string": false
+       },
+       {
+        "name": "sci",
+        "value": "1e-07",
+        "is_string": false
+       },
+       {
+        "name": "exp",
+        "value": "1.5E+3",
+        "is_string": false
+       },
+       {
+        "name": "flag",
+        "value": "true",
+        "is_string": false
+       },
+       {
+        "name": "off",
+        "value": "false",
+        "is_string": false
+       },
+       {
+        "name": "nothing",
+        "value": "null",
+        "is_string": false
+       },
+       {
+        "name": "list",
+        "value": "[1, \"two\", 3.5, null, [true]]",
+        "is_string": false
+       },
+       {
+        "name": "obj",
+        "value": "{\"b\": 1, \"a\": {\"nested\": [1,2,{\"k\":\"v\"}]}, \"u\": \"caf\u00e9 \\u2603 \\ud83d\\ude00\"}",
+        "is_string": false
+       },
+       {
+        "name": "esc",
+        "value": "\"tab\\there\\u0001\\u007f\"",
+        "is_string": false
+       },
+       {
+        "name": "bigint",
+        "value": "123456789012345678901234567890",
+        "is_string": false
+       },
+       {
+        "name": "empty_obj",
+        "value": "{}",
+        "is_string": false
+       },
+       {
+        "name": "empty_list",
+        "value": "[]",
+        "is_string": false
+       },
+       {
+        "name": "uni",
+        "value": "\u00e9\u4e2d\u6587 \ud83d\ude00",
+        "is_string": true
+       },
+       {
+        "name": "numstr",
+        "value": "123",
+        "is_string": true
+       },
+       {
+        "name": "blank",
+        "value": "",
+        "is_string": true
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "booked",
+    "tool_call_id": "call_big"
+   }
+  ],
+  "expected": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Caf\u00e9 \u2603 \\\"quoted\\\"\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"default\": 3, \"minimum\": 1}, \"scale\": {\"type\": \"number\", \"default\": 2.0}, \"tiny\": {\"type\": \"number\", \"default\": 1e-07}, \"units\": {\"enum\": [\"c\", \"f\"], \"default\": null}}, \"required\": [\"city\"]}}\n{\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"number\"}, \"b\": {\"type\": \"number\"}}, \"required\": [\"a\", \"b\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are an agent.<|user|>Plan a trip.<|assistant|><think></think>Looking up.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call><|observation|><tool_response>Paris sunny</tool_response><tool_response>Tokyo rain</tool_response><|assistant|><think></think>Paris is better.<|user|>Book it<|assistant|><think>Call a tool.</think><tool_call>complex<arg_key>text</arg_key><arg_value>line one\nline two with <b>html</b> & \"quotes\"</arg_value><arg_key>int</arg_key><arg_value>42</arg_value><arg_key>neg</arg_key><arg_value>-7</arg_value><arg_key>float</arg_key><arg_value>2.0</arg_value><arg_key>sci</arg_key><arg_value>1e-07</arg_value><arg_key>exp</arg_key><arg_value>1500.0</arg_value><arg_key>flag</arg_key><arg_value>true</arg_value><arg_key>off</arg_key><arg_value>false</arg_value><arg_key>nothing</arg_key><arg_value>null</arg_value><arg_key>list</arg_key><arg_value>[1, \"two\", 3.5, null, [true]]</arg_value><arg_key>obj</arg_key><arg_value>{\"b\": 1, \"a\": {\"nested\": [1, 2, {\"k\": \"v\"}]}, \"u\": \"caf\u00e9 \u2603 \ud83d\ude00\"}</arg_value><arg_key>esc</arg_key><arg_value>tab\there\u0001\u007f</arg_value><arg_key>bigint</arg_key><arg_value>123456789012345678901234567890</arg_value><arg_key>empty_obj</arg_key><arg_value>{}</arg_value><arg_key>empty_list</arg_key><arg_value>[]</arg_value><arg_key>uni</arg_key><arg_value>\u00e9\u4e2d\u6587 \ud83d\ude00</arg_value><arg_key>numstr</arg_key><arg_value>123</arg_value><arg_key>blank</arg_key><arg_value></arg_value></tool_call><|observation|><tool_response>booked</tool_response><|assistant|><think>"
+ }
+]
