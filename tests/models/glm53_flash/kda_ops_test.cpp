@@ -386,6 +386,7 @@ int main() {
     RunCase(1, 64, 1, 11);    // decode
     RunCase(5, 64, 2, 12);    // short prefill; split reads history + new tokens
     RunCase(64, 16, 40, 13);  // multi-tile conv + history kernel
+    RunCase(9, 3, 8, 14);     // partial final conv tile + partial norm group
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << "\n";
     return 1;
