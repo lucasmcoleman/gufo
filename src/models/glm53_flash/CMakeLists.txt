@@ -2,6 +2,7 @@
 # kernels, executor and the CPU oracle are added per lane.
 add_library(gufo_glm53_flash STATIC
   config.cpp
+  tokenizer.cpp
   weights.cpp)
 
 target_include_directories(gufo_glm53_flash PUBLIC ${PROJECT_SOURCE_DIR})

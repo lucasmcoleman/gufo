@@ -13,6 +13,10 @@ endfunction()
 add_glm53_flash_test(weights gufo_glm53_flash "cpu;model")
 set_tests_properties(glm53_flash.weights PROPERTIES SKIP_RETURN_CODE 77)
 
+# Tokenizer on the real GGUF vocabulary (GLM53_FLASH_GGUF); skips without it.
+add_glm53_flash_test(tokenizer gufo_glm53_flash "cpu;model")
+set_tests_properties(glm53_flash.tokenizer PROPERTIES SKIP_RETURN_CODE 77)
+
 # HF-generated hyper-connection fixture (fixtures/make_hc_fixture.py).
 set(GLM53_HC_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hc_fixture.bin")
 add_glm53_flash_test(hc_reference gufo_glm53_flash_reference "cpu")
@@ -49,6 +53,13 @@ add_executable(glm53_flash_reference_probe
 target_link_libraries(glm53_flash_reference_probe PRIVATE
   gufo_glm53_flash_reference)
 set_target_properties(glm53_flash_reference_probe PROPERTIES EXCLUDE_FROM_ALL ON)
+
+# Tokenizer parity probe (not a test): encodes a hex-line corpus for
+# comparison with llama-tokenize (see /server/staging/glm53-gufo/a6).
+add_executable(glm53_flash_tokenize_probe
+  ${PROJECT_SOURCE_DIR}/tools/glm53/tokenize_probe.cpp)
+target_link_libraries(glm53_flash_tokenize_probe PRIVATE gufo_glm53_flash)
+set_target_properties(glm53_flash_tokenize_probe PROPERTIES EXCLUDE_FROM_ALL ON)
 
 # Lane B tests (owned by the Lane B fragment).
 include(${CMAKE_CURRENT_SOURCE_DIR}/lane_b_tests.cmake OPTIONAL)
