@@ -33,6 +33,10 @@ struct SpeculativeOptions {
   bool use_batched_verification{false};
   bool retain_frontier_logits{false};
   DFlashDraftPolicy dflash_policy{DFlashDraftPolicy::kAdaptive};
+  /// MTP prompt-prime slice width: rows per batched prime. `0` selects the
+  /// legacy per-token serial prime. Reachable from `serve llm
+  /// --mtp-prime-chunk`; the other draft backends ignore it.
+  std::uint32_t mtp_prime_chunk{1024};
 };
 
 struct SpeculativeStats {

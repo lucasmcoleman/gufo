@@ -1160,7 +1160,8 @@ public:
             mtp_model_,
             hip::QwenMtpGpuDraftConfig{
                 .max_context = max_context_,
-                .max_draft_tokens = speculative_options_.max_draft_tokens}),
+                .max_draft_tokens = speculative_options_.max_draft_tokens,
+                .prime_chunk = speculative_options_.mtp_prime_chunk}),
         ledger);
     // Qwen's 256-row chunks are small. Preserve a bounded group before
     // waiting, instead of synchronizing every half-MiB range individually.
@@ -1233,7 +1234,7 @@ public:
       resident_weights += dflash_model_->GetPackedWeightBytes();
     } else if (mtp_model_ != nullptr) {
       const auto draft = hip::QwenMtpGpuExecutor::EstimateMemoryUsage(
-          *mtp_model_, max_context_);
+          *mtp_model_, max_context_, speculative_options_.mtp_prime_chunk);
       usage.request_state_bytes += draft.request_state_bytes;
       usage.temporary_scratch_bytes += draft.temporary_scratch_bytes;
       resident_weights += mtp_model_->GetPackedWeightBytes();
@@ -3384,6 +3385,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model;
     std::shared_ptr<const hip::QwenMtpGpuModel> mtp_model;
     speculative::SpeculativeOptions speculative_options;
+    speculative_options.mtp_prime_chunk = speculative_config.mtp_prime_chunk;
     if (speculative_config.backend == TextSpeculativeBackend::kDFlash) {
       if (speculative_config.draft_model_path.empty()) {
         SetError(error, "DFlash HTTP decoding requires --dflash-model");
