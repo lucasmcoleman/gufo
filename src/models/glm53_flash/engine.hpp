@@ -47,6 +47,11 @@ struct ModelOptions {
   std::uint32_t max_context{4096};
   /// Tokens per executor pass; longer prefills run in several passes.
   std::uint32_t prefill_chunk{256};
+  /// Compute the last prompt token's logits inside the final prefill pass
+  /// (Executor::ForwardLast) rather than in an extra one-token pass. The
+  /// environment variable GUFO_GLM53_FUSED_LAST_LOGITS=0 turns it off for A/B
+  /// runs.
+  bool fused_last_logits{true};
 };
 
 class Model final : public std::enable_shared_from_this<Model> {
@@ -100,9 +105,13 @@ private:
 #if defined(ENGINE_ENABLE_HIP)
 /// `executor` (embedding and head uploaded) as a ForwardSession of
 /// `capacity` positions and `vocab` logits. The executor must outlive it.
-/// Used by Model and by GPU tests with stand-in operators.
+/// Used by Model and by GPU tests with stand-in operators. With
+/// `fused_last_logits` a Forward that wants logits computes the last token's
+/// inside the final pass (Executor::ForwardLast); without it (the default)
+/// the last token gets its own one-token pass, as before.
 [[nodiscard]] std::unique_ptr<ForwardSession> MakeExecutorSession(
-    Executor& executor, std::uint32_t capacity, std::uint32_t vocab);
+    Executor& executor, std::uint32_t capacity, std::uint32_t vocab,
+    bool fused_last_logits = false);
 #endif
 
 }  // namespace gufo::models::glm53_flash
