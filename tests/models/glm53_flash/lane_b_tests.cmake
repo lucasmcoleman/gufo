@@ -25,4 +25,7 @@ if (ENGINE_ENABLE_HIP)
   add_glm53_flash_test(lane_b_dense gufo_glm53_flash "hip;gpu;gfx1151")
   add_glm53_flash_test(lane_b_iq gufo_glm53_flash "hip;gpu;gfx1151")
   add_glm53_flash_test(lane_b_ffn gufo_glm53_flash_reference "hip;gpu;gfx1151")
+  add_glm53_flash_test(lane_b_executor gufo_glm53_flash_reference "hip;gpu;gfx1151")
+  target_compile_definitions(glm53_flash_lane_b_executor_test PRIVATE
+    GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
 endif()
