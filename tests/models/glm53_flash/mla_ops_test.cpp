@@ -38,8 +38,10 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/glm53_flash/config.hpp"
 #include "src/models/glm53_flash/executor.hpp"
+#include "src/models/glm53_flash/kernels/mla.hpp"
 #include "src/models/glm53_flash/layer_ops.hpp"
 #include "src/models/glm53_flash/reference.hpp"
 #include "src/models/glm53_flash/reference_mla.hpp"
@@ -723,8 +725,149 @@ void SyntheticCheck(Verdict& v, const std::string& label, const glm::Config& c,
   }
 }
 
+// ---- Batched per-head projections (mla::ProjectHeads) ----
+
+/// Random Q6_K rows: `rows * blocks` blocks of ql/qh/scales/d with a small
+/// positive d (fp16 bits), so dequantised values stay O(1).
+std::vector<std::uint8_t> RandomQ6K(std::mt19937& rng, std::size_t blocks) {
+  std::vector<std::uint8_t> raw(blocks * 210);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = raw.data() + (b * 210);
+    for (int i = 0; i < 192; ++i) {
+      blk[i] = static_cast<std::uint8_t>(rng());
+    }
+    for (int i = 0; i < 16; ++i) {
+      blk[192 + i] = static_cast<std::uint8_t>(
+          static_cast<std::int8_t>(static_cast<int>(rng() % 41) - 20));
+    }
+    const std::uint16_t d =
+        static_cast<std::uint16_t>(0x2800 | (rng() & 0x3FF));
+    std::memcpy(blk + 208, &d, sizeof d);
+  }
+  return raw;
+}
+
+glm::DeviceMatrix UploadQ6K(glm::DeviceArena& arena,
+                            const std::vector<std::uint8_t>& raw,
+                            std::uint64_t cols, std::uint64_t rows,
+                            std::uint64_t experts) {
+  void* p = arena.Allocate(raw.size());
+  if (p == nullptr) {
+    throw std::runtime_error("device allocation failed");
+  }
+  Hip(hipMemcpy(p, raw.data(), raw.size(), hipMemcpyHostToDevice), "upload");
+  return glm::DeviceMatrix{.data = p,
+                           .type = gufo::core::GgmlType::kQ6_K,
+                           .cols = cols,
+                           .rows = rows,
+                           .experts = experts,
+                           .row_bytes = (cols / 256) * 210};
+}
+
+std::vector<float> DownloadF32(const float* d, std::size_t n) {
+  std::vector<float> out(n);
+  Hip(hipMemcpy(out.data(), d, n * sizeof(float), hipMemcpyDeviceToHost),
+      "download");
+  return out;
+}
+
+/// ProjectHeads against the per-head Project loop it replaces and, for Q6_K,
+/// against a host dequantise-and-dot oracle. F32 must be bit-identical (same
+/// per-output arithmetic); Q6_K has a different reduction order and is held
+/// to kTol. Shapes follow k_b ([cols 256][rows 512]) and v_b ([512][256]).
+void ProjectHeadsCheck(Verdict& v) {
+  struct Shape {
+    std::uint64_t cols, rows;
+    const char* name;
+  };
+  std::mt19937 rng(20261017);
+  std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
+  constexpr std::uint32_t kHeads = 6;
+  for (const Shape sh : {Shape{256, 70, "k_b-like"}, Shape{512, 33, "v_b-like"},
+                         Shape{256, 512, "k_b rows"}}) {
+    for (const bool q6k : {false, true}) {
+      for (const std::uint32_t tokens : {1U, 7U, 33U, 70U}) {
+        glm::DeviceArena arena;
+        const std::size_t wn = kHeads * sh.rows * sh.cols;
+        std::vector<float> wf;
+        std::vector<std::uint8_t> raw;
+        glm::DeviceMatrix w;
+        if (q6k) {
+          raw = RandomQ6K(rng, kHeads * sh.rows * (sh.cols / 256));
+          w = UploadQ6K(arena, raw, sh.cols, sh.rows, kHeads);
+        } else {
+          wf.resize(wn);
+          for (float& f : wf) {
+            f = dist(rng);
+          }
+          w = UploadF32(arena, wf, sh.cols, sh.rows, kHeads);
+        }
+        std::vector<float> x(std::size_t{kHeads} * tokens * sh.cols);
+        for (float& f : x) {
+          f = dist(rng);
+        }
+        const std::size_t yn = std::size_t{kHeads} * tokens * sh.rows;
+        auto* dx = static_cast<float*>(arena.Allocate(x.size() * 4));
+        auto* dy_new = static_cast<float*>(arena.Allocate(yn * 4));
+        auto* dy_old = static_cast<float*>(arena.Allocate(yn * 4));
+        Hip(hipMemcpy(dx, x.data(), x.size() * 4, hipMemcpyHostToDevice),
+            "upload x");
+        const bool ok_new =
+            glm::mla::ProjectHeads(w, kHeads, dx, dy_new, tokens, nullptr);
+        bool ok_old = true;
+        for (std::uint32_t h = 0; ok_old && h < kHeads; ++h) {
+          ok_old = glm::mla::Project(
+              w, h, dx + (std::size_t{h} * tokens * sh.cols),
+              dy_old + (std::size_t{h} * tokens * sh.rows), tokens, nullptr);
+        }
+        Hip(hipDeviceSynchronize(), "sync");
+        const std::string label = std::string(sh.name) +
+                                  (q6k ? " Q6_K" : " F32") + " tokens " +
+                                  std::to_string(tokens);
+        v.Check(ok_new && ok_old, "ProjectHeads and Project launch: " + label);
+        const auto got = DownloadF32(dy_new, yn);
+        const auto old = DownloadF32(dy_old, yn);
+        if (!q6k) {
+          v.Check(
+              Same(got, old),
+              "ProjectHeads F32 bit-identical to per-head Project: " + label);
+          continue;
+        }
+        // Host oracle: dequantise each row and dot in double.
+        std::vector<float> want(yn);
+        std::vector<float> row(sh.cols);
+        for (std::uint32_t h = 0; h < kHeads; ++h) {
+          for (std::uint64_t r = 0; r < sh.rows; ++r) {
+            gufo::quant::DequantizeQ6_K(
+                raw.data() + (((h * sh.rows) + r) * (sh.cols / 256) * 210),
+                row.data(), sh.cols);
+            for (std::uint32_t t = 0; t < tokens; ++t) {
+              const float* xt = x.data() + (((h * tokens) + t) * sh.cols);
+              double acc = 0.0;
+              for (std::uint64_t c = 0; c < sh.cols; ++c) {
+                acc += static_cast<double>(row[c]) * xt[c];
+              }
+              want[(((h * tokens) + t) * sh.rows) + r] =
+                  static_cast<float>(acc);
+            }
+          }
+        }
+        const double vs_host = RelL2(got.data(), want.data(), yn);
+        const double vs_old = RelL2(got.data(), old.data(), yn);
+        char line[200];
+        std::snprintf(line, sizeof line,
+                      "ProjectHeads Q6_K vs host oracle %.2e, vs per-head GEMM "
+                      "%.2e (<= %.0e): %s",
+                      vs_host, vs_old, kTol, label.c_str());
+        v.Check(vs_host <= kTol && vs_old <= kTol, line);
+      }
+    }
+  }
+}
+
 int RunDefault() {
   Verdict v;
+  ProjectHeadsCheck(v);
   const bool fixture = FixtureCheck(v);
   // G = 2 attention path, short context (no pool dropped), odd splits.
   SyntheticCheck(v, "synthetic-short",
