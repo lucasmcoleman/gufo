@@ -5,11 +5,14 @@
 #include <algorithm>
 #include <cstring>
 #include <initializer_list>
+#include <iostream>
+#include <optional>
 #include <utility>
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/glm53_flash/kernels/hc.hpp"
 #include "src/models/glm53_flash/kernels/kda.hpp"
+#include "src/models/glm53_flash/profile.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
@@ -645,6 +648,9 @@ Executor::Executor(const ModelWeights& weights, const ExecutorOptions& options,
 Executor::~Executor() {
   if (stream_ != nullptr) {
     (void)hipStreamSynchronize(stream_);
+    if (profiler_ != nullptr) {
+      PrintProfile(std::cerr);
+    }
     (void)hipStreamDestroy(stream_);
   }
 }
@@ -659,8 +665,15 @@ std::unique_ptr<Executor> Executor::Create(const ModelWeights& weights,
   return e;
 }
 
+void Executor::PrintProfile(std::ostream& os) const {
+  if (profiler_ != nullptr) {
+    profiler_->Print(os);
+  }
+}
+
 bool Executor::Init(std::string* error) {
   const Config& c = config_;
+  profiler_ = OpProfiler::FromEnv();
   if (options_.last_layer == 0) {
     options_.last_layer = c.num_layers;
   }
@@ -902,6 +915,9 @@ bool Executor::Run(const std::int32_t* tokens, const float* streams,
     position_ += n;
   }
   failed_ = false;
+  if (profiler_ != nullptr && profiler_->per_run()) {
+    PrintProfile(std::cerr);
+  }
   return true;
 }
 
@@ -912,7 +928,25 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
   const std::size_t hidden = c.hidden_size;
   const std::size_t hc_dim = c.HcDim();
   const std::size_t row = hidden * sizeof(float);
+  // Spans open when a failure returns are dropped; declared first so it runs
+  // after the scopes below have closed.
+  struct PassGuard {
+    OpProfiler* p;
+    bool done{false};
+    ~PassGuard() {
+      if (p != nullptr && !done) {
+        p->AbortPass();
+      }
+    }
+  } guard{profiler_.get()};
+  if (profiler_ != nullptr) {
+    profiler_->BeginPass(n);
+  }
+  std::optional<OpScope> pass_scope;
+  pass_scope.emplace(profiler_.get(), "pass", stream_);
+  std::optional<OpScope> embed_scope;
   if (tokens != nullptr) {
+    embed_scope.emplace(profiler_.get(), "embedding", stream_);
     // Four copies of the token embedding (HF:1493).
     const std::vector<std::uint32_t> ids(tokens, tokens + n);
     bool ok = hipMemcpyAsync(ids_, ids.data(), n * sizeof(std::uint32_t),
@@ -924,6 +958,7 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
                             row, row, n, hipMemcpyDeviceToDevice,
                             stream_) == hipSuccess;
     }
+    embed_scope.reset();
     if (!ok || hipStreamSynchronize(stream_) != hipSuccess) {
       return Fail(error, "embedding lookup failed");
     }
@@ -931,6 +966,7 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
                             hipMemcpyHostToDevice, stream_) != hipSuccess) {
     return Fail(error, "stream upload failed");
   }
+  embed_scope.reset();
 
   for (std::uint32_t il = options_.first_layer; il < options_.last_layer;
        ++il) {
@@ -957,21 +993,34 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
   bool ok = true;
   if (output_norm_ != nullptr) {
     // Mean head, then the final RMSNorm (HF:1509) and the output projection.
-    ok = rocm::HcHeadMean(streams_, a_, n, c.hidden_size, stream_);
-    Emit(tap, "hc_head.out", kNoLayer, a_, hidden, n);
-    ::gufo::hip::LaunchBatchedRMSNorm(a_, output_norm_, xn_, nullptr, n, hidden,
-                                      c.rms_eps, stream_);
-    Emit(tap, "final_norm.out", kNoLayer, xn_, hidden, n);
-    ok = ok && download(out->hidden, xn_, hidden);
+    {
+      const OpScope scope(profiler_.get(), "head_norm", stream_);
+      ok = rocm::HcHeadMean(streams_, a_, n, c.hidden_size, stream_);
+      Emit(tap, "hc_head.out", kNoLayer, a_, hidden, n);
+      ::gufo::hip::LaunchBatchedRMSNorm(a_, output_norm_, xn_, nullptr, n,
+                                        hidden, c.rms_eps, stream_);
+      Emit(tap, "final_norm.out", kNoLayer, xn_, hidden, n);
+    }
+    {
+      const OpScope scope(profiler_.get(), "head_hidden_download", stream_);
+      ok = ok && download(out->hidden, xn_, hidden);
+    }
     if (want_logits && !output_.empty()) {
+      const OpScope scope(profiler_.get(), "head_logits", stream_);
       ok = ok && LaunchProjection(output_, xn_, logits_, n, stream_) &&
            download(out->logits, logits_, c.vocab_size);
     }
   } else {
+    const OpScope scope(profiler_.get(), "streams_download", stream_);
     ok = download(out->streams, streams_, hc_dim);
   }
+  pass_scope.reset();
   ok = ok && hipStreamSynchronize(stream_) == hipSuccess &&
        hipPeekAtLastError() == hipSuccess;
+  if (profiler_ != nullptr && ok) {
+    profiler_->EndPass();
+    guard.done = true;
+  }
   return ok || Fail(error, "head failed");
 }
 
@@ -989,10 +1038,13 @@ bool Executor::HalfLayer(std::uint32_t il, bool ffn, std::uint32_t n,
   const std::size_t mix_bytes = c.HcMixDim() * sizeof(float);
   const int k = ffn ? 1 : 0;
   Emit(tap, ffn ? "ffn_hc.in" : "in", il, streams_, hidden, hc, n);
-  if (!rocm::HcPre(streams_, w.fn, w.base, w.scale, x_, split_, nullptr, n,
-                   c.hidden_size, c.hc_sinkhorn_iters, c.hc_eps, c.rms_eps,
-                   stream_)) {
-    return false;
+  {
+    const OpScope scope(profiler_.get(), "hc_pre", stream_);
+    if (!rocm::HcPre(streams_, w.fn, w.base, w.scale, x_, split_, nullptr, n,
+                     c.hidden_size, c.hc_sinkhorn_iters, c.hc_eps, c.rms_eps,
+                     stream_)) {
+      return false;
+    }
   }
   if (tap != nullptr && *tap) {
     // post and comb are strided inside split [T][pre | post | comb].
@@ -1008,29 +1060,40 @@ bool Executor::HalfLayer(std::uint32_t il, bool ffn, std::uint32_t n,
     Emit(tap, kHcTaps[k][1], il, tap_comb_, hc * hc, n);
     Emit(tap, kHcTaps[k][2], il, x_, hidden, n);
   }
-  ::gufo::hip::LaunchBatchedRMSNorm(x_, ffn ? d.ffn_norm : d.attn_norm, xn_,
-                                    nullptr, n, hidden, c.rms_eps, stream_);
+  {
+    const OpScope scope(profiler_.get(), "norm", stream_);
+    ::gufo::hip::LaunchBatchedRMSNorm(x_, ffn ? d.ffn_norm : d.attn_norm, xn_,
+                                      nullptr, n, hidden, c.rms_eps, stream_);
+  }
   Emit(tap, ffn ? "post_attention_layernorm.out" : "input_layernorm.out", il,
        xn_, hidden, n);
   const OpContext ctx{.stream = stream_,
                       .scratch = scratch_,
                       .scratch_bytes = scratch_bytes_,
-                      .tap = tap};
+                      .tap = tap,
+                      .profiler = profiler_.get()};
   bool ok = false;
   if (ffn) {
+    const OpScope scope(profiler_.get(), d.ffn.dense ? "ffn_dense" : "ffn_moe",
+                        stream_);
     ok = ops_.ffn(ctx, c, il, d.ffn, xn_, n, a_);
   } else if (c.IsKdaLayer(il)) {
+    const OpScope scope(profiler_.get(), "kda", stream_);
     ok = KdaMixerForward(ctx, c, il, d.kda, kda_[il], xn_, n, a_);
   } else {
+    const OpScope scope(profiler_.get(), "mla", stream_);
     ok = ops_.mla(ctx, c, il, d.mla, mla_[il], xn_, n, pos0, a_);
   }
   if (!ok) {
     return false;
   }
   Emit(tap, ffn ? "mlp.out" : "self_attn.out", il, a_, hidden, n);
-  if (!rocm::HcPost(a_, streams_, split_, streams_, n, c.hidden_size,
-                    stream_)) {
-    return false;
+  {
+    const OpScope scope(profiler_.get(), "hc_post", stream_);
+    if (!rocm::HcPost(a_, streams_, split_, streams_, n, c.hidden_size,
+                      stream_)) {
+      return false;
+    }
   }
   if (ffn) {
     Emit(tap, "out0", il, streams_, hidden, hc, n);

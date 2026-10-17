@@ -14,11 +14,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 
 #include "src/models/glm53_flash/executor.hpp"
 #include "src/models/glm53_flash/layer_ops.hpp"
+#include "src/models/glm53_flash/profile.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace gufo::models::glm53_flash {
@@ -332,6 +334,8 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   float* latent = cache.latent + (std::size_t{pos0} * L);
 
   // Query and latent (HF:1181-1186).
+  std::optional<OpScope> scope;
+  scope.emplace(ctx.profiler, "mla/q_kv_proj", stream);
   bool ok = Project(w.q_a, 0, x, s.qr, n, stream);
   ok = ok && NormRows(s.qr, w.q_a_norm, nullptr, s.qr, n, c.q_lora_rank,
                       c.rms_eps, stream);
@@ -339,6 +343,7 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   ok = ok && Project(w.kv_a, 0, x, s.kv, n, stream);
   ok = ok &&
        NormRows(s.kv, w.kv_a_norm, nullptr, latent, n, L, c.rms_eps, stream);
+  scope.reset();
   if (!ok) {
     return false;
   }
@@ -354,9 +359,11 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
                           .iw = s.iw,
                           .sel = s.sel,
                           .top_k = tapping ? s.top_k : nullptr};
+  scope.emplace(ctx.profiler, "mla/indexer", stream);
   if (!IndexerForward(c, w, cache, ib, n, pos0, stream)) {
     return false;
   }
+  scope.reset();
   if (tapping) {
     const std::uint32_t ih = c.indexer_heads;
     const std::uint32_t idim = c.indexer_head_dim;
@@ -375,14 +382,17 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   }
 
   // Absorb k_b per head, attend over the latent rows, v_b per head.
+  scope.emplace(ctx.profiler, "mla/k_b", stream);
   SwapKernel<<<dim3(n, heads), 64, 0, stream>>>(s.q, s.qh, n, heads, nope);
   for (std::uint32_t h = 0; ok && h < heads; ++h) {
     ok = Project(w.k_b, h, s.qh + (std::size_t{h} * n * nope),
                  s.qabs + (std::size_t{h} * n * L), n, stream);
   }
+  scope.reset();
   if (!ok) {
     return false;
   }
+  scope.emplace(ctx.profiler, "mla/attention", stream);
   const int g = AttentionGroup(c);
   const std::uint32_t smax = SelectionRows(c);
   const float scale = 1.0F / std::sqrt(static_cast<float>(nope));
@@ -403,17 +413,22 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
         <<<grid, kThreads, lds, stream>>>(s.qabs, cache.latent, s.sel, s.ctx, n,
                                           pos0, L, kpool, budget, smax, scale);
   }
+  scope.reset();
+  scope.emplace(ctx.profiler, "mla/v_b", stream);
   for (std::uint32_t h = 0; ok && h < heads; ++h) {
     ok = Project(w.v_b, h, s.ctx + (std::size_t{h} * n * L),
                  s.vo + (std::size_t{h} * n * v_dim), n, stream);
   }
+  scope.reset();
   if (!ok) {
     return false;
   }
+  scope.emplace(ctx.profiler, "mla/out_proj", stream);
   SwapKernel<<<dim3(heads, n), 64, 0, stream>>>(s.vo, s.attn, heads, n, v_dim);
   Tap(ctx, "kqv_out", layer, s.attn, TapView::Dtype::kF32,
       std::uint64_t{heads} * v_dim, n);
   ok = Project(w.out, 0, s.attn, y, n, stream);
+  scope.reset();
   Tap(ctx, "attn_out", layer, y, TapView::Dtype::kF32, c.hidden_size, n);
   return ok && hipPeekAtLastError() == hipSuccess;
 }
