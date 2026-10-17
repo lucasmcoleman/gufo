@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <utility>
 
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/models/glm53_flash/kernels/hc.hpp"
 #include "src/models/glm53_flash/kernels/kda.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -286,7 +287,11 @@ DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
 void* DeviceArena::Allocate(std::size_t bytes) {
   const std::size_t size = AlignUp(std::max<std::size_t>(bytes, 1));
   void* p = nullptr;
-  if (hipMalloc(&p, size) != hipSuccess) {
+  // Managed memory, always: on the gfx1151 APU hipMalloc stalls (it never
+  // returns OOM) near 56 GiB while hipMemGetInfo still reports the 112 GiB
+  // TTM heap free, so the AllocateDevice fallback never triggers and the
+  // 89.5 GiB Maya-S upload hangs. Managed pages come from the same DRAM.
+  if (gufo::hip::AllocateManaged(&p, size) != hipSuccess) {
     return nullptr;
   }
   blocks_.push_back(p);
