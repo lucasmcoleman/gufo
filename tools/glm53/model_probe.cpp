@@ -14,13 +14,11 @@
 // Each GPU mode runs (a) a 5-token prefill and (b) after Reset a 4-token
 // prefill plus a 1-token decode, writes OUTDIR/<mode>-<a|b>.f32
 // ([5][154880] F32) and OUTDIR/compare.json, and prints the verdict.
-// Memory: the executor uploads ~87 GiB with hipMalloc, which stalls at the KFD
-// ~57 GiB system-memory cap on this APU (the UploadGuard SIGTERMs after 300 s
-// without GTT growth). Run with LD_PRELOAD=/server/staging/glm53-gufo/v4/
-// libhipmalloc_managed.so (hipMalloc -> hipMallocManaged; the GTT counter then
-// stays flat, so the guard only matters for the plain-hipMalloc case; upload
-// takes ~2 min), under gpu-lock-exec (v4/run.sh).
-// Env: V3_DIR (default /server/staging/glm53-gufo/v3) holds llama/ and gufo/.
+// Memory: the executor uploads ~87 GiB into managed memory (plain hipMalloc
+// stalls near 56 GiB on this APU). The UploadGuard still SIGTERMs the probe
+// after 300 s without GTT growth, so a hang cannot hold the GPU admission
+// lock. Upload takes ~1 min; run under the GPU admission lock.
+// Env: V3_DIR (required) holds the V3 llama/ and gufo/ dumps.
 
 #include <hip/hip_runtime.h>
 
@@ -474,7 +472,12 @@ int main(int argc, char** argv) {
   const std::string out_dir = argv[2];
   const std::string mode = argv[3];
   const char* env = std::getenv("V3_DIR");
-  const std::string v3 = env ? env : "/server/staging/glm53-gufo/v3";
+  if (env == nullptr || *env == '\0') {
+    std::cerr << "set V3_DIR to the directory holding the V3 llama/ and gufo/ "
+                 "dumps\n";
+    return 2;
+  }
+  const std::string v3 = env;
   if (mode != "hostffn" && mode != "laneb" && mode != "ffntime") {
     std::cerr << "mode must be hostffn, laneb or ffntime\n";
     return 2;

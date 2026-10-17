@@ -89,7 +89,7 @@ set_target_properties(glm53_flash_reference_probe PROPERTIES EXCLUDE_FROM_ALL ON
 
 # KDA executor parity probe (not a test): GPU KdaMixerForward vs the CPU
 # ReferenceModel on layers 0-2 of a real GGUF
-# (tools/glm53/kda_executor_probe.cpp, see /server/staging/glm53-gufo/a3).
+# (tools/glm53/kda_executor_probe.cpp).
 if (ENGINE_ENABLE_HIP)
   add_executable(glm53_flash_kda_executor_probe
     ${PROJECT_SOURCE_DIR}/tools/glm53/kda_executor_probe.cpp)
@@ -101,7 +101,7 @@ endif()
 
 # Layer-loop parity probe (not a test): GPU Executor on layers 0-2 plus the
 # embedding of a real GGUF, host FFN stand-in, vs the CPU ReferenceModel
-# (tools/glm53/executor_loop_probe.cpp, see /server/staging/glm53-gufo/a3/loop).
+# (tools/glm53/executor_loop_probe.cpp).
 if (ENGINE_ENABLE_HIP)
   add_executable(glm53_flash_executor_loop_probe
     ${PROJECT_SOURCE_DIR}/tools/glm53/executor_loop_probe.cpp)
@@ -113,7 +113,7 @@ endif()
 
 # Full-model parity probe (not a test): the GPU Executor over all 45 layers of
 # a real GGUF, logits vs llama.cpp and the CPU ReferenceModel
-# (tools/glm53/model_probe.cpp, see /server/staging/glm53-gufo/v4).
+# (tools/glm53/model_probe.cpp).
 if (ENGINE_ENABLE_HIP)
   add_executable(glm53_flash_model_probe
     ${PROJECT_SOURCE_DIR}/tools/glm53/model_probe.cpp)
@@ -123,7 +123,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 # Tokenizer parity probe (not a test): encodes a hex-line corpus for
-# comparison with llama-tokenize (see /server/staging/glm53-gufo/a6).
+# comparison with llama-tokenize.
 add_executable(glm53_flash_tokenize_probe
   ${PROJECT_SOURCE_DIR}/tools/glm53/tokenize_probe.cpp)
 target_link_libraries(glm53_flash_tokenize_probe PRIVATE gufo_glm53_flash)

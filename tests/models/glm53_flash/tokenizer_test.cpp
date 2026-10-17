@@ -2,8 +2,8 @@
 // ids, chat-template control tokens, the glm4 pre-tokenizer split, special
 // token parsing and byte-exact round trips. Set GLM53_FLASH_GGUF to the first
 // shard; without it the test reports a skip (which is not a pass for model
-// qualification). Parity with llama-tokenize is checked by
-// /server/staging/glm53-gufo/a6/run_parity.py.
+// qualification). Parity with llama-tokenize is checked separately with
+// tools/glm53/tokenize_probe.cpp.
 
 #include "src/models/glm53_flash/tokenizer.hpp"
 
