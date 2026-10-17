@@ -117,6 +117,10 @@ struct OpContext {
 [[nodiscard]] std::size_t OpScratchBytes(const Config& config,
                                          std::uint32_t max_tokens) noexcept;
 
+/// Scratch MlaForward needs for a call of up to `max_tokens` tokens.
+[[nodiscard]] std::size_t MlaScratchBytes(const Config& config,
+                                          std::uint32_t max_tokens) noexcept;
+
 /// Absorbed MLA with DSA top-k selection. Appends rows for positions
 /// [pos0, pos0 + tokens) to `cache` and writes `y` [tokens x hidden].
 /// Returns false (and leaves `y` unspecified) on an unsupported weight
