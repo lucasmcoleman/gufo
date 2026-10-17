@@ -1,8 +1,10 @@
 #include "src/models/glm53_flash/engine.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -38,8 +40,11 @@ bool ProductionOps(LayerOps* ops, std::string* error) {
 class ExecutorSession final : public ForwardSession {
 public:
   ExecutorSession(Executor& executor, std::uint32_t capacity,
-                  std::uint32_t vocab)
-      : executor_(executor), capacity_(capacity), vocab_(vocab) {}
+                  std::uint32_t vocab, bool fused_last_logits)
+      : executor_(executor),
+        capacity_(capacity),
+        vocab_(vocab),
+        fused_(fused_last_logits) {}
 
   bool Forward(std::span<const TokenId> tokens, std::vector<float>* logits,
                std::string* error) override {
@@ -53,6 +58,23 @@ public:
       ids_.push_back(static_cast<std::int32_t>(token));
     }
     const std::span<const std::int32_t> all(ids_);
+    if (fused_) {
+      // One pass per chunk: the final pass projects its last row only, and
+      // no pass downloads the hidden states.
+      if (!executor_.ForwardLast(all, logits != nullptr, &result_, nullptr,
+                                 error))
+        return false;
+      if (logits == nullptr)
+        return true;
+      if (result_.logits.size() != vocab_) {
+        return Fail(error, "GLM-5.3-Flash executor returned " +
+                               std::to_string(result_.logits.size()) +
+                               " logits for a vocabulary of " +
+                               std::to_string(vocab_));
+      }
+      logits->assign(result_.logits.begin(), result_.logits.end());
+      return true;
+    }
     if (logits == nullptr)
       return executor_.Forward(all, false, &result_, nullptr, error);
     // Logits of the last token only: the executor returns a row per token,
@@ -86,6 +108,7 @@ private:
   Executor& executor_;
   std::uint32_t capacity_;
   std::uint32_t vocab_;
+  bool fused_;
   std::vector<std::int32_t> ids_;
   ForwardResult result_;
 };
@@ -112,8 +135,10 @@ bool RuntimeAvailable(std::string* error) {
 #if defined(GLM53_ROCM_BUILD)
 std::unique_ptr<ForwardSession> MakeExecutorSession(Executor& executor,
                                                     std::uint32_t capacity,
-                                                    std::uint32_t vocab) {
-  return std::make_unique<ExecutorSession>(executor, capacity, vocab);
+                                                    std::uint32_t vocab,
+                                                    bool fused_last_logits) {
+  return std::make_unique<ExecutorSession>(executor, capacity, vocab,
+                                           fused_last_logits);
 }
 #endif
 
@@ -122,6 +147,7 @@ struct Model::Impl {
   std::unique_ptr<ModelWeights> weights;
 #if defined(GLM53_ROCM_BUILD)
   std::unique_ptr<Executor> executor;
+  bool fused_last_logits{true};
 #endif
 };
 
@@ -231,6 +257,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     Fail(error, "GLM-5.3-Flash executor: " + detail);
     return nullptr;
   }
+  const char* fused_env = std::getenv("GUFO_GLM53_FUSED_LAST_LOGITS");
+  model->impl_->fused_last_logits =
+      options.fused_last_logits &&
+      !(fused_env != nullptr && std::string_view(fused_env) == "0");
   model->stops_ = ResolveStopTokens(*tokenizer);
   model->tokenizer_ = std::move(tokenizer);
   model->max_context_ = max_context;
@@ -256,7 +286,8 @@ std::unique_ptr<ForwardSession> Model::CreateSession(std::string* error) {
   }
   return std::make_unique<Session>(
       shared_from_this(),
-      MakeExecutorSession(*impl_->executor, max_context_, VocabSize()));
+      MakeExecutorSession(*impl_->executor, max_context_, VocabSize(),
+                          impl_->fused_last_logits));
 #else
   Fail(error, std::string(kLaneBMissingError));
   return nullptr;

@@ -103,7 +103,9 @@ float MinMargin(const std::vector<std::vector<float>>& rows) {
   return margin;
 }
 
-void Run(const fixture::Model& m) {
+void Run(const fixture::Model& m, bool fused) {
+  std::cout << (fused ? "-- fused last-token logits\n"
+                      : "-- separate last-token pass\n");
   const glm::Config& c = m.config;
   const std::uint32_t vocab = c.vocab_size;
   glm::stand_in::HostOps ops(c);
@@ -115,7 +117,8 @@ void Run(const fixture::Model& m) {
   Check("create executor " + error, executor != nullptr);
   if (!executor)
     return;
-  const auto session = glm::MakeExecutorSession(*executor, kCapacity, vocab);
+  const auto session =
+      glm::MakeExecutorSession(*executor, kCapacity, vocab, fused);
   glm::Generator generator(*session, glm::StopTokens{}, nullptr);
 
   const ref::GgufWeightSource source(m.weights);
@@ -175,11 +178,13 @@ void Run(const fixture::Model& m) {
         ok && result.reused_tokens == kPrompt + kSteps - 1);
   Check("extension continues the reference's greedy sequence",
         ok && result.tokens == want_next.tokens);
-  // MLA layer 3 runs once per call: the 3-token suffix splits into 2 + 1
-  // (logits of the last only), then two decodes.
+  // MLA layer 3 runs once per pass: the 3-token suffix is one pass when the
+  // last token's logits are fused into it, else 2 + 1; then two decodes.
+  const std::uint32_t expect_calls = fused ? 3 : 4;
   Check("only the suffix was prefilled (" +
-            std::to_string(ops.mla_calls() - mla_before) + " MLA calls)",
-        ops.mla_calls() - mla_before == 4);
+            std::to_string(ops.mla_calls() - mla_before) + " MLA calls, " +
+            std::to_string(expect_calls) + " expected)",
+        ops.mla_calls() - mla_before == expect_calls);
 
   // (c) A stop token ends the turn before it is run.
   const glm::TokenId stop = want.tokens[2];
@@ -231,7 +236,8 @@ int main() {
     const fixture::Fixture fx = fixture::Load(GLM53_E2E_FIXTURE);
     fixture::Model m;
     fixture::BuildModel(m, fx);
-    Run(m);
+    Run(m, false);
+    Run(m, true);
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << "\n";
     return 1;

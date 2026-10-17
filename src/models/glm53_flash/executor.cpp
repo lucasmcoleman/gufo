@@ -867,7 +867,23 @@ bool Executor::Forward(std::span<const std::int32_t> tokens, bool want_logits,
     }
   }
   return Run(tokens.data(), nullptr, static_cast<std::uint32_t>(tokens.size()),
-             want_logits, out, tap, error);
+             want_logits, Head::kPerToken, out, tap, error);
+}
+
+bool Executor::ForwardLast(std::span<const std::int32_t> tokens,
+                           bool want_logits, ForwardResult* out,
+                           const TapFn* tap, std::string* error) {
+  if (embd_.empty()) {
+    return Fail(error,
+                "ForwardLast needs the embedding (ExecutorOptions::embed)");
+  }
+  for (const std::int32_t id : tokens) {
+    if (id < 0 || static_cast<std::uint32_t>(id) >= config_.vocab_size) {
+      return Fail(error, "token id " + std::to_string(id) + " out of range");
+    }
+  }
+  return Run(tokens.data(), nullptr, static_cast<std::uint32_t>(tokens.size()),
+             want_logits, Head::kLastRow, out, tap, error);
 }
 
 bool Executor::ForwardStreams(const float* streams, std::uint32_t n_tokens,
@@ -876,12 +892,13 @@ bool Executor::ForwardStreams(const float* streams, std::uint32_t n_tokens,
   if (streams == nullptr && n_tokens != 0) {
     return Fail(error, "null streams");
   }
-  return Run(nullptr, streams, n_tokens, want_logits, out, tap, error);
+  return Run(nullptr, streams, n_tokens, want_logits, Head::kPerToken, out, tap,
+             error);
 }
 
 bool Executor::Run(const std::int32_t* tokens, const float* streams,
-                   std::uint32_t n_tokens, bool want_logits, ForwardResult* out,
-                   const TapFn* tap, std::string* error) {
+                   std::uint32_t n_tokens, bool want_logits, Head head,
+                   ForwardResult* out, const TapFn* tap, std::string* error) {
   if (failed_) {
     return Fail(error, "a previous call failed partway; call Reset()");
   }
@@ -909,7 +926,7 @@ bool Executor::Run(const std::int32_t* tokens, const float* streams,
     const std::uint32_t n = std::min(options_.max_tokens, n_tokens - t0);
     if (!Pass(tokens != nullptr ? tokens + t0 : nullptr,
               streams != nullptr ? streams + (t0 * hc_dim) : nullptr, n,
-              want_logits, out, tap, error)) {
+              want_logits, head, t0 + n == n_tokens, out, tap, error)) {
       return false;
     }
     position_ += n;
@@ -922,8 +939,9 @@ bool Executor::Run(const std::int32_t* tokens, const float* streams,
 }
 
 bool Executor::Pass(const std::int32_t* tokens, const float* streams,
-                    std::uint32_t n, bool want_logits, ForwardResult* out,
-                    const TapFn* tap, std::string* error) {
+                    std::uint32_t n, bool want_logits, Head head,
+                    bool last_pass, ForwardResult* out, const TapFn* tap,
+                    std::string* error) {
   const Config& c = config_;
   const std::size_t hidden = c.hidden_size;
   const std::size_t hc_dim = c.HcDim();
@@ -991,7 +1009,12 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
                           hipMemcpyDeviceToHost, stream_) == hipSuccess;
   };
   bool ok = true;
-  if (output_norm_ != nullptr) {
+  // kLastRow needs the head only for the last pass's logits row (and for taps,
+  // which see the whole head); it never downloads `hidden`.
+  const bool last_row = head == Head::kLastRow;
+  const bool need_logits = want_logits && !output_.empty();
+  if (output_norm_ != nullptr &&
+      (!last_row || (last_pass && need_logits) || (tap != nullptr && *tap))) {
     // Mean head, then the final RMSNorm (HF:1509) and the output projection.
     {
       const OpScope scope(profiler_.get(), "head_norm", stream_);
@@ -1001,16 +1024,26 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
                                         hidden, c.rms_eps, stream_);
       Emit(tap, "final_norm.out", kNoLayer, xn_, hidden, n);
     }
-    {
+    if (!last_row) {
       const OpScope scope(profiler_.get(), "head_hidden_download", stream_);
       ok = ok && download(out->hidden, xn_, hidden);
     }
-    if (want_logits && !output_.empty()) {
+    if (need_logits && !last_row) {
       const OpScope scope(profiler_.get(), "head_logits", stream_);
       ok = ok && LaunchProjection(output_, xn_, logits_, n, stream_) &&
            download(out->logits, logits_, c.vocab_size);
+    } else if (need_logits && last_pass) {
+      // One row: the final token of the call, projected inside this pass.
+      const OpScope scope(profiler_.get(), "head_logits", stream_);
+      out->logits.resize(c.vocab_size);
+      ok = ok &&
+           LaunchProjection(output_, xn_ + ((n - 1) * hidden), logits_, 1,
+                            stream_) &&
+           hipMemcpyAsync(out->logits.data(), logits_,
+                          c.vocab_size * sizeof(float), hipMemcpyDeviceToHost,
+                          stream_) == hipSuccess;
     }
-  } else {
+  } else if (output_norm_ == nullptr) {
     const OpScope scope(profiler_.get(), "streams_download", stream_);
     ok = download(out->streams, streams_, hc_dim);
   }

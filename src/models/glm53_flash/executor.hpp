@@ -285,6 +285,21 @@ public:
                              bool want_logits, ForwardResult* out,
                              const TapFn* tap, std::string* error);
 
+  /// Forward for a session that needs only the next-token logits: same
+  /// layer loop and state update as Forward, but the output head and its
+  /// device-to-host copy are skipped on every pass except the call's last,
+  /// where only the final token's row is projected. `out->logits` is one row
+  /// [vocab] when `want_logits` and output.weight is bound (else empty);
+  /// `out->hidden` is never filled. A prompt of N tokens is ceil(N /
+  /// max_tokens) passes, with no extra pass for its last token. The last
+  /// token's rows run inside the batch of the final pass, so its logits and
+  /// state agree with a separate one-token Forward to F32 rounding, not
+  /// bitwise (batch-dependent GEMM routes). Forward is unchanged and still
+  /// returns hidden and logits for every token.
+  [[nodiscard]] bool ForwardLast(std::span<const std::int32_t> tokens,
+                                 bool want_logits, ForwardResult* out,
+                                 const TapFn* tap, std::string* error);
+
   /// As Forward, from host residual streams [T][hc][hidden] entering
   /// first_layer instead of token ids (a layer range starting past 0).
   [[nodiscard]] bool ForwardStreams(const float* streams,
@@ -296,12 +311,15 @@ private:
   Executor(const ModelWeights& weights, const ExecutorOptions& options,
            LayerOps ops);
   bool Init(std::string* error);
+  /// What the output head produces: every token's hidden (and logits when
+  /// wanted), or only the call's last token's logits.
+  enum class Head : std::uint8_t { kPerToken, kLastRow };
   bool Run(const std::int32_t* tokens, const float* streams,
-           std::uint32_t n_tokens, bool want_logits, ForwardResult* out,
-           const TapFn* tap, std::string* error);
+           std::uint32_t n_tokens, bool want_logits, Head head,
+           ForwardResult* out, const TapFn* tap, std::string* error);
   bool Pass(const std::int32_t* tokens, const float* streams, std::uint32_t n,
-            bool want_logits, ForwardResult* out, const TapFn* tap,
-            std::string* error);
+            bool want_logits, Head head, bool last_pass, ForwardResult* out,
+            const TapFn* tap, std::string* error);
   bool HalfLayer(std::uint32_t il, bool ffn, std::uint32_t n,
                  std::uint32_t pos0, const TapFn* tap);
   void Emit(const TapFn* tap, std::string_view name, std::uint32_t layer,

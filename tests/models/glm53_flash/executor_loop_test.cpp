@@ -16,6 +16,9 @@
 //   (c) Reset() then the 12-token prefill again reproduces (a);
 //   (d) a [0,3) range with embedding and no head, then [3,5) with the head
 //       from its streams (ForwardStreams), vs the full 14-token reference;
+//   (f) ForwardLast (the session path): last-token logits only, in the final
+//       pass of the call, with identical state afterwards; Forward still
+//       returns hidden and logits for every token;
 //   (e) refusals: an MLA range without an MLA operator, the embedding with a
 //       range past layer 0, and a failing operator leaving the executor
 //       Failed() until Reset().
@@ -241,6 +244,92 @@ void CheckIncremental(const Model& m) {
            first_logits, 1e-6);
 }
 
+// (f) Executor::ForwardLast vs the per-token Forward and the reference.
+void CheckLastLogits(const Model& m) {
+  const glm::Config& c = m.config;
+  const std::size_t vocab = c.vocab_size;
+  const std::size_t hidden = c.hidden_size;
+  const ref::GgufWeightSource source(m.weights);
+  ref::ReferenceModel model(c, source);
+  const std::span<const std::int32_t> ids(m.ids);
+  const auto prefill = model.Forward(ids.first(kPrefill), true);
+  const auto step12 = model.Forward(ids.subspan(kPrefill, 1), true);
+  const auto step13 = model.Forward(ids.subspan(kPrefill + 1, 1), true);
+  const std::vector<float> want_last(prefill.logits.end() - vocab,
+                                     prefill.logits.end());
+  std::string error;
+
+  // The per-token API is unchanged: a row of hidden and of logits per token.
+  {
+    glm::stand_in::HostOps ops(c);
+    auto exec =
+        glm::Executor::Create(m.weights, Options(5), ops.Bind(), &error);
+    glm::ForwardResult got;
+    const bool ok =
+        exec && exec->Forward(ids.first(kPrefill), true, &got, nullptr, &error);
+    Check("Forward(12) per-token API " + error, ok);
+    if (!ok)
+      return;
+    Check("Forward still returns hidden and logits for every token",
+          ok && got.hidden.size() == kPrefill * hidden &&
+              got.logits.size() == kPrefill * vocab);
+    CheckRel("Forward(12) logits vs reference", got.logits, prefill.logits);
+    glm::ForwardResult none;
+    Check("Forward(want_logits=false) still returns hidden only",
+          exec->Forward(ids.subspan(kPrefill, 1), false, &none, nullptr,
+                        &error) &&
+              none.hidden.size() == hidden && none.logits.empty());
+  }
+
+  // ForwardLast over several pass sizes: the 12 prompt tokens take
+  // ceil(12 / max_tokens) passes (one MLA call each), then single-token
+  // calls on the same executor continue from identical state.
+  for (const std::uint32_t max_tokens : {16U, 5U, 12U, 1U}) {
+    const std::string label = "max_tokens " + std::to_string(max_tokens);
+    glm::stand_in::HostOps ops(c);
+    auto exec = glm::Executor::Create(m.weights, Options(max_tokens),
+                                      ops.Bind(), &error);
+    Check("create " + label + " " + error, exec != nullptr);
+    if (!exec)
+      return;
+    glm::ForwardResult got;
+    bool ok =
+        exec->ForwardLast(ids.first(kPrefill), true, &got, nullptr, &error);
+    Check(label + ": ForwardLast(12) " + error, ok);
+    if (!ok)
+      return;
+    Check(label + ": one logits row, no hidden", got.logits.size() == vocab &&
+                                                     got.hidden.empty() &&
+                                                     got.streams.empty());
+    CheckRel(label + ": last-token logits vs reference", got.logits, want_last);
+    const std::uint32_t passes = (kPrefill + max_tokens - 1) / max_tokens;
+    Check(label + ": " + std::to_string(passes) + " passes for 12 tokens (" +
+              std::to_string(ops.mla_calls()) + " MLA calls)",
+          ops.mla_calls() == passes && exec->Position() == kPrefill);
+
+    glm::ForwardResult next;
+    ok = exec->Forward(ids.subspan(kPrefill, 1), true, &next, nullptr, &error);
+    Check(label + ": decode after ForwardLast " + error, ok);
+    CheckRel(label + ": decode logits (state carried over)", next.logits,
+             step12.logits);
+    ok = exec->ForwardLast(ids.subspan(kPrefill + 1, 1), true, &next, nullptr,
+                           &error);
+    Check(label + ": ForwardLast(1) " + error, ok);
+    CheckRel(label + ": ForwardLast(1) logits", next.logits, step13.logits);
+
+    // No logits wanted: nothing is downloaded, state still advances.
+    Check(label + ": reset", exec->Reset());
+    glm::ForwardResult quiet;
+    ok = exec->ForwardLast(ids.first(kPrefill), false, &quiet, nullptr, &error);
+    Check(label + ": ForwardLast(want_logits=false) " + error,
+          ok && quiet.logits.empty() && quiet.hidden.empty() &&
+              exec->Position() == kPrefill);
+    ok = exec->Forward(ids.subspan(kPrefill, 1), true, &next, nullptr, &error);
+    CheckRel(label + ": decode after a logits-free ForwardLast", next.logits,
+             step12.logits);
+  }
+}
+
 // (b) + (d).
 void CheckPassesAndRanges(const Model& m) {
   const glm::Config& c = m.config;
@@ -357,6 +446,7 @@ int main() {
     BuildModel(m, fx);
     CheckIncremental(m);
     CheckPassesAndRanges(m);
+    CheckLastLogits(m);
     CheckRefusals(m);
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << "\n";
