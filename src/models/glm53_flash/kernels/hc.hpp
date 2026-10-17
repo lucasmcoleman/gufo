@@ -29,8 +29,12 @@ constexpr std::uint32_t kHcMixDim = 24;  ///< 2*4 + 4*4
 /// projection by `fn`, the sigmoid/Sinkhorn split (eps `hc_eps`,
 /// `sinkhorn_iters` total column normalisations), and the collapse
 /// x = sum_s pre[s] * H[s]. Writes `split`; `logits` (raw projection, [T][24])
-/// may be null. Hidden 4096 takes the fused register-resident path; other
-/// sizes a generic one-block-per-token path.
+/// may be null. Hidden 4096 takes the fused register-resident path (for at
+/// most 8 tokens, the decode case, as two launches that spread the 24 mix
+/// rows over many blocks; bitwise identical to the single-launch kernel);
+/// other sizes a generic one-block-per-token path. The two-launch path keeps
+/// its partial sums in a module-level device buffer, so two HcPre calls must
+/// not run concurrently on different streams.
 bool HcPre(const float* H, const float* fn, const float* base,
            const float* scale, float* x, float* split, float* logits,
            std::uint32_t n_tokens, std::uint32_t hidden,

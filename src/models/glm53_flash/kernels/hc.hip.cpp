@@ -216,6 +216,182 @@ __global__ void __launch_bounds__(TOK* TPT)
   }
 }
 
+/// Decode-sized HcPre (hidden 4096, at most kSplitMaxTokens tokens), in two
+/// launches so the 1.5 MB of mix weights are streamed by many compute units
+/// instead of one workgroup per token.
+///
+/// The partial sums are exactly the ones Hc4PreFusedKernel<4, 256, 16> forms:
+/// one 32-lane wave per (old wave index w), lane l owning columns
+/// (w * 32 + l) * 16 .. +15 of every stream, the same h-then-c accumulation
+/// order, and the same __shfl_down tree. Only the (w, j) pairs are spread
+/// over blocks, and the final 8-way sum of wave values runs in the same
+/// ascending order in the finishing kernel, so the result is bitwise
+/// identical to the fused kernel (given the same FMA contraction).
+constexpr std::uint32_t kSplitMaxTokens = 8;
+constexpr std::uint32_t kSplitWaves = 8;      // 256 threads / 32 lanes
+constexpr std::uint32_t kSplitCols = 16;      // columns per lane
+constexpr std::uint32_t kSplitJPerBlock = 3;  // mix rows per block
+constexpr std::uint32_t kSplitJGroups = kMix / kSplitJPerBlock;
+constexpr std::uint32_t kSplitStride = kMix + 1u;  // 24 dots + sum of squares
+static_assert(kMix % kSplitJPerBlock == 0, "mix rows must tile evenly");
+
+/// Wave sums of the old fused kernel, [token][wave][24 dots | sum sq]. Only
+/// ever live between the two launches of one HcPre on one stream.
+__device__ float
+    g_hc_split_partial[kSplitMaxTokens * kSplitWaves * kSplitStride];
+
+/// grid (kSplitWaves, kSplitJGroups, n_tokens), 32 threads.
+__global__ void __launch_bounds__(32)
+    Hc4PreMixPartialKernel(const float* residual_hc, const float* mix_w,
+                           std::uint32_t n_embd) {
+  constexpr std::uint32_t COLS = kSplitCols;
+  const std::uint32_t wave = blockIdx.x;
+  const std::uint32_t jg = blockIdx.y;
+  const std::uint32_t t = blockIdx.z;
+  const std::uint32_t wlane = threadIdx.x;
+  const std::uint64_t hc_dim = 4ull * n_embd;
+  const std::uint32_t col0 = ((wave * 32u) + wlane) * COLS;
+  float* part =
+      g_hc_split_partial + (((t * kSplitWaves) + wave) * kSplitStride);
+
+  float v[4][COLS];
+  const float* rrow = residual_hc + (static_cast<std::uint64_t>(t) * hc_dim);
+#pragma unroll
+  for (std::uint32_t h = 0; h < 4u; h++) {
+    const float* src = rrow + (static_cast<std::uint64_t>(h) * n_embd) + col0;
+#pragma unroll
+    for (std::uint32_t c = 0; c < COLS; c += 4u) {
+      const float4 q = *reinterpret_cast<const float4*>(src + c);
+      v[h][c + 0u] = q.x;
+      v[h][c + 1u] = q.y;
+      v[h][c + 2u] = q.z;
+      v[h][c + 3u] = q.w;
+    }
+  }
+  if (jg == 0u) {
+    float sum = 0.0f;
+#pragma unroll
+    for (std::uint32_t h = 0; h < 4u; h++) {
+#pragma unroll
+      for (std::uint32_t c = 0; c < COLS; c++)
+        sum += v[h][c] * v[h][c];
+    }
+    sum = WarpSum(sum);
+    if (wlane == 0u)
+      part[kMix] = sum;
+  }
+#pragma unroll
+  for (std::uint32_t jj = 0; jj < kSplitJPerBlock; jj++) {
+    const std::uint32_t j = (jg * kSplitJPerBlock) + jj;
+    const float* wrow = mix_w + (static_cast<std::uint64_t>(j) * hc_dim);
+    float a = 0.0f;
+#pragma unroll
+    for (std::uint32_t h = 0; h < 4u; h++) {
+      const float* wsrc =
+          wrow + (static_cast<std::uint64_t>(h) * n_embd) + col0;
+#pragma unroll
+      for (std::uint32_t c = 0; c < COLS; c += 4u) {
+        const float4 w4 = *reinterpret_cast<const float4*>(wsrc + c);
+        a += w4.x * v[h][c + 0u];
+        a += w4.y * v[h][c + 1u];
+        a += w4.z * v[h][c + 2u];
+        a += w4.w * v[h][c + 3u];
+      }
+    }
+    const float s = WarpSum(a);
+    if (wlane == 0u)
+      part[j] = s;
+  }
+}
+
+/// grid (n_tokens), 256 threads: the cross-wave sum, split and collapse of
+/// Hc4PreFusedKernel (TOK = 1), reading the partials of the kernel above.
+__global__ void __launch_bounds__(256)
+    Hc4PreFinishKernel(float* out, float* split_out, float* logits_out,
+                       const float* residual_hc, const float* scale,
+                       const float* base, std::uint32_t n_embd,
+                       std::uint32_t sinkhorn_iters, float eps,
+                       float norm_eps) {
+  constexpr std::uint32_t COLS = kSplitCols;
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  const std::uint64_t hc_dim = 4ull * n_embd;
+  const std::uint32_t col0 = lane * COLS;
+  const float* part = g_hc_split_partial + (static_cast<std::size_t>(t) *
+                                            kSplitWaves * kSplitStride);
+
+  __shared__ float mixbuf[kMix];
+  __shared__ float splitbuf[kMix];
+
+  // Issue the residual loads first; they do not depend on the partials.
+  float v[4][COLS];
+  const float* rrow = residual_hc + (static_cast<std::uint64_t>(t) * hc_dim);
+#pragma unroll
+  for (std::uint32_t h = 0; h < 4u; h++) {
+    const float* src = rrow + (static_cast<std::uint64_t>(h) * n_embd) + col0;
+#pragma unroll
+    for (std::uint32_t c = 0; c < COLS; c += 4u) {
+      const float4 q = *reinterpret_cast<const float4*>(src + c);
+      v[h][c + 0u] = q.x;
+      v[h][c + 1u] = q.y;
+      v[h][c + 2u] = q.z;
+      v[h][c + 3u] = q.w;
+    }
+  }
+
+  if (lane < kMix) {
+    float rowsum = 0.0f;
+    float s = 0.0f;
+#pragma unroll
+    for (std::uint32_t w = 0; w < kSplitWaves; w++) {
+      rowsum += part[(w * kSplitStride) + kMix];
+      s += part[(w * kSplitStride) + lane];
+    }
+    const float nscale =
+        rsqrtf((rowsum / static_cast<float>(hc_dim)) + norm_eps);
+    s *= nscale;
+    mixbuf[lane] = s;
+    if (logits_out != nullptr) {
+      logits_out[(static_cast<std::uint64_t>(t) * kMix) + lane] = s;
+    }
+  }
+  __syncthreads();
+  if (lane == 0u) {
+    Hc4Split(splitbuf, mixbuf, scale, base, sinkhorn_iters, eps);
+  }
+  __syncthreads();
+  if (lane < kMix) {
+    split_out[(static_cast<std::uint64_t>(t) * kMix) + lane] = splitbuf[lane];
+  }
+
+  const float s0 = splitbuf[0];
+  const float s1 = splitbuf[1];
+  const float s2 = splitbuf[2];
+  const float s3 = splitbuf[3];
+  float* orow = out + (static_cast<std::uint64_t>(t) * n_embd) + col0;
+#pragma unroll
+  for (std::uint32_t c = 0; c < COLS; c += 4u) {
+    float4 q;
+    q.x = v[0][c + 0u] * s0;
+    q.x += v[1][c + 0u] * s1;
+    q.x += v[2][c + 0u] * s2;
+    q.x += v[3][c + 0u] * s3;
+    q.y = v[0][c + 1u] * s0;
+    q.y += v[1][c + 1u] * s1;
+    q.y += v[2][c + 1u] * s2;
+    q.y += v[3][c + 1u] * s3;
+    q.z = v[0][c + 2u] * s0;
+    q.z += v[1][c + 2u] * s1;
+    q.z += v[2][c + 2u] * s2;
+    q.z += v[3][c + 2u] * s3;
+    q.w = v[0][c + 3u] * s0;
+    q.w += v[1][c + 3u] * s1;
+    q.w += v[2][c + 3u] * s2;
+    q.w += v[3][c + 3u] * s3;
+    *reinterpret_cast<float4*>(orow + c) = q;
+  }
+}
+
 /// Any hidden size: one 256-thread workgroup per token, strided columns.
 constexpr std::uint32_t kGenericThreads = 256;
 
@@ -422,7 +598,16 @@ bool HcPre(const float* H, const float* fn, const float* base,
   constexpr std::uint32_t kTok = 4u;
   constexpr std::uint32_t kTpt = 256u;
   constexpr std::uint32_t kCols = 16u;
-  if (hidden == kTpt * kCols && Aligned16(H) && Aligned16(fn) && Aligned16(x)) {
+  const bool fused_shape =
+      hidden == kTpt * kCols && Aligned16(H) && Aligned16(fn) && Aligned16(x);
+  if (fused_shape && n_tokens <= kSplitMaxTokens) {
+    // Decode: the fused kernel would use n_tokens workgroups in all.
+    Hc4PreMixPartialKernel<<<dim3(kSplitWaves, kSplitJGroups, n_tokens), 32, 0,
+                             stream>>>(H, fn, hidden);
+    Hc4PreFinishKernel<<<n_tokens, 256, 0, stream>>>(
+        x, split, logits, H, scale, base, hidden, sinkhorn_iters, hc_eps,
+        rms_eps);
+  } else if (fused_shape) {
     Hc4PreFusedKernel<kTok, kTpt, kCols>
         <<<(n_tokens + kTok - 1u) / kTok, kTok * kTpt, 0, stream>>>(
             x, split, logits, H, fn, scale, base, hidden, n_tokens,

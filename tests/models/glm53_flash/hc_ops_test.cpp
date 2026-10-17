@@ -1,12 +1,16 @@
 // GPU hyper-connection kernels (kernels/hc.hpp) against the CPU oracle
 // (reference_hc.hpp): random inputs at hidden 4096 (fused path) for
-// T in {1, 7, 64}, and the HF fixture at hidden 32 (generic path). Every
+// T in {1, 7, 8, 9, 64} (<= 8 tokens take the two-launch decode path, more
+// the fused path), and the HF fixture at hidden 32 (generic path). Every
 // output (logits, split, x, H_new in place, head mean) at rel-L2 <= 1e-5.
+// BitwiseDecodeSplit additionally requires the two-launch path to match the
+// fused path bit for bit.
 // Allocates under 10 MB of device memory.
 
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <random>
@@ -193,6 +197,51 @@ Case RandomCase(std::uint32_t tokens, std::uint32_t hidden, unsigned seed) {
   return k;
 }
 
+// HcPre on the first `t_small` tokens of a case, once alone (the decode
+// split path) and once inside a call of all its tokens (the fused path), must
+// agree bitwise in x, split and logits.
+void BitwiseDecodeSplit(std::uint32_t t_small, std::uint32_t t_big,
+                        unsigned seed) {
+  const Case k = RandomCase(t_big, 4096, seed);
+  const std::uint32_t D = k.hidden;
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreate(&stream), "hipStreamCreate");
+  DeviceBuffer d_h(k.H), d_fn(k.fn), d_base(k.base), d_scale(k.scale);
+  DeviceBuffer big_x(t_big * D), big_split(t_big * 24), big_logits(t_big * 24);
+  DeviceBuffer small_x(t_small * D), small_split(t_small * 24),
+      small_logits(t_small * 24);
+  bool ok = rocm::HcPre(d_h.get(), d_fn.get(), d_base.get(), d_scale.get(),
+                        big_x.get(), big_split.get(), big_logits.get(), t_big,
+                        D, 20, 1e-6F, 1e-5F, stream);
+  ok = ok && rocm::HcPre(d_h.get(), d_fn.get(), d_base.get(), d_scale.get(),
+                         small_x.get(), small_split.get(), small_logits.get(),
+                         t_small, D, 20, 1e-6F, 1e-5F, stream);
+  CheckHip(hipStreamSynchronize(stream), "hipStreamSynchronize");
+  CheckHip(hipStreamDestroy(stream), "hipStreamDestroy");
+  const std::string name =
+      "decode split vs fused T=" + std::to_string(t_small) + " of " +
+      std::to_string(t_big);
+  if (!ok) {
+    std::cout << "FAIL " << name << " launcher returned false\n";
+    ++failures;
+    return;
+  }
+  const auto same = [&](const char* what, const std::vector<float>& a,
+                        const std::vector<float>& b, std::size_t n) {
+    const bool eq = a.size() >= n && b.size() >= n &&
+                    std::memcmp(a.data(), b.data(), n * sizeof(float)) == 0;
+    std::cout << (eq ? "ok   " : "FAIL ") << name << " " << what
+              << " bitwise\n";
+    if (!eq)
+      ++failures;
+  };
+  same("x", small_x.Download(), big_x.Download(), std::size_t{t_small} * D);
+  same("split", small_split.Download(), big_split.Download(),
+       std::size_t{t_small} * 24);
+  same("logits", small_logits.Download(), big_logits.Download(),
+       std::size_t{t_small} * 24);
+}
+
 }  // namespace
 
 int main() {
@@ -202,10 +251,12 @@ int main() {
       std::cerr << "no HIP device\n";
       return 77;
     }
-    for (std::uint32_t t : {1U, 7U, 64U})
+    for (std::uint32_t t : {1U, 7U, 8U, 9U, 64U})
       Run(RandomCase(t, 4096, 100 + t));
     Run(RandomCase(5, 4100, 7));  // generic HcPre path, Vec4 HcPost
     Run(RandomCase(5, 4101, 9));  // generic HcPre path, scalar HcPost
+    BitwiseDecodeSplit(1, 64, 301);
+    BitwiseDecodeSplit(8, 64, 302);
 
     const auto fx = glm53_hc_fixture::Load(GLM53_HC_FIXTURE);
     Case k;
