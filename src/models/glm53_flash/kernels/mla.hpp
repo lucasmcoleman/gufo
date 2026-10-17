@@ -76,6 +76,17 @@ struct IndexerBuffers {
                            const float* x, float* y, std::uint32_t tokens,
                            Stream stream);
 
+/// Project for every head of a per-head stack in one launch: with
+/// heads == w.experts, Y[h][t][r] = sum_c W[h][r][c] X[h][t][c], X
+/// [heads][tokens][w.cols], Y [heads][tokens][w.rows], contiguous. F32
+/// weights are bit-identical to `heads` Project calls; Q6_K weights with one
+/// or two blocks per row (k_b, v_b) use a GLM-local kernel whose reduction
+/// order differs from gufo's Q6_K GEMMs (F32 rounding); other encodings fall
+/// back to a Project per head.
+[[nodiscard]] bool ProjectHeads(const DeviceMatrix& w, std::uint32_t heads,
+                                const float* x, float* y, std::uint32_t tokens,
+                                Stream stream);
+
 /// True if `w` (any expert) has a Project route.
 [[nodiscard]] bool CanProject(const DeviceMatrix& w) noexcept;
 

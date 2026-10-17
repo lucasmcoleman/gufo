@@ -8,6 +8,7 @@
 
 #include "src/models/glm53_flash/kernels/mla.hpp"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -84,6 +85,101 @@ __global__ void MatmulF32Kernel(const float* w, const float* x, float* y,
   acc = WaveSum(acc);
   if (lane == 0) {
     y[(std::size_t{t} * rows) + r] = acc;
+  }
+}
+
+/// MatmulF32Kernel for every head at once: blockIdx.z is the head. Weights
+/// are [heads][rows][cols], X [heads][tokens][cols], Y [heads][tokens][rows].
+/// Per-output arithmetic (lane-strided accumulation, WaveSum) is identical to
+/// MatmulF32Kernel, so the result is bit-identical to a launch per head.
+__global__ void MatmulF32HeadsKernel(const float* w, const float* x, float* y,
+                                     std::uint32_t rows, std::uint32_t cols,
+                                     std::uint32_t tokens) {
+  const std::uint32_t lane = threadIdx.x % kWave;
+  const std::uint32_t r =
+      (blockIdx.x * (blockDim.x / kWave)) + (threadIdx.x / kWave);
+  const std::uint32_t t = blockIdx.y;
+  const std::size_t head = blockIdx.z;
+  if (r >= rows) {
+    return;
+  }
+  const float* wr = w + (((head * rows) + r) * cols);
+  const float* xt = x + (((head * tokens) + t) * cols);
+  float acc = 0.0F;
+  for (std::uint32_t c = lane; c < cols; c += kWave) {
+    acc += wr[c] * xt[c];
+  }
+  acc = WaveSum(acc);
+  if (lane == 0) {
+    y[(((head * tokens) + t) * rows) + r] = acc;
+  }
+}
+
+constexpr unsigned kQ6KBlockBytes = 210;  ///< ql[128] qh[64] scales[16] d
+constexpr unsigned kQ6KBlockElems = 256;
+constexpr unsigned kHeadsTokenTile = 32;  ///< tokens per block in z
+
+/// Q6_K weights for every head at once. A wave owns one weight row of
+/// kBlocks Q6_K blocks (cols = 256 * kBlocks), dequantises it once into
+/// registers (d * scale * (q - 32), ggml's DequantizeQ6_K), then dots it with
+/// each token of its tile, summing the lane partials with WaveSum. Lane l
+/// holds elements blk * 256 + half * 128 + quad * 32 + l, so weight and
+/// activation loads are coalesced. The reduction order differs from gufo's
+/// Q6_K GEMMs (sequential per lane, then a wave tree); results agree to
+/// F32 rounding.
+template<unsigned kBlocks>
+__global__ void MatmulQ6KHeadsKernel(const std::uint8_t* w, const float* x,
+                                     float* y, std::uint32_t rows,
+                                     std::uint32_t tokens) {
+  constexpr std::uint32_t kCols = kBlocks * kQ6KBlockElems;
+  const std::uint32_t lane = threadIdx.x % kWave;
+  const std::uint32_t r =
+      (blockIdx.x * (blockDim.x / kWave)) + (threadIdx.x / kWave);
+  const std::size_t head = blockIdx.y;
+  if (r >= rows) {
+    return;
+  }
+  const std::uint8_t* row =
+      w + (((head * rows) + r) * (std::size_t{kBlocks} * kQ6KBlockBytes));
+  float wv[kBlocks * 8];
+#pragma unroll
+  for (unsigned b = 0; b < kBlocks; ++b) {
+    const std::uint8_t* blk = row + (b * kQ6KBlockBytes);
+    const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk + 208));
+#pragma unroll
+    for (unsigned hh = 0; hh < 2; ++hh) {
+      const std::uint8_t qh = blk[128 + (hh * 32) + lane];
+#pragma unroll
+      for (unsigned qd = 0; qd < 4; ++qd) {
+        const std::uint8_t ql = blk[(hh * 64) + ((qd & 1) * 32) + lane];
+        const int q = ((qd >> 1) != 0 ? (ql >> 4) : (ql & 0xF)) |
+                      (((qh >> (2 * qd)) & 3) << 4);
+        const int s = sc[(hh * 8) + (qd * 2) + (lane / 16)];
+        wv[(b * 8) + (hh * 4) + qd] =
+            d * static_cast<float>(s) * static_cast<float>(q - 32);
+      }
+    }
+  }
+  const std::uint32_t t0 = blockIdx.z * kHeadsTokenTile;
+  const std::uint32_t t1 = min(t0 + kHeadsTokenTile, tokens);
+  for (std::uint32_t t = t0; t < t1; ++t) {
+    const float* xt = x + (((head * tokens) + t) * kCols);
+    float acc = 0.0F;
+#pragma unroll
+    for (unsigned b = 0; b < kBlocks; ++b) {
+#pragma unroll
+      for (unsigned i = 0; i < 8; ++i) {
+        // i = half * 4 + quad -> element half * 128 + quad * 32 + lane
+        acc +=
+            wv[(b * 8) + i] *
+            xt[(b * kQ6KBlockElems) + ((i >> 2) * 128) + ((i & 3) * 32) + lane];
+      }
+    }
+    acc = WaveSum(acc);
+    if (lane == 0) {
+      y[(((head * tokens) + t) * rows) + r] = acc;
+    }
   }
 }
 
@@ -384,10 +480,7 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   // Absorb k_b per head, attend over the latent rows, v_b per head.
   scope.emplace(ctx.profiler, "mla/k_b", stream);
   SwapKernel<<<dim3(n, heads), 64, 0, stream>>>(s.q, s.qh, n, heads, nope);
-  for (std::uint32_t h = 0; ok && h < heads; ++h) {
-    ok = Project(w.k_b, h, s.qh + (std::size_t{h} * n * nope),
-                 s.qabs + (std::size_t{h} * n * L), n, stream);
-  }
+  ok = ProjectHeads(w.k_b, heads, s.qh, s.qabs, n, stream);
   scope.reset();
   if (!ok) {
     return false;
@@ -415,10 +508,7 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   }
   scope.reset();
   scope.emplace(ctx.profiler, "mla/v_b", stream);
-  for (std::uint32_t h = 0; ok && h < heads; ++h) {
-    ok = Project(w.v_b, h, s.ctx + (std::size_t{h} * n * L),
-                 s.vo + (std::size_t{h} * n * v_dim), n, stream);
-  }
+  ok = ProjectHeads(w.v_b, heads, s.ctx, s.vo, n, stream);
   scope.reset();
   if (!ok) {
     return false;
@@ -472,6 +562,51 @@ bool Project(const DeviceMatrix& w, std::uint64_t expert, const float* x,
   }
   ::gufo::hip::LaunchBatchedQuantGEMMFp32(w.type, base, x, y, tokens, rows,
                                           cols, stream);
+  return true;
+}
+
+bool ProjectHeads(const DeviceMatrix& w, std::uint32_t heads, const float* x,
+                  float* y, std::uint32_t tokens, Stream stream) {
+  if (!CanProject(w) || w.experts != heads || x == nullptr || y == nullptr) {
+    return false;
+  }
+  if (tokens == 0 || heads == 0) {
+    return true;
+  }
+  const std::uint32_t rows = static_cast<std::uint32_t>(w.rows);
+  constexpr unsigned kWaves = kThreads / kWave;
+  const unsigned row_blocks = (rows + kWaves - 1) / kWaves;
+  if (w.type == GgmlType::kF32) {
+    MatmulF32HeadsKernel<<<dim3(row_blocks, tokens, heads), kThreads, 0,
+                           stream>>>(static_cast<const float*>(w.data), x, y,
+                                     rows, static_cast<std::uint32_t>(w.cols),
+                                     tokens);
+    return true;
+  }
+  const unsigned tiles = (tokens + kHeadsTokenTile - 1) / kHeadsTokenTile;
+  if (w.type == GgmlType::kQ6_K && w.cols % kQ6KBlockElems == 0 &&
+      w.row_bytes == (w.cols / kQ6KBlockElems) * kQ6KBlockBytes) {
+    const auto* base = static_cast<const std::uint8_t*>(w.data);
+    if (w.cols == kQ6KBlockElems) {
+      MatmulQ6KHeadsKernel<1>
+          <<<dim3(row_blocks, heads, tiles), kThreads, 0, stream>>>(
+              base, x, y, rows, tokens);
+      return true;
+    }
+    if (w.cols == 2 * kQ6KBlockElems) {
+      MatmulQ6KHeadsKernel<2>
+          <<<dim3(row_blocks, heads, tiles), kThreads, 0, stream>>>(
+              base, x, y, rows, tokens);
+      return true;
+    }
+  }
+  // Other encodings: a GEMM per head.
+  for (std::uint32_t h = 0; h < heads; ++h) {
+    if (!Project(w, h, x + (std::size_t{h} * tokens * w.cols),
+                 y + (std::size_t{h} * tokens * w.rows), tokens, stream)) {
+      return false;
+    }
+  }
   return true;
 }
 
