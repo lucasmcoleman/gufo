@@ -111,6 +111,17 @@ if (ENGINE_ENABLE_HIP)
     EXCLUDE_FROM_ALL ON)
 endif()
 
+# Full-model parity probe (not a test): the GPU Executor over all 45 layers of
+# a real GGUF, logits vs llama.cpp and the CPU ReferenceModel
+# (tools/glm53/model_probe.cpp, see /server/staging/glm53-gufo/v4).
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_model_probe
+    ${PROJECT_SOURCE_DIR}/tools/glm53/model_probe.cpp)
+  target_link_libraries(glm53_flash_model_probe PRIVATE
+    gufo_glm53_flash_reference)
+  set_target_properties(glm53_flash_model_probe PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
+
 # Tokenizer parity probe (not a test): encodes a hex-line corpus for
 # comparison with llama-tokenize (see /server/staging/glm53-gufo/a6).
 add_executable(glm53_flash_tokenize_probe
