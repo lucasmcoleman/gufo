@@ -111,6 +111,8 @@ __global__ void FloatProject(const void* w, bool bf16, const float* x,
   for (std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
        i < count; i += std::size_t{gridDim.x} * blockDim.x) {
     const auto tr = i / rows;
+    // Only Route supplies IDs here; it writes [0, num_experts) even when
+    // poisoning nonfinite routing. External IDs use IqRoutedMatmul checks.
     const auto expert = ids ? ids[tr] : 0;
     const auto offset =
         (static_cast<std::size_t>(expert) * rows + i % rows) * cols;
@@ -252,7 +254,8 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
       reinterpret_cast<std::uintptr_t>(ctx.scratch) % kAlign ||
       reinterpret_cast<std::uintptr_t>(x) % alignof(float) ||
       reinterpret_cast<std::uintptr_t>(y) % alignof(float) ||
-      !std::isfinite(w.clamp_exp) || !std::isfinite(w.clamp_shexp))
+      !std::isfinite(w.clamp_exp) || !std::isfinite(w.clamp_shexp) ||
+      w.clamp_exp < 0 || w.clamp_shexp < 0)
     return false;
   const auto h = c.hidden_size;
   const auto valid_ff = [&](const DeviceMatrix& g, const DeviceMatrix& u,
