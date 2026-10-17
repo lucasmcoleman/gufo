@@ -1,6 +1,6 @@
 // V3 probe: runs the GLM-5.3-Flash CPU ReferenceModel on a real GGUF for a
 // fixed token sequence and writes every tap as raw float32, so it can be
-// compared with llama.cpp's cb_eval dump (see /server/staging/glm53-gufo/v3).
+// compared with llama.cpp's cb_eval dump.
 //
 // usage: glm53_flash_reference_probe MODEL.gguf OUTDIR id0 id1 ...
 // Writes OUTDIR/<tap>-<layer>.f32 (layer taps), OUTDIR/<tap>.f32 (global
