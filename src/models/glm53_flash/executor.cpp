@@ -239,26 +239,39 @@ bool KdaPass(const OpContext& ctx, const Config& config,
   const Stream stream = ctx.stream;
 
   // Projections (HF:676-686, 723-733), then the conv over q|k|v (HF:688-716).
+  // Sub-scopes ("kda/..." rows) nest inside the executor's "kda" scope and
+  // cost a pointer test when GUFO_GLM53_PROFILE is off.
+  std::optional<OpScope> scope;
+  scope.emplace(ctx.profiler, "kda/proj_qkv", stream);
   bool ok = LaunchProjection(w.qkv, x, s.qkv, n, stream);
+  scope.emplace(ctx.profiler, "kda/conv", stream);
   ok = ok && rocm::KdaConv(s.qkv, channels, w.conv_w, state.conv, s.conv, n,
                            channels, stream);
+  scope.emplace(ctx.profiler, "kda/proj_f", stream);
   ok = ok && LaunchProjection(w.f_a, x, s.low, n, stream);
   ok = ok && LaunchProjection(w.f_b, s.low, s.f, n, stream);
+  scope.emplace(ctx.profiler, "kda/proj_g", stream);
   ok = ok && LaunchProjection(w.g_a, x, s.low, n, stream);
   ok = ok && LaunchProjection(w.g_b, s.low, s.gate, n, stream);
+  scope.emplace(ctx.profiler, "kda/proj_beta", stream);
   ok = ok && LaunchProjection(w.beta, x, s.beta_in, n, stream);
   // Forget gate (HF:353-369), l2norm + beta (HF:451-459, 733), recurrence
   // (HF:497-511), gated RMSNorm (HF:381-393), o_proj.
+  scope.emplace(ctx.profiler, "kda/gate_prep", stream);
   ok = ok &&
        rocm::KdaGate(s.f, width, w.dt_bias, w.a, config.kda_gate_lower_bound,
                      nullptr, s.decay, n, heads, stream);
   ok = ok && rocm::KdaPrep(s.conv, channels, s.beta_in, heads, qn, kn, s.beta,
                            n, heads, kKdaL2Eps, stream);
+  scope.emplace(ctx.profiler, "kda/recurrent", stream);
   ok = ok && rocm::KdaRecurrent(qn, kn, s.conv + (2 * width), channels, s.decay,
                                 s.beta, state.recurrent, o, n, heads, stream);
+  scope.emplace(ctx.profiler, "kda/out_norm", stream);
   ok = ok && rocm::KdaOutput(o, s.gate, width, w.norm, config.rms_eps, o, n,
                              heads, stream);
+  scope.emplace(ctx.profiler, "kda/out_proj", stream);
   ok = ok && LaunchProjection(w.out, o, y, n, stream);
+  scope.reset();
   return ok && hipPeekAtLastError() == hipSuccess;
 }
 
