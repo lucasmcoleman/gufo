@@ -120,3 +120,22 @@ set_target_properties(glm53_flash_tokenize_probe PROPERTIES EXCLUDE_FROM_ALL ON)
 
 # Lane B tests (owned by the Lane B fragment).
 include(${CMAKE_CURRENT_SOURCE_DIR}/lane_b_tests.cmake OPTIONAL)
+
+if (ENGINE_ENABLE_HIP)
+  # GPU MLA + DSA indexer operator (layer_ops.hpp MlaForward) vs the CPU
+  # oracle (ReferenceModel::Mla's math) and the HF mla_attention.npz fixture
+  # from GLM53_LANE_B_FIXTURE_DIR; synthetic chunk-invariance and long
+  # (> top_k tokens) selection cases. The operator sources are compiled into
+  # the test with the package's HIP options. `real-cpu` / `real-gpu` modes
+  # probe a real GGUF (see the test's header).
+  set(GLM53_MLA_SOURCES
+    ${PROJECT_SOURCE_DIR}/src/models/glm53_flash/kernels/mla.hip.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/glm53_flash/kernels/indexer.hip.cpp)
+  add_glm53_flash_test(mla_ops gufo_glm53_flash_reference "hip;gpu;gfx1151")
+  target_sources(glm53_flash_mla_ops_test PRIVATE ${GLM53_MLA_SOURCES})
+  set_source_files_properties(${GLM53_MLA_SOURCES} PROPERTIES LANGUAGE HIP
+    COMPILE_OPTIONS "-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-command-line-argument")
+  target_compile_definitions(glm53_flash_mla_ops_test PRIVATE
+    GLM53_ROCM_BUILD=1
+    GLM53_LANE_B_FIXTURE_DIR="${GLM53_LANE_B_FIXTURE_DIR}")
+endif()
