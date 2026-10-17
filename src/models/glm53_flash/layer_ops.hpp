@@ -99,11 +99,16 @@ struct TapView {
 using TapFn = std::function<void(std::string_view name, std::uint32_t layer,
                                  const TapView& view)>;
 
+class OpProfiler;  // profile.hpp
+
 struct OpContext {
   Stream stream{};
   void* scratch{nullptr};  ///< Executor-owned, at least OpScratchBytes().
   std::size_t scratch_bytes{0};
   const TapFn* tap{nullptr};
+  /// GUFO_GLM53_PROFILE timer, or nullptr (the default) when profiling is off;
+  /// operators may bracket sub-steps with OpScope (profile.hpp).
+  OpProfiler* profiler{nullptr};
 };
 
 // ---- Lane B: implemented in kernels/{mla,indexer,moe}.hip.cpp ----

@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <ostream>
 #include <span>
 #include <string>
 #include <string_view>
@@ -40,6 +41,8 @@
 #include "src/models/glm53_flash/weights.hpp"
 
 namespace gufo::models::glm53_flash {
+
+class OpProfiler;  // profile.hpp
 
 /// Owns device allocations; frees them on destruction. Not thread-safe.
 class DeviceArena {
@@ -270,6 +273,10 @@ public:
   }
   [[nodiscard]] Stream stream() const noexcept { return stream_; }
 
+  /// Per-op GPU timing table (GUFO_GLM53_PROFILE=1); nothing when profiling
+  /// is off. Also printed to stderr when the Executor is destroyed.
+  void PrintProfile(std::ostream& os) const;
+
   /// Runs `tokens` at positions Position() .. Position()+T-1 and advances.
   /// Needs the embedding. Fills `out->hidden` and (with `want_logits` and
   /// output.weight bound) `out->logits` when the head is uploaded, else
@@ -327,6 +334,7 @@ private:
   std::size_t scratch_bytes_{0};
   std::uint32_t position_{0};
   bool failed_{false};
+  std::unique_ptr<OpProfiler> profiler_;  ///< null unless profiling
 };
 
 }  // namespace gufo::models::glm53_flash
