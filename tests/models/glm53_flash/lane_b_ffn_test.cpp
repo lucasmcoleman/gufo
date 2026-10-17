@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -52,26 +53,50 @@ struct Weight {
     host.resize(std::size_t(rows) * cols * experts);
     const auto row_bytes = gufo::quant::EncodedSizeBytes(type, cols);
     std::vector<std::uint8_t> bytes(std::size_t(rows) * experts * row_bytes);
-    if (type == GgmlType::kF32) {
+    Require(row_bytes > 0, "invalid fixture row encoding");
+    if (type == GgmlType::kF32 || type == GgmlType::kBF16) {
       std::uniform_real_distribution<float> dist(-0.6F, 0.6F);
       for (auto& v : host)
         v = dist(rng);
-      std::memcpy(bytes.data(), host.data(), bytes.size());
+      if (type == GgmlType::kF32) {
+        std::memcpy(bytes.data(), host.data(), bytes.size());
+      } else {
+        // Independently round finite F32 fixture weights to BF16, nearest
+        // with ties to even. The oracle consumes precisely those rounded bits.
+        for (std::size_t i = 0; i < host.size(); ++i) {
+          const auto bits = std::bit_cast<std::uint32_t>(host[i]);
+          const auto rounded = static_cast<std::uint16_t>(
+              (bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16);
+          std::memcpy(bytes.data() + i * sizeof(rounded), &rounded,
+                      sizeof(rounded));
+          host[i] = std::bit_cast<float>(std::uint32_t{rounded} << 16);
+        }
+      }
     } else {
       for (auto& v : bytes)
         v = static_cast<std::uint8_t>(rng());
-      const auto block_bytes = row_bytes / (cols / 256);
+      const auto block_elements = type == GgmlType::kQ8_0 ? 32U : 256U;
+      const auto block_bytes = row_bytes / (cols / block_elements);
       for (std::size_t offset = 0; offset < bytes.size();
            offset += block_bytes) {
-        // IQ block scale is the first fp16. Keep it finite and small while
-        // exercising independent random codebook indices, signs and scales.
-        const auto scale = static_cast<std::uint16_t>(0x1400 + rng() % 1024);
-        std::memcpy(bytes.data() + offset, &scale, sizeof(scale));
+        // Q6_K stores its fp16 scale last; IQ and Q8_0 store it first.
+        // Payload bytes remain independent, including signs and subscales.
+        const auto scale = static_cast<std::uint16_t>(
+            (type == GgmlType::kQ6_K ? 0x0800 : 0x1400) + rng() % 1024);
+        const auto scale_offset = type == GgmlType::kQ6_K ? block_bytes - 2 : 0;
+        std::memcpy(bytes.data() + offset + scale_offset, &scale,
+                    sizeof(scale));
       }
       for (std::size_t row = 0; row < std::size_t(rows) * experts; ++row) {
         const auto* src = bytes.data() + row * row_bytes;
         auto* dst = host.data() + row * cols;
         switch (type) {
+          case GgmlType::kQ6_K:
+            gufo::quant::DequantizeQ6_K(src, dst, cols);
+            break;
+          case GgmlType::kQ8_0:
+            gufo::quant::DequantizeQ8_0(src, dst, cols);
+            break;
           case GgmlType::kIQ2_XXS:
             gufo::quant::DequantizeIQ2_XXS(src, dst, cols);
             break;
@@ -94,21 +119,25 @@ struct Weight {
 };
 
 void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
-         std::uint32_t tokens, GgmlType type) {
+         std::uint32_t tokens, GgmlType type,
+         GgmlType shared_type = GgmlType::kF32, std::uint32_t dimension = 0) {
   std::cout << "case dense=" << dense << " shared=" << shared
             << " clamp=" << clamp << " norm=" << normalize
             << " routing=" << routing_case << " tokens=" << tokens
-            << " type=" << static_cast<int>(type) << std::endl;
-  const bool iq = type != GgmlType::kF32;
+            << " type=" << static_cast<int>(type)
+            << " shared_type=" << static_cast<int>(shared_type)
+            << " dimension=" << dimension << std::endl;
+  const bool packed = type != GgmlType::kF32 && type != GgmlType::kBF16;
   glm::Config config;
   config.num_layers = 2;
   config.leading_dense_layers = 1;
-  config.hidden_size = iq ? 256 : 19;
-  config.dense_ff = iq ? 256 : 37;
-  config.expert_ff = iq ? 256 : 23;
+  config.hidden_size = dimension ? dimension : (packed ? 256 : 19);
+  config.dense_ff = dimension ? dimension : (packed ? 256 : 37);
+  config.expert_ff = dimension ? dimension : (packed ? 256 : 23);
   config.num_experts = 5;
   config.num_experts_used = 3;
-  config.shared_expert_ff = shared ? (iq ? 256 : 29) : 0;
+  config.shared_expert_ff =
+      shared ? (dimension ? dimension : (packed ? 256 : 29)) : 0;
   config.num_shared_experts = shared ? 1 : 0;
   config.expert_weights_norm = normalize;
   config.expert_weights_scale = normalize ? 2.5F : 0.7F;
@@ -134,11 +163,11 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
     weights.down_exps = down.matrix;
     if (shared) {
       sg = std::make_unique<Weight>(config.shared_expert_ff, hidden, 1,
-                                    GgmlType::kF32, rng);
+                                    shared_type, rng);
       su = std::make_unique<Weight>(config.shared_expert_ff, hidden, 1,
-                                    GgmlType::kF32, rng);
+                                    shared_type, rng);
       sd = std::make_unique<Weight>(hidden, config.shared_expert_ff, 1,
-                                    GgmlType::kF32, rng);
+                                    shared_type, rng);
       weights.shexp_gate = sg->matrix;
       weights.shexp_up = su->matrix;
       weights.shexp_down = sd->matrix;
@@ -276,11 +305,22 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
       static_cast<GgmlType>(0xffffffffU);
   Require(!glm::FfnForward(ctx, config, layer, invalid, dx.f(), tokens, dy.f()),
           "FFN accepted unsupported weight type");
+  invalid = weights;
+  invalid.clamp_exp = -0.1F;
+  Require(!glm::FfnForward(ctx, config, layer, invalid, dx.f(), tokens, dy.f()),
+          "FFN accepted negative dense/routed clamp");
+  if (!dense && shared) {
+    invalid = weights;
+    invalid.clamp_shexp = -0.1F;
+    Require(
+        !glm::FfnForward(ctx, config, layer, invalid, dx.f(), tokens, dy.f()),
+        "FFN accepted negative shared clamp");
+  }
   ctx.scratch_bytes = scratch_bytes - 1;
   Require(!glm::FfnForward(ctx, config, layer, weights, dx.f(), tokens, dy.f()),
           "FFN accepted undersized scratch");
   Hip(hipStreamSynchronize(stream.value));
-  if (dense && clamp && tokens == 1 && !iq) {
+  if (dense && clamp && tokens == 1 && !packed) {
     ctx.scratch_bytes = scratch_bytes;
     std::fill(x.begin(), x.end(), std::numeric_limits<float>::quiet_NaN());
     Hip(hipMemcpyAsync(dx.p, x.data(), x.size() * sizeof(float),
@@ -295,7 +335,7 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
                         [](float v) { return std::isnan(v); }),
             "nonfinite dense activation was silently sanitized by clamp");
   }
-  if (!dense && clamp && tokens == 1 && !iq && routing_case == 0) {
+  if (!dense && clamp && tokens == 1 && !packed && routing_case == 0) {
     ctx.scratch_bytes = scratch_bytes;
     std::fill(bias.begin(), bias.end(),
               std::numeric_limits<float>::quiet_NaN());
@@ -342,6 +382,29 @@ int main() {
          {GgmlType::kIQ2_XXS, GgmlType::kIQ2_S, GgmlType::kIQ3_XXS}) {
       Run(false, true, true, true, 2, 9, type);
       Run(false, false, false, false, 1, 1, type);
+    }
+    for (auto tokens : {1U, 8U, 9U, 33U}) {
+      for (bool clamp : {false, true}) {
+        Run(true, false, clamp, true, 0, tokens, GgmlType::kBF16);
+        Run(false, true, clamp, true, 0, tokens, GgmlType::kBF16,
+            GgmlType::kBF16);
+        Run(true, false, clamp, true, 0, tokens, GgmlType::kQ6_K);
+        Run(false, true, clamp, true, 2, tokens, GgmlType::kF32,
+            GgmlType::kQ6_K, 256);
+        for (auto dimension : {32U, 128U, 256U}) {
+          Run(true, false, clamp, true, 0, tokens, GgmlType::kQ8_0,
+              GgmlType::kF32, dimension);
+          Run(false, true, clamp, true, 2, tokens, GgmlType::kF32,
+              GgmlType::kQ8_0, dimension);
+        }
+      }
+      // Real mixed encoding: packed IQ routed gate/up/down plus quantized
+      // shared gate/up/down. Each format is decoded independently on CPU.
+      for (auto type :
+           {GgmlType::kIQ2_XXS, GgmlType::kIQ2_S, GgmlType::kIQ3_XXS}) {
+        for (auto shared_type : {GgmlType::kQ6_K, GgmlType::kQ8_0})
+          Run(false, true, true, true, 2, tokens, type, shared_type);
+      }
     }
     return 0;
   } catch (const std::exception& error) {
