@@ -5198,6 +5198,7 @@ void TestUnfinishedInlineReasoningFallback() {
   for (const auto& item : std::vector<Case>{
            {prefix + valid, true, prefix, ""},
            {prefix + valid + "</think>", true, prefix, ""},
+           {prefix + valid + "</think>Answer", true, prefix, "Answer"},
            {prefix + wrong, false, prefix + wrong, ""},
            {prefix + missing, false, prefix + missing, ""},
            {prefix + wrong + "</think>Answer", false, prefix + wrong, "Answer"},
@@ -5459,7 +5460,8 @@ ToolBoundaryOutput ToolBoundaryRequest(
     gufo::sampling::JsonConstraint::ToolFormat format, int api, bool stream,
     FakeBackend::InitialOutputState initial =
         FakeBackend::InitialOutputState::kContent,
-    FakeBackend::FinishReason finish = FakeBackend::FinishReason::kStop) {
+    FakeBackend::FinishReason finish = FakeBackend::FinishReason::kStop,
+    bool unconstrained = false) {
   using gufo::json::Value;
   FakeBackend backend;
   backend.pieces = pieces;
@@ -5486,6 +5488,8 @@ ToolBoundaryOutput ToolBoundaryRequest(
     gufo::server::ChatRequest chat;
     Expect(!gufo::server::ParseOpenAiResponseControls(body, &chat),
            "tag boundary controls parse");
+    if (unconstrained)
+      chat.constrained_tools = false;
     response = api == 1 ? gufo::server::CreateOpenAiResponse(
                               Request("{}"), backend, chat, 4096, {}, stream)
                         : gufo::server::CreateAnthropicMessage(
@@ -5811,6 +5815,74 @@ void TestToolTagBoundaries() {
               Expect(invalid, "an interrupted prefix is not executable JSON");
             }
           }
+    }
+  }
+}
+
+// Unconstrained generation must retain prose after tools just like buffering.
+void TestUnconstrainedPostCallProse() {
+  using Format = gufo::sampling::JsonConstraint::ToolFormat;
+  for (const auto format : {Format::kGlm, Format::kQwen}) {
+    const std::string call =
+        format == Format::kGlm ? "<tool_call>record<arg_key>text</"
+                                 "arg_key><arg_value>x</arg_value></tool_call>"
+                               : "<tool_call><function=record><parameter=text>"
+                                 "x</parameter></function></tool_call>";
+    const std::string label = format == Format::kGlm ? "GLM" : "Qwen";
+    for (const std::string prefix :
+         {"", "Before. ", "  <think>Thought</think>Before. ",
+          "  <think>Thought"}) {
+      const auto initial = prefix.starts_with("  <think>")
+                               ? FakeBackend::InitialOutputState::kAuto
+                               : FakeBackend::InitialOutputState::kContent;
+      for (const std::string suffix : std::vector<std::string>{
+               " After.", " Between. " + call + " After.",
+               "</tool_call> After.", " After.<tool_call>"}) {
+        const std::string raw = prefix + call + suffix;
+        for (const int api : {0, 1, 2}) {
+          const auto buffered =
+              ToolBoundaryRequest({raw}, format, api, false, initial,
+                                  FakeBackend::FinishReason::kStop, true);
+          // Chat controls constrain Qwen even when this helper requests the
+          // unconstrained path for Responses/Messages. An unclosed thinking
+          // block there keeps tool-shaped text in reasoning, not content.
+          const bool constrained_thinking = api == 0 &&
+                                            format == Format::kQwen &&
+                                            prefix == "  <think>Thought";
+          Expect(
+              !buffered.failed &&
+                  (constrained_thinking
+                       ? buffered.content.empty() && buffered.names.empty()
+                       : buffered.content.find("After.") != std::string::npos),
+              label + " buffered respects the active reasoning/tool mode");
+          for (const bool bytewise : {false, true}) {
+            std::vector<std::string> pieces;
+            if (bytewise) {
+              for (const char byte : raw)
+                pieces.emplace_back(1, byte);
+            } else {
+              pieces = {raw};
+            }
+            const auto streamed =
+                ToolBoundaryRequest(pieces, format, api, true, initial,
+                                    FakeBackend::FinishReason::kStop, true);
+            Expect(!streamed.failed && streamed.content == buffered.content,
+                   label + " post-call content parity API " +
+                       std::to_string(api) + ": expected '" + buffered.content +
+                       "', got '" + streamed.content + "'");
+            Expect(streamed.arguments == buffered.arguments &&
+                       streamed.names == buffered.names,
+                   label + " post-call tool parity");
+            Expect(streamed.content.find("<tool_call>") == std::string::npos,
+                   label + " partial calls stay hidden");
+            // GLM intentionally has no closer-framing filter. Preserve the
+            // existing Qwen #383 policy without changing dialect semantics.
+            if (format == Format::kQwen)
+              Expect(streamed.content.find("</tool_call>") == std::string::npos,
+                     label + " repeated closers stay hidden");
+          }
+        }
+      }
     }
   }
 }
@@ -6405,12 +6477,8 @@ void TestGlmQuotedExamplesAndParallelCalls() {
       Expect(result.calls.size() == 1,
              label + "quoted copy is not a second call, got " +
                  std::to_string(result.calls.size()));
-      // A stream hides everything after its first call (the same for every
-      // unconstrained dialect), so only the buffered response carries it.
-      if (!stream)
-        Expect(
-            result.content == " Example: `" + call + "`",
-            label + "quoted copy stays content, got '" + result.content + "'");
+      Expect(result.content == " Example: `" + call + "`",
+             label + "quoted copy stays content, got '" + result.content + "'");
       const auto fenced =
           run(call + "\n```\n" + other + "\n```\n", stream, std::nullopt);
       Expect(fenced.calls.size() == 1 && city(fenced.calls[0]) == "Paris",
@@ -6446,6 +6514,7 @@ void TestGlmQuotedExamplesAndParallelCalls() {
 }
 
 int main() {
+  TestUnconstrainedPostCallProse();
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();
   TestStreamingQuotedAndMalformedTools();

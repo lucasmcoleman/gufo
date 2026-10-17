@@ -1981,10 +1981,16 @@ ParsedGeneration ParseGeneration(
       if (glm_stop != std::string_view::npos)
         parsed.text.resize(marker + glm_stop);
     } else if (text_from_tools.starts_with(
-                   tokenization::QwenToolSyntax::kCallOpen))
-      ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, nullptr,
+                   tokenization::QwenToolSyntax::kCallOpen)) {
+      ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, &spans,
                      unfinished_reasoning_quote, partial);
-    else
+      // Qwen scans the full response; the shared content assembly below uses
+      // offsets relative to the first tool marker, like the other dialects.
+      for (auto& [begin, end] : spans) {
+        begin -= marker;
+        end -= marker;
+      }
+    } else
       ParseDsmlCalls(
           text_from_tools, markers, tools, &parsed.tool_calls, &spans,
           partial && !unfinished_reasoning_quote && !quotes.UnclosedAt(marker));
@@ -2019,12 +2025,23 @@ ParsedGeneration ParseGeneration(
     if (!parsed.tool_calls.empty() || !enforce_required) {
       // Text outside complete envelopes is content. Framing echoed directly
       // after a call is removed, as for Qwen calls (#383).
+      std::vector<std::string_view> reasoning_closers;
+      ToolCloserSet post_call_closers = closers;
+      if (!reasoning_call_context.empty() && !IsGlmMarkers(markers) &&
+          text_from_tools.starts_with(
+              tokenization::QwenToolSyntax::kCallOpen)) {
+        // A recovered call already ended reasoning implicitly. Its delayed
+        // reasoning closer is framing, but prose after that closer is content.
+        reasoning_closers.assign(closers.begin(), closers.end());
+        reasoning_closers.push_back(kThinkEnd);
+        post_call_closers = reasoning_closers;
+      }
       const std::string full = std::move(parsed.text);
       std::string text(ContentBefore(full, 0, marker, closers, quotes, tools));
       std::size_t cursor = marker;
       for (const auto& [begin, end] : spans) {
-        text += ContentBefore(full, cursor, marker + begin, closers, quotes,
-                              tools, cursor > marker);
+        text += ContentBefore(full, cursor, marker + begin, post_call_closers,
+                              quotes, tools, cursor > marker);
         cursor = marker + end;
       }
       if (!spans.empty()) {
@@ -2034,8 +2051,8 @@ ParsedGeneration ParseGeneration(
           if (const auto held =
                   HeldMarkerPrefix(full, full.size(), markers, quotes))
             unfinished = full.size() - held;
-        text += ContentBefore(full, cursor, unfinished, closers, quotes, tools,
-                              true);
+        text += ContentBefore(full, cursor, unfinished, post_call_closers,
+                              quotes, tools, true);
       }
       parsed.text = std::move(text);
       parsed.hide_tool_markup = true;
@@ -2371,6 +2388,9 @@ public:
       }
       if (kThinkStart.starts_with(view)) {
         if (view == kThinkStart) {
+          if (!raw_content_ &&
+              !Emit(pending_.substr(0, pending_.size() - view.size()), false))
+            return false;
           state_ = State::kThinking;
           pending_.clear();
         }
@@ -2379,6 +2399,9 @@ public:
       if (view.starts_with(kThinkStart)) {
         // A buffered result arrives as one piece: the opening tag together
         // with the reasoning after it.
+        if (!raw_content_ &&
+            !Emit(pending_.substr(0, pending_.size() - view.size()), false))
+          return false;
         state_ = State::kThinking;
         pending_.erase(0, pending_.size() - view.size() + kThinkStart.size());
       } else {
@@ -2499,10 +2522,11 @@ public:
     if (tool_mode_ && state_ == State::kThinking) {
       const auto tail = reasoning.substr(
           std::min(emitted_reasoning_bytes_, reasoning.size()));
+      content.remove_prefix(std::min(emitted_content_bytes_, content.size()));
       return (tail.empty() || Emit(tail, true)) &&
              (content.empty() || Emit(content, false));
     }
-    if (tool_only_ && tool_mode_ && hide_tool_markup) {
+    if (tool_mode_ && hide_tool_markup) {
       // The prefix was streamed before the first call. Preserve prose between
       // or after complete calls without exposing their markup or partial calls.
       const auto offset = std::min(emitted_content_bytes_, content.size());
@@ -2552,6 +2576,8 @@ private:
       return false;
     if (reasoning)
       emitted_reasoning_bytes_ += piece.size();
+    else
+      emitted_content_bytes_ += piece.size();
     return true;
   }
 
@@ -2567,7 +2593,6 @@ private:
         if (!prose.empty() && !Emit(prose, false)) {
           return false;
         }
-        emitted_content_bytes_ += prose.size();
         hidden_ = pending_.substr(start);
         pending_.clear();
         tool_mode_ = true;
@@ -2585,7 +2610,6 @@ private:
         if (!text.empty() && !Emit(text, false)) {
           return false;
         }
-        emitted_content_bytes_ += text.size();
       }
       pending_.erase(0, ready);
       return true;
