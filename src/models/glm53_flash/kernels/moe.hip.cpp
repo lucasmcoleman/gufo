@@ -117,7 +117,9 @@ __global__ void FloatProject(const void* w, bool bf16, const float* x,
     const auto offset =
         (static_cast<std::size_t>(expert) * rows + i % rows) * cols;
     const float* in = x + (broadcast ? tr / routes : tr) * cols;
-    float sum = 0;
+    // Preserve cancellation through the unquantized fallback. Sequential
+    // FP32 accumulation drifts enough to fail near-zero routed/shared sums.
+    double sum = 0;
     for (std::uint32_t k = 0; k < cols; ++k) {
       const float v =
           bf16
@@ -125,9 +127,9 @@ __global__ void FloatProject(const void* w, bool bf16, const float* x,
                                     w)[offset + k]}
                                 << 16)
               : static_cast<const float*>(w)[offset + k];
-      sum = fmaf(v, in[k], sum);
+      sum += static_cast<double>(v) * in[k];
     }
-    y[i] = sum;
+    y[i] = static_cast<float>(sum);
   }
 }
 unsigned Grid(std::size_t n) {
