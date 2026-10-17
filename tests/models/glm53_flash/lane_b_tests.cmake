@@ -23,4 +23,6 @@ endif()
 
 if (ENGINE_ENABLE_HIP)
   add_glm53_flash_test(lane_b_dense gufo_glm53_flash "hip;gpu;gfx1151")
+  add_glm53_flash_test(lane_b_iq gufo_glm53_flash "hip;gpu;gfx1151")
+  add_glm53_flash_test(lane_b_ffn gufo_glm53_flash_reference "hip;gpu;gfx1151")
 endif()
