@@ -406,6 +406,14 @@ int main() {
           Run(false, true, true, true, 2, tokens, type, shared_type);
       }
     }
+    // Cooperative projection lanes must mask both reduction tails and the
+    // final partial wave group without changing per-token arithmetic.
+    for (auto tokens : {1U, 8U, 33U}) {
+      for (auto type : {GgmlType::kF32, GgmlType::kBF16}) {
+        Run(true, false, false, true, 0, tokens, type, type, 65);
+        Run(false, true, false, true, 0, tokens, type, type, 129);
+      }
+    }
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

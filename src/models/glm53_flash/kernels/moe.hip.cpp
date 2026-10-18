@@ -132,6 +132,41 @@ __global__ void FloatProject(const void* w, bool bf16, const float* x,
     y[i] = static_cast<float>(sum);
   }
 }
+// One wave cooperates on each output row. FP64 partial sums retain the
+// cancellation accuracy of FloatProject while consecutive lanes coalesce
+// weight/input loads and shorten the serial dependency chain.
+__global__ void FloatProjectWave(const void* w, bool bf16, const float* x,
+                                 const std::int32_t* ids, float* y,
+                                 std::size_t count, std::uint32_t routes,
+                                 std::uint32_t rows, std::uint32_t cols,
+                                 bool broadcast) {
+  // gfx1151 builds use wave32; shuffle width and output mapping agree.
+  constexpr unsigned kWave = 32;
+  const unsigned lane = threadIdx.x % kWave;
+  for (std::size_t i =
+           std::size_t{blockIdx.x} * (blockDim.x / kWave) + threadIdx.x / kWave;
+       i < count; i += std::size_t{gridDim.x} * (blockDim.x / kWave)) {
+    const auto tr = i / rows;
+    const auto expert = ids ? ids[tr] : 0;
+    const auto offset =
+        (static_cast<std::size_t>(expert) * rows + i % rows) * cols;
+    const float* in = x + (broadcast ? tr / routes : tr) * cols;
+    double sum = 0;
+    for (std::size_t k = lane; k < cols; k += kWave) {
+      const float v =
+          bf16
+              ? __uint_as_float(std::uint32_t{static_cast<const std::uint16_t*>(
+                                    w)[offset + k]}
+                                << 16)
+              : static_cast<const float*>(w)[offset + k];
+      sum += static_cast<double>(v) * in[k];
+    }
+    for (unsigned delta = kWave / 2; delta; delta /= 2)
+      sum += __shfl_down(sum, delta, kWave);
+    if (lane == 0)
+      y[i] = static_cast<float>(sum);
+  }
+}
 unsigned Grid(std::size_t n) {
   return static_cast<unsigned>(std::min<std::size_t>((n + 255) / 256, 65535));
 }
@@ -143,9 +178,17 @@ bool Project(const DeviceMatrix& w, const float* x, const std::int32_t* ids,
                                 w.experts, w.rows, w.cols, broadcast, stream);
   if (w.type == GgmlType::kF32 || w.type == GgmlType::kBF16) {
     const auto n = std::size_t{tokens} * routes * w.rows;
-    FloatProject<<<Grid(n), 256, 0, stream>>>(w.data, w.type == GgmlType::kBF16,
-                                              x, ids, y, n, routes, w.rows,
-                                              w.cols, broadcast);
+    if (w.cols < 64) {
+      FloatProject<<<Grid(n), 256, 0, stream>>>(
+          w.data, w.type == GgmlType::kBF16, x, ids, y, n, routes, w.rows,
+          w.cols, broadcast);
+    } else {
+      const auto grid =
+          static_cast<unsigned>(std::min<std::size_t>((n + 7) / 8, 65535));
+      FloatProjectWave<<<grid, 256, 0, stream>>>(
+          w.data, w.type == GgmlType::kBF16, x, ids, y, n, routes, w.rows,
+          w.cols, broadcast);
+    }
   } else {
     ::gufo::hip::LaunchBatchedQuantGEMMFp32(w.type, w.data, x, y, tokens,
                                             w.rows, w.cols, stream);
