@@ -166,6 +166,13 @@ int main() {
       for (auto tokens : {1U, 8U, 9U, 33U})
         for (bool broadcast : {false, true})
           Run(type, tokens, tokens == 1 ? 256 : 768, broadcast);
+    // Real routed gate/up and down reduction widths exercise all eight
+    // independent chains over multiple blocks, including partial output waves.
+    for (auto type : {GgmlType::kIQ2_XXS, GgmlType::kIQ2_S, GgmlType::kIQ3_XXS})
+      for (auto tokens : {1U, 8U}) {
+        Run(type, tokens, 4096, true);
+        Run(type, tokens, 2048, false);
+      }
     return 0;
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

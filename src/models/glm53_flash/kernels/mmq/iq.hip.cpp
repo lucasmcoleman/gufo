@@ -16,6 +16,13 @@ namespace {
 
 using core::GgmlType;
 
+// HIP __fadd_rn still permits reassociation under -ffast-math. Preserve the
+// original reduction tree when moving its partials from LDS into registers.
+__device__ __forceinline__ float OrderedAdd(float a, float b) {
+#pragma clang fp reassociate(off) contract(off)
+  return a + b;
+}
+
 __device__ std::uint32_t Read32(const std::uint8_t* p) {
   return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8U) |
          (std::uint32_t(p[2]) << 16U) | (std::uint32_t(p[3]) << 24U);
@@ -79,32 +86,42 @@ __global__ void RoutedKernel(const std::uint8_t* weights, const float* input,
                              std::uint32_t experts, std::uint32_t rows,
                              std::uint32_t cols, std::size_t row_bytes,
                              bool broadcast) {
-  __shared__ float sums[256];
-  for (std::size_t out = blockIdx.x; out < count; out += gridDim.x) {
+  // Each wave preserves the original 256-lane dot/reduction tree in eight
+  // register partials per lane. Independent output rows need no LDS barriers.
+  // The gfx1151 target uses wave32. Each output occupies one complete wave.
+  const unsigned lane = threadIdx.x % 32;
+  const std::size_t wave =
+      (std::size_t{blockIdx.x} * blockDim.x + threadIdx.x) / 32;
+  const std::size_t waves = std::size_t{gridDim.x} * blockDim.x / 32;
+  for (std::size_t out = wave; out < count; out += waves) {
     const std::size_t route = out / rows;
     const std::int32_t expert = ids[route];
-    float sum = 0.0F;
+    float sums[8] = {};
     if (expert < 0 || std::uint32_t(expert) >= experts) {
-      sum = __int_as_float(0x7fc00000);
+      sums[0] = __int_as_float(0x7fc00000);
     } else {
       const auto* w =
           weights + (std::size_t(expert) * rows + out % rows) * row_bytes;
       const auto* x = input + (broadcast ? route / routes : route) * cols;
-      for (std::size_t c = threadIdx.x; c < cols; c += 256) {
-        sum = fmaf(Decode<Type>(w, static_cast<std::uint32_t>(c)), x[c], sum);
+      for (std::size_t c = lane; c < cols; c += 256) {
+#pragma unroll
+        for (unsigned j = 0; j < 8; ++j)
+          sums[j] =
+              fmaf(Decode<Type>(w, static_cast<std::uint32_t>(c + j * 32)),
+                   x[c + j * 32], sums[j]);
       }
     }
-    sums[threadIdx.x] = sum;
-    __syncthreads();
-    for (unsigned stride = 128; stride > 0; stride /= 2) {
-      if (threadIdx.x < stride)
-        sums[threadIdx.x] += sums[threadIdx.x + stride];
-      __syncthreads();
-    }
-    if (threadIdx.x == 0)
-      output[out] = sums[0];
-    // Every consumer finishes before the next grid-stride iteration writes LDS.
-    __syncthreads();
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j)
+      sums[j] = OrderedAdd(sums[j], sums[j + 4]);
+    sums[0] = OrderedAdd(sums[0], sums[2]);
+    sums[1] = OrderedAdd(sums[1], sums[3]);
+    float sum = OrderedAdd(sums[0], sums[1]);
+#pragma unroll
+    for (unsigned stride = 16; stride > 0; stride /= 2)
+      sum = OrderedAdd(sum, __shfl_down(sum, stride, 32));
+    if (lane == 0)
+      output[out] = sum;
   }
 }
 
@@ -188,7 +205,7 @@ bool IqRoutedMatmul(GgmlType type, const void* weights, const float* input,
       !Product(input_elements, sizeof(float), &bytes))
     return false;
   const auto row_bytes = std::size_t(cols / 256) * block_bytes;
-  const unsigned grid = Grid(count);
+  const unsigned grid = Grid((count + 7) / 8);
 #define LAUNCH_ROUTED(TYPE)                                                 \
   RoutedKernel<TYPE><<<grid, 256, 0, stream>>>(                             \
       static_cast<const std::uint8_t*>(weights), input, expert_ids, output, \
