@@ -3,11 +3,14 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/glm53_flash/kernels/hc.hpp"
@@ -909,6 +912,48 @@ bool Executor::ForwardStreams(const float* streams, std::uint32_t n_tokens,
              error);
 }
 
+
+namespace {
+
+// GUFO_GLM53_QUAL_DUMP=<file>: append routing (ffn_moe_topk,
+// ffn_moe_weights_scaled), every sub-layer output (mlp.out, self_attn.out),
+// final_norm.out and the returned logits to <file> as raw records, so two
+// builds can be diffed bitwise on the real model. Qualification only; the taps
+// synchronise the device.
+struct QualDump {
+  std::FILE* f{nullptr};
+  QualDump() {
+    const char* path = std::getenv("GUFO_GLM53_QUAL_DUMP");
+    if (path != nullptr && *path != '\0') {
+      f = std::fopen(path, "ab");
+    }
+  }
+  ~QualDump() {
+    if (f != nullptr) {
+      std::fclose(f);
+    }
+  }
+  void Write(std::string_view name, std::uint32_t layer, std::uint32_t dtype,
+             std::uint64_t ne0, std::uint64_t ne1, std::uint64_t ne2,
+             const void* host, std::size_t bytes) const {
+    const auto len = static_cast<std::uint32_t>(name.size());
+    std::fwrite(&len, sizeof len, 1, f);
+    std::fwrite(name.data(), 1, len, f);
+    std::fwrite(&layer, sizeof layer, 1, f);
+    std::fwrite(&dtype, sizeof dtype, 1, f);
+    const std::uint64_t ne[3] = {ne0, ne1, ne2};
+    std::fwrite(ne, sizeof ne, 1, f);
+    std::fwrite(host, 1, bytes, f);
+  }
+};
+
+const QualDump& GetQualDump() {
+  static const QualDump dump;
+  return dump;
+}
+
+}  // namespace
+
 bool Executor::Run(const std::int32_t* tokens, const float* streams,
                    std::uint32_t n_tokens, bool want_logits, Head head,
                    ForwardResult* out, const TapFn* tap, std::string* error) {
@@ -921,6 +966,30 @@ bool Executor::Run(const std::int32_t* tokens, const float* streams,
   *out = ForwardResult{};
   if (n_tokens == 0) {
     return true;
+  }
+  const QualDump& qual = GetQualDump();
+  TapFn qual_tap;
+  if (qual.f != nullptr && tap == nullptr) {
+    qual_tap = [&qual](std::string_view name, std::uint32_t layer,
+                       const TapView& v) {
+      if (name != "ffn_moe_topk" && name != "ffn_moe_weights_scaled" &&
+          name != "mlp.out" && name != "self_attn.out" &&
+          name != "final_norm.out") {
+        return;
+      }
+      const std::size_t elem = v.dtype == TapView::Dtype::kF16 ? 2 : 4;
+      std::vector<unsigned char> host(v.count() * elem);
+      if (hipDeviceSynchronize() != hipSuccess ||
+          hipMemcpy(host.data(), v.device, host.size(),
+                    hipMemcpyDeviceToHost) != hipSuccess) {
+        std::cerr << "GUFO_GLM53_QUAL_DUMP: download of " << name
+                  << " failed\n";
+        return;
+      }
+      qual.Write(name, layer, static_cast<std::uint32_t>(v.dtype), v.ne0,
+                 v.ne1, v.ne2, host.data(), host.size());
+    };
+    tap = &qual_tap;
   }
   for (std::uint32_t il = options_.first_layer; il < options_.last_layer;
        ++il) {
@@ -945,6 +1014,11 @@ bool Executor::Run(const std::int32_t* tokens, const float* streams,
     position_ += n;
   }
   failed_ = false;
+  if (qual.f != nullptr && !out->logits.empty()) {
+    qual.Write("logits", 0xFFFFFFFFU, 0, out->logits.size(), 1, 1,
+               out->logits.data(), out->logits.size() * sizeof(float));
+    std::fflush(qual.f);
+  }
   if (profiler_ != nullptr && profiler_->per_run()) {
     PrintProfile(std::cerr);
   }
