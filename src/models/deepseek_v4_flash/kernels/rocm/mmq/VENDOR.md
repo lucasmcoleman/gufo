@@ -21,3 +21,10 @@ focused DS4 projection/attention checks through Nix. The backend and all six
 matrix translation units were also compared before and after preprocessing
 for `gfx1151`; only private symbol names and unsupported-kernel diagnostics
 changed. Current measurements belong in the model benchmark README.
+
+The IQ2_S and IQ3_XXS vector dots retain their fractional scale contributions
+in integer numerators until the final floating-point multiplication. The
+imported expressions divided integer sums before scaling and truncated valid
+fractions, even for exactly Q8-representable activations. This local correction
+aligns those dots with independent dequantization and the MMQ arithmetic;
+activation quantization still changes general F32 inputs.
