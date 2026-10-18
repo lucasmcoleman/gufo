@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
+#include "ds4_mmq.h"
 #include "src/models/glm53_flash/kernels/mmq/iq.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
@@ -170,6 +172,40 @@ __global__ void FloatProjectWave(const void* w, bool bf16, const float* x,
 unsigned Grid(std::size_t n) {
   return static_cast<unsigned>(std::min<std::size_t>((n + 255) / 256, 65535));
 }
+// Routed IQ2_XXS gate/up through the vendored llama.cpp kernels (MMVQ for
+// decode, expert-grouped MMQ for prefill) with Q8_1 activations. Set
+// GUFO_GLM53_SCALAR_MOE=1 to keep the scalar IqRoutedMatmul path instead.
+bool UseDs4(const DeviceMatrix& gate, const DeviceMatrix& up,
+            const std::int32_t* ids) {
+  static const bool scalar = [] {
+    const char* v = std::getenv("GUFO_GLM53_SCALAR_MOE");
+    return v && *v && *v != '0';
+  }();
+  return !scalar && ids && gate.type == GgmlType::kIQ2_XXS &&
+         up.type == GgmlType::kIQ2_XXS && gate.experts > 1 &&
+         gate.experts <= INT32_MAX && gate.rows <= INT32_MAX &&
+         gate.cols <= INT32_MAX;
+}
+
+constexpr std::uint32_t kVecTokens = 8;
+
+bool Ds4GateUp(const DeviceMatrix& gate, const DeviceMatrix& up,
+               const float* x, const std::int32_t* ids, float* g, float* u,
+               std::uint32_t tokens, std::uint32_t routes, Stream stream) {
+  const int m = static_cast<int>(gate.rows), k = static_cast<int>(gate.cols),
+            t = static_cast<int>(tokens), e = static_cast<int>(gate.experts),
+            r = static_cast<int>(routes);
+  if (tokens <= kVecTokens)
+    return ds4_mmq_iq2_xxs_moe_vec(gate.data, x, ids, g, m, k, t, e, r,
+                                   stream) == 0 &&
+           ds4_mmq_iq2_xxs_moe_vec(up.data, x, ids, u, m, k, t, e, r,
+                                   stream) == 0;
+  // The paired MMQ shares one activation quantization and expert map
+  // between gate and up.
+  return ds4_mmq_iq2_xxs_moe_pair(gate.data, up.data, x, ids, g, u, m, k, t, e,
+                                  r, stream) == 0;
+}
+
 bool Project(const DeviceMatrix& w, const float* x, const std::int32_t* ids,
              float* y, std::uint32_t tokens, std::uint32_t routes,
              bool broadcast, Stream stream) {
@@ -345,9 +381,14 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
   const auto ff = [&](const DeviceMatrix& gate, const DeviceMatrix& up,
                       const DeviceMatrix& down, std::uint32_t routes,
                       const std::int32_t* selected, float clamp, float* out) {
-    if (!Project(gate, x, selected, g, tokens, routes, true, ctx.stream) ||
-        !Project(up, x, selected, u, tokens, routes, true, ctx.stream))
+    if (UseDs4(gate, up, selected)) {
+      if (!Ds4GateUp(gate, up, x, selected, g, u, tokens, routes, ctx.stream))
+        return false;
+    } else if (!Project(gate, x, selected, g, tokens, routes, true,
+                        ctx.stream) ||
+               !Project(up, x, selected, u, tokens, routes, true, ctx.stream)) {
       return false;
+    }
     const auto n = std::size_t{tokens} * routes * gate.rows;
     Activate<<<Grid(n), 256, 0, ctx.stream>>>(g, u, n, clamp);
     if (hipGetLastError() != hipSuccess)
