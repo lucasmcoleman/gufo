@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "ds4_mmq.h"
+#include "ds4_pool.h"
 #include "src/models/glm53_flash/kernels/mmq/iq.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
@@ -179,6 +180,9 @@ bool UseDs4(const DeviceMatrix& gate, const DeviceMatrix& up,
             const std::int32_t* ids) {
   static const bool scalar = [] {
     const char* v = std::getenv("GUFO_GLM53_SCALAR_MOE");
+    // GLM runs one stream without graph capture, so the LIFO arena replaces
+    // a hipMallocAsync/hipFreeAsync pair per call.
+    ds4_pool_use_stack_arena(1);
     return v && *v && *v != '0';
   }();
   return !scalar && ids && gate.type == GgmlType::kIQ2_XXS &&

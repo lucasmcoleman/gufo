@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 // Device properties are queried once and shared by the matrix dispatchers.
 const ds4_ggml_hip_device_info & ds4_ggml_hip_info() {
@@ -129,9 +131,75 @@ struct ds4_naive_pool : public ds4_ggml_hip_pool {
     }
 };
 
+/* Opt-in stack arena, after qwen38's qfn_stack_pool. Every allocation the
+ * tier makes is scoped to one entry point and released in reverse order, so
+ * a stack over one arena serves a caller that runs all kernels on one stream
+ * and never captures graphs. It avoids a hipMallocAsync/hipFreeAsync pair per
+ * call, whose reuse of a just-freed block raced with in-flight kernels on
+ * this ROCm (see qfn_ggml_stubs.hip.cpp). The arena is managed memory: on
+ * gfx1151 hipMalloc stalls once a large model is resident. */
+static bool g_ds4_stack_pool = false;
+
+struct ds4_stack_pool : public ds4_ggml_hip_pool {
+    int device;
+    char *base = nullptr;
+    size_t capacity = 0;
+    size_t top = 0;
+    std::vector<std::pair<char *, size_t>> live;
+
+    explicit ds4_stack_pool(int device) : device(device) {}
+
+    ~ds4_stack_pool() override {
+        if (base) (void)hipFree(base);
+    }
+
+    void reserve(size_t bytes) {
+        if (bytes <= capacity) return;
+        /* Growing invalidates outstanding pointers, so it only happens while
+         * nothing is live; the arena starts generous to keep that true. */
+        if (top != 0) {
+            fprintf(stderr, "ds4_stack_pool: arena exhausted with live allocations\n");
+            abort();
+        }
+        (void)hipDeviceSynchronize();
+        if (base) (void)hipFree(base);
+        size_t next = capacity ? capacity : (size_t) 256 << 20;
+        while (next < bytes) next *= 2;
+        DS4_HIP_CHECK(hipMallocManaged((void **)&base, next));
+        capacity = next;
+    }
+
+    void * alloc(size_t size, size_t * actual_size) override {
+        ds4_ggml_hip_set_device(device);
+        const size_t aligned = (size + 255) & ~(size_t) 255;
+        if (top + aligned > capacity) reserve(top + aligned);
+        char *ptr = base + top;
+        top += aligned;
+        live.emplace_back(ptr, aligned);
+        if (actual_size) *actual_size = aligned;
+        return ptr;
+    }
+
+    void free(void * ptr, size_t /*size*/) override {
+        if (!ptr) return;
+        if (live.empty() || live.back().first != ptr) {
+            fprintf(stderr, "ds4_stack_pool: non-LIFO free\n");
+            abort();
+        }
+        top -= live.back().second;
+        live.pop_back();
+    }
+};
+
 } // anonymous namespace
 
+extern "C" void ds4_pool_use_stack_arena(int enable) {
+    g_ds4_stack_pool = enable != 0;
+}
+
 std::unique_ptr<ds4_ggml_hip_pool> ds4_ggml_hip_context::new_pool_for_device(int device, int /*stream_no*/) {
+    if (g_ds4_stack_pool)
+        return std::unique_ptr<ds4_ggml_hip_pool>(new ds4_stack_pool(device));
     return std::unique_ptr<ds4_ggml_hip_pool>(new ds4_naive_pool(device));
 }
 
