@@ -1622,6 +1622,22 @@ extern "C" int ds4_mmq_iq2_xxs_moe(
                                                n_tokens, n_experts, n_expert_used, stream);
 }
 
+extern "C" int ds4_mmq_iq2_s_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_IQ2_S>("ds4_mmq_iq2_s_moe", W, X, ids, out, M, K,
+                                               n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq3_xxs_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_IQ3_XXS>("ds4_mmq_iq3_xxs_moe", W, X, ids, out, M, K,
+                                               n_tokens, n_experts, n_expert_used, stream);
+}
+
 /* ds4 (P4 Inc3): mmq MoE over the aligned row-pair-SoA Q2_K artifact
  * (weight server --repack-q2k-aligned) -- no raw-layout weights and no
  * derepack scratch involved; the mul_mat_q tile loader reads the SoA
@@ -3391,6 +3407,24 @@ extern "C" int ds4_mmq_iq2_xxs_moe_vec(
         n_tokens, n_experts, n_expert_used, stream);
 }
 
+extern "C" int ds4_mmq_iq2_s_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_IQ2_S>(
+        "ds4_mmq_iq2_s_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq3_xxs_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_IQ3_XXS>(
+        "ds4_mmq_iq3_xxs_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
 extern "C" int ds4_mmq_q4_K_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
@@ -4258,6 +4292,10 @@ template void mul_mat_q_case<GGML_TYPE_Q8_0>(
 template void mul_mat_q_case<GGML_TYPE_Q2_K>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ2_S>(
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ3_XXS>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
