@@ -173,22 +173,29 @@ __global__ void FloatProjectWave(const void* w, bool bf16, const float* x,
 unsigned Grid(std::size_t n) {
   return static_cast<unsigned>(std::min<std::size_t>((n + 255) / 256, 65535));
 }
-// Routed IQ2_XXS gate/up through the vendored llama.cpp kernels (MMVQ for
+// Routed IQ projections through the vendored llama.cpp kernels (MMVQ for
 // decode, expert-grouped MMQ for prefill) with Q8_1 activations. Set
 // GUFO_GLM53_SCALAR_MOE=1 to keep the scalar IqRoutedMatmul path instead.
-bool UseDs4(const DeviceMatrix& gate, const DeviceMatrix& up,
-            const std::int32_t* ids) {
-  static const bool scalar = [] {
+bool Ds4Enabled() {
+  static const bool enabled = [] {
     const char* v = std::getenv("GUFO_GLM53_SCALAR_MOE");
     // GLM runs one stream without graph capture, so the LIFO arena replaces
     // a hipMallocAsync/hipFreeAsync pair per call.
     ds4_pool_use_stack_arena(1);
-    return v && *v && *v != '0';
+    return !(v && *v && *v != '0');
   }();
-  return !scalar && ids && gate.type == GgmlType::kIQ2_XXS &&
-         up.type == GgmlType::kIQ2_XXS && gate.experts > 1 &&
-         gate.experts <= INT32_MAX && gate.rows <= INT32_MAX &&
-         gate.cols <= INT32_MAX;
+  return enabled;
+}
+
+bool Ds4Shape(const DeviceMatrix& w, const std::int32_t* ids) {
+  return Ds4Enabled() && ids && w.experts > 1 && w.experts <= INT32_MAX &&
+         w.rows <= INT32_MAX && w.cols <= INT32_MAX;
+}
+
+bool UseDs4(const DeviceMatrix& gate, const DeviceMatrix& up,
+            const std::int32_t* ids) {
+  return Ds4Shape(gate, ids) && gate.type == GgmlType::kIQ2_XXS &&
+         up.type == GgmlType::kIQ2_XXS;
 }
 
 constexpr std::uint32_t kVecTokens = 8;
@@ -208,6 +215,29 @@ bool Ds4GateUp(const DeviceMatrix& gate, const DeviceMatrix& up,
   // between gate and up.
   return ds4_mmq_iq2_xxs_moe_pair(gate.data, up.data, x, ids, g, u, m, k, t, e,
                                   r, stream) == 0;
+}
+
+bool UseDs4Down(const DeviceMatrix& down, const std::int32_t* ids) {
+  return Ds4Shape(down, ids) && (down.type == GgmlType::kIQ2_S ||
+                                 down.type == GgmlType::kIQ3_XXS);
+}
+
+// Each route's down input differs, so the assignments are flattened to
+// tokens * routes rows with one expert each.
+bool Ds4Down(const DeviceMatrix& down, const float* x, const std::int32_t* ids,
+             float* y, std::uint32_t tokens, std::uint32_t routes,
+             Stream stream) {
+  const auto rows = std::size_t{tokens} * routes;
+  if (rows > INT32_MAX)
+    return false;
+  const int m = static_cast<int>(down.rows), k = static_cast<int>(down.cols),
+            n = static_cast<int>(rows), e = static_cast<int>(down.experts);
+  const bool vec = tokens <= kVecTokens;
+  if (down.type == GgmlType::kIQ2_S)
+    return (vec ? ds4_mmq_iq2_s_moe_vec : ds4_mmq_iq2_s_moe)(
+               down.data, x, ids, y, m, k, n, e, 1, stream) == 0;
+  return (vec ? ds4_mmq_iq3_xxs_moe_vec : ds4_mmq_iq3_xxs_moe)(
+             down.data, x, ids, y, m, k, n, e, 1, stream) == 0;
 }
 
 bool Project(const DeviceMatrix& w, const float* x, const std::int32_t* ids,
@@ -397,6 +427,8 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
     Activate<<<Grid(n), 256, 0, ctx.stream>>>(g, u, n, clamp);
     if (hipGetLastError() != hipSuccess)
       return false;
+    if (UseDs4Down(down, selected))
+      return Ds4Down(down, g, selected, out, tokens, routes, ctx.stream);
     return Project(down, g, selected, out, tokens, routes, false, ctx.stream);
   };
   if (w.dense) {
