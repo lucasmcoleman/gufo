@@ -166,24 +166,43 @@ __global__ void FloatProjectWave(const void* w, bool bf16, const float* x,
     // Float: Kahan-compensated per lane (error ~2u, near the double path's
     // for these lengths), then the lane partials reduce in double.
     Acc sum = 0, carry = 0;
-    for (std::size_t k = lane; k < cols; k += kWave) {
-      const float v =
-          bf16
-              ? __uint_as_float(std::uint32_t{static_cast<const std::uint16_t*>(
-                                    w)[offset + k]}
-                                << 16)
-              : static_cast<const float*>(w)[offset + k];
-      if constexpr (std::is_same_v<Acc, float>) {
-        // This library builds with -ffast-math, whose reassociation folds
-        // the compensation to carry = term - term (codexms #690). Keep the
-        // Kahan update exactly as written.
+    // Issue kBatch independent weight/input loads before accumulating them in
+    // the original k order. Decode has one wave per router row (288 waves),
+    // too few to hide memory latency behind a load -> FMA chain.
+    constexpr unsigned kBatch = 8;
+    for (std::size_t k0 = lane; k0 < cols; k0 += kWave * kBatch) {
+      float vs[kBatch], xs[kBatch];
+#pragma unroll
+      for (unsigned b = 0; b < kBatch; ++b) {
+        const std::size_t k = k0 + std::size_t{b} * kWave;
+        vs[b] = 0.0f;
+        xs[b] = 0.0f;
+        if (k < cols) {
+          vs[b] = bf16 ? __uint_as_float(
+                             std::uint32_t{static_cast<const std::uint16_t*>(
+                                 w)[offset + k]}
+                             << 16)
+                       : static_cast<const float*>(w)[offset + k];
+          xs[b] = in[k];
+        }
+      }
+#pragma unroll
+      for (unsigned b = 0; b < kBatch; ++b) {
+        if (k0 + std::size_t{b} * kWave >= cols)
+          break;
+        const float v = vs[b];
+        if constexpr (std::is_same_v<Acc, float>) {
+          // This library builds with -ffast-math, whose reassociation folds
+          // the compensation to carry = term - term (codexms #690). Keep the
+          // Kahan update exactly as written.
 #pragma clang fp reassociate(off) contract(off)
-        const float term = fmaf(v, in[k], -carry);
-        const float next = sum + term;
-        carry = (next - sum) - term;
-        sum = next;
-      } else {
-        sum += static_cast<Acc>(v) * in[k];
+          const float term = fmaf(v, xs[b], -carry);
+          const float next = sum + term;
+          carry = (next - sum) - term;
+          sum = next;
+        } else {
+          sum += static_cast<Acc>(v) * xs[b];
+        }
       }
     }
     double total = static_cast<double>(sum) - static_cast<double>(carry);
