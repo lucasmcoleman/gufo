@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "src/core/hip/managed_alloc.hpp"
+#include "src/core/hip/weight_upload.hpp"
 #include "src/models/glm53_flash/kernels/hc.hpp"
 #include "src/models/glm53_flash/kernels/kda.hpp"
 #include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
@@ -71,8 +72,7 @@ bool UploadEncoded(DeviceArena& arena, const TensorRef& t, DeviceMatrix* out,
   if (dst == nullptr) {
     return Fail(error, "device allocation failed for " + ShapeOf(t));
   }
-  if (hipMemcpy(dst, t.data, t.SizeBytes(), hipMemcpyHostToDevice) !=
-      hipSuccess) {
+  if (!arena.Copy(dst, t, t.SizeBytes())) {
     return Fail(error, "host-to-device copy failed for " + ShapeOf(t));
   }
   *out = DeviceMatrix{.data = dst,
@@ -131,8 +131,7 @@ const float* UploadF32(DeviceArena& arena,
   }
   std::size_t offset = 0;
   for (const TensorRef* t : parts) {
-    if (hipMemcpy(dst + offset, t->data, bytes, hipMemcpyHostToDevice) !=
-        hipSuccess) {
+    if (!arena.Copy(dst + offset, *t, bytes)) {
       Fail(error, std::string(what) + ": host-to-device copy failed");
       return nullptr;
     }
@@ -168,8 +167,7 @@ bool UploadStacked(DeviceArena& arena,
   }
   std::size_t offset = 0;
   for (const TensorRef* t : parts) {
-    if (hipMemcpy(dst + offset, t->data, t->SizeBytes(),
-                  hipMemcpyHostToDevice) != hipSuccess) {
+    if (!arena.Copy(dst + offset, *t, t->SizeBytes())) {
       return Fail(error, "host-to-device copy failed for " + ShapeOf(*t));
     }
     offset += t->SizeBytes();
@@ -288,7 +286,8 @@ DeviceArena::~DeviceArena() {
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
     : blocks_(std::exchange(other.blocks_, {})),
-      bytes_(std::exchange(other.bytes_, 0)) {}
+      bytes_(std::exchange(other.bytes_, 0)),
+      upload_(std::exchange(other.upload_, nullptr)) {}
 
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
   if (this != &other) {
@@ -297,6 +296,7 @@ DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     }
     blocks_ = std::exchange(other.blocks_, {});
     bytes_ = std::exchange(other.bytes_, 0);
+    upload_ = std::exchange(other.upload_, nullptr);
   }
   return *this;
 }
@@ -314,6 +314,13 @@ void* DeviceArena::Allocate(std::size_t bytes) {
   blocks_.push_back(p);
   bytes_ += size;
   return p;
+}
+
+bool DeviceArena::Copy(void* dst, const TensorRef& t, std::size_t bytes) const {
+  if (upload_ != nullptr) {
+    return upload_->Copy(t.shard, t.file_offset, bytes, dst, nullptr);
+  }
+  return hipMemcpy(dst, t.data, bytes, hipMemcpyHostToDevice) == hipSuccess;
 }
 
 // ---- Projections ----
@@ -731,6 +738,20 @@ bool Executor::Init(std::string* error) {
   if (hipStreamCreate(&stream_) != hipSuccess) {
     return Fail(error, "hipStreamCreate failed");
   }
+  // Weight copies queue on `upload` until Finish below. On an early return
+  // the guard detaches it before its destructor drains the queue.
+  std::unique_ptr<hip::WeightUpload> upload;
+  if (!options_.shards.empty()) {
+    upload = hip::WeightUpload::Create(options_.shards, error);
+    if (upload == nullptr) {
+      return false;
+    }
+  }
+  struct StageGuard {
+    DeviceArena& arena;
+    ~StageGuard() { arena.StageFrom(nullptr); }
+  } stage_guard{arena_};
+  arena_.StageFrom(upload.get());
 
   const std::size_t hidden = c.hidden_size;
   const std::size_t mix_dim = c.HcMixDim();
@@ -820,6 +841,11 @@ bool Executor::Init(std::string* error) {
          !UploadMatrix(arena_, weights_.output, &output_, error))) {
       return false;
     }
+  }
+
+  arena_.StageFrom(nullptr);
+  if (upload != nullptr && !upload->Finish(error)) {
+    return false;
   }
 
   // Activations for one pass of max_tokens.
