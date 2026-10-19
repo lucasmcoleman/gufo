@@ -136,8 +136,8 @@ struct ds4_naive_pool : public ds4_ggml_hip_pool {
  * a stack over one arena serves a caller that runs all kernels on one stream
  * and never captures graphs. It avoids a hipMallocAsync/hipFreeAsync pair per
  * call, whose reuse of a just-freed block raced with in-flight kernels on
- * this ROCm (see qfn_ggml_stubs.hip.cpp). The arena is managed memory: on
- * gfx1151 hipMalloc stalls once a large model is resident. */
+ * this ROCm (see qfn_ggml_stubs.hip.cpp). The arena is managed memory (coarse
+ * grain): on gfx1151 hipMalloc stalls once a large model is resident. */
 static bool g_ds4_stack_pool = false;
 
 struct ds4_stack_pool : public ds4_ggml_hip_pool {
@@ -166,6 +166,13 @@ struct ds4_stack_pool : public ds4_ggml_hip_pool {
         size_t next = capacity ? capacity : (size_t) 256 << 20;
         while (next < bytes) next *= 2;
         DS4_HIP_CHECK(hipMallocManaged((void **)&base, next));
+        /* Managed memory is fine-grain by default; the arena only holds
+         * kernel-written scratch, so coarse-grain lets the GPU cache it like
+         * hipMalloc memory (as src/core/hip/managed_alloc.hpp does). Decode
+         * MoE gate/up read their Q8_1 activations from here: 0.41 -> ~0.34 ms
+         * per layer in glm53_flash_moe_bench. Advice failure is not fatal. */
+        if (hipMemAdvise(base, next, hipMemAdviseSetCoarseGrain, device) != hipSuccess)
+            (void)hipGetLastError();
         capacity = next;
     }
 
