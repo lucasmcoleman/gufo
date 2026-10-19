@@ -180,12 +180,28 @@ unsigned Grid(std::size_t n) {
 // Routed IQ projections through the vendored llama.cpp kernels (MMVQ for
 // decode, expert-grouped MMQ for prefill) with Q8_1 activations. Set
 // GUFO_GLM53_SCALAR_MOE=1 to keep the scalar IqRoutedMatmul path instead.
+int Ds4TileCols() {
+  static const int cols = [] {
+    const char* v = std::getenv("GUFO_GLM53_MOE_TILE_COLS");
+    return v && *v ? std::atoi(v) : 16;
+  }();
+  return cols;
+}
+
 bool Ds4Enabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("GUFO_GLM53_SCALAR_MOE");
     // GLM runs one stream without graph capture, so the LIFO arena replaces
     // a hipMallocAsync/hipFreeAsync pair per call.
     ds4_pool_use_stack_arena(1);
+    // Prefill gate/up column-tile width. DS4's default rule picks 80 columns,
+    // but a 256-token GLM pass gives each of the 288 experts ~7 rows, so most
+    // of every tile is padding. glm53_flash_moe_bench (GLM shapes, gfx1151):
+    // 256 tokens 34.5 -> 13.3 ms with 16 and the token bound, 64 tokens
+    // 27.7 -> 10.7 ms. The width changes the per-element summation order (max
+    // |delta| 5.7e-6 on outputs up to 17), not the arithmetic. 0 restores the
+    // default rule.
+    ds4_mmq_set_routed_tile_cols(Ds4TileCols());
     return !(v && *v && *v != '0');
   }();
   return enabled;
@@ -216,9 +232,12 @@ bool Ds4GateUp(const DeviceMatrix& gate, const DeviceMatrix& up,
            ds4_mmq_iq2_xxs_moe_vec(up.data, x, ids, u, m, k, t, e, r,
                                    stream) == 0;
   // The paired MMQ shares one activation quantization and expert map
-  // between gate and up.
-  return ds4_mmq_iq2_xxs_moe_pair(gate.data, up.data, x, ids, g, u, m, k, t, e,
-                                  r, stream) == 0;
+  // between gate and up. Token-bound: a token's top-k experts are distinct,
+  // so no expert gets more rows than there are tokens, and the launch grid is
+  // sized by tokens instead of tokens * routes (empty blocks only; same
+  // results).
+  return ds4_mmq_iq2_xxs_moe_pair_token_bound(gate.data, up.data, x, ids, g, u,
+                                              m, k, t, e, r, stream) == 0;
 }
 
 bool UseDs4Down(const DeviceMatrix& down, const std::int32_t* ids) {
@@ -237,11 +256,21 @@ bool Ds4Down(const DeviceMatrix& down, const float* x, const std::int32_t* ids,
   const int m = static_cast<int>(down.rows), k = static_cast<int>(down.cols),
             n = static_cast<int>(rows), e = static_cast<int>(down.experts);
   const bool vec = tokens <= kVecTokens;
-  if (down.type == GgmlType::kIQ2_S)
-    return (vec ? ds4_mmq_iq2_s_moe_vec : ds4_mmq_iq2_s_moe)(
-               down.data, x, ids, y, m, k, n, e, 1, stream) == 0;
-  return (vec ? ds4_mmq_iq3_xxs_moe_vec : ds4_mmq_iq3_xxs_moe)(
-             down.data, x, ids, y, m, k, n, e, 1, stream) == 0;
+  // Prefill tiling, as for gate/up (Ds4Enabled): a token's routes go to
+  // distinct experts, so no expert gets more than `tokens` rows, and narrow
+  // tiles fit the ~7 rows per expert. glm53_flash_moe_bench, 256 tokens,
+  // IQ3_XXS: 20.9 -> 11.4 ms (order-only differences, max 1.1e-5).
+  if (!vec)
+    ds4_mmq_set_moe_down_bounds(Ds4TileCols(), static_cast<int>(tokens));
+  const bool ok =
+      down.type == GgmlType::kIQ2_S
+          ? (vec ? ds4_mmq_iq2_s_moe_vec : ds4_mmq_iq2_s_moe)(
+                down.data, x, ids, y, m, k, n, e, 1, stream) == 0
+          : (vec ? ds4_mmq_iq3_xxs_moe_vec : ds4_mmq_iq3_xxs_moe)(
+                down.data, x, ids, y, m, k, n, e, 1, stream) == 0;
+  if (!vec)
+    ds4_mmq_set_moe_down_bounds(0, 0);
+  return ok;
 }
 
 bool Project(const DeviceMatrix& w, const float* x, const std::int32_t* ids,

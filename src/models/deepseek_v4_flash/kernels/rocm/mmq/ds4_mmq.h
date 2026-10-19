@@ -55,6 +55,15 @@ void ds4_mmq_set_routed_max_expert_rows(int rows);
 // order, so results are unchanged.
 void ds4_mmq_set_routed_tile_cols(int cols);
 
+// Launch bounds for ds4_mmq_moe_impl (the *_moe entries, e.g. a routed down
+// projection called with one row per token-route). tile_cols requests a
+// column-tile width as ds4_mmq_set_routed_tile_cols does for gate/up;
+// max_expert_rows bounds the rows any one expert can receive (for routed rows
+// whose tokens pick distinct experts: the token count), which shrinks the grid
+// by empty blocks only. 0 restores the default for either. Global and
+// persistent until changed; callers that do not set it are unaffected.
+void ds4_mmq_set_moe_down_bounds(int tile_cols, int max_expert_rows);
+
 // The width the model above picks for one per-expert assignment-count array.
 // Returns 0 when the counts are unusable, which the setter treats as "default".
 int ds4_mmq_routed_tile_cols_for_counts(const unsigned int *counts,
