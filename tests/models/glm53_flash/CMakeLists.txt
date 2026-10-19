@@ -78,6 +78,7 @@ if (ENGINE_ENABLE_HIP)
   # Prefill WMMA projection (kernels/prefill_gemm.hpp) vs an FP64 CPU product,
   # within the Q8_1 activation-rounding bound.
   add_glm53_flash_test(prefill_gemm gufo_glm53_flash "hip;gpu;gfx1151")
+  set_tests_properties(glm53_flash.prefill_gemm PROPERTIES SKIP_RETURN_CODE 77)
   target_compile_definitions(glm53_flash_generator_gpu_test PRIVATE
     GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
 endif()

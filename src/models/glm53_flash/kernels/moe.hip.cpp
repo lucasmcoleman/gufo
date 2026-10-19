@@ -8,6 +8,7 @@
 #include <limits>
 
 #include <optional>
+#include <type_traits>
 
 #include "ds4_mmq.h"
 #include "ds4_pool.h"
@@ -142,6 +143,10 @@ __global__ void FloatProject(const void* w, bool bf16, const float* x,
 // One wave cooperates on each output row. FP64 partial sums retain the
 // cancellation accuracy of FloatProject while consecutive lanes coalesce
 // weight/input loads and shorten the serial dependency chain.
+// Acc = double is the exact path (decode, GUFO_GLM53_EXACT_PREFILL). Prefill
+// uses float: gfx1151 runs FP64 at a small fraction of the FP32 rate, which
+// made the 4096 x 288 router cost ~4 ms per MoE layer per 256-token pass.
+template <typename Acc>
 __global__ void FloatProjectWave(const void* w, bool bf16, const float* x,
                                  const std::int32_t* ids, float* y,
                                  std::size_t count, std::uint32_t routes,
@@ -158,7 +163,9 @@ __global__ void FloatProjectWave(const void* w, bool bf16, const float* x,
     const auto offset =
         (static_cast<std::size_t>(expert) * rows + i % rows) * cols;
     const float* in = x + (broadcast ? tr / routes : tr) * cols;
-    double sum = 0;
+    // Float: Kahan-compensated per lane (error ~2u, near the double path's
+    // for these lengths), then the lane partials reduce in double.
+    Acc sum = 0, carry = 0;
     for (std::size_t k = lane; k < cols; k += kWave) {
       const float v =
           bf16
@@ -166,12 +173,20 @@ __global__ void FloatProjectWave(const void* w, bool bf16, const float* x,
                                     w)[offset + k]}
                                 << 16)
               : static_cast<const float*>(w)[offset + k];
-      sum += static_cast<double>(v) * in[k];
+      if constexpr (std::is_same_v<Acc, float>) {
+        const float term = fmaf(v, in[k], -carry);
+        const float next = sum + term;
+        carry = (next - sum) - term;
+        sum = next;
+      } else {
+        sum += static_cast<Acc>(v) * in[k];
+      }
     }
+    double total = static_cast<double>(sum) - static_cast<double>(carry);
     for (unsigned delta = kWave / 2; delta; delta /= 2)
-      sum += __shfl_down(sum, delta, kWave);
+      total += __shfl_down(total, delta, kWave);
     if (lane == 0)
-      y[i] = static_cast<float>(sum);
+      y[i] = static_cast<float>(total);
   }
 }
 unsigned Grid(std::size_t n) {
@@ -288,7 +303,9 @@ bool Project(const DeviceMatrix& w, const float* x, const std::int32_t* ids,
     } else {
       const auto grid =
           static_cast<unsigned>(std::min<std::size_t>((n + 7) / 8, 65535));
-      FloatProjectWave<<<grid, 256, 0, stream>>>(
+      (tokens > 8 && !ExactPrefill() ? FloatProjectWave<float>
+                                     : FloatProjectWave<double>)<<<grid, 256, 0,
+                                                                   stream>>>(
           w.data, w.type == GgmlType::kBF16, x, ids, y, n, routes, w.rows,
           w.cols, broadcast);
     }

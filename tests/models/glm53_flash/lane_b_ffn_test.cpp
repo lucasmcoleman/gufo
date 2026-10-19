@@ -280,9 +280,14 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
   const bool q_down = !dense && Ds4Active() &&
                       (type == GgmlType::kIQ2_S || type == GgmlType::kIQ3_XXS);
   const bool q8 = q_gate_up || q_down;
-  // The 6-token chunk pass runs the decode kernels; with Q8_1 rounding its
-  // oracle differs from the full pass whenever that pass is a prefill.
-  const bool chunk_differs = q8 && tokens > 8;
+  // The 6-token chunk pass always runs the decode kernels. Past 8 tokens the
+  // full pass runs the prefill ones (DS4 MMQ, the float-accumulated router),
+  // so bitwise chunk parity only holds up to 8 tokens; past that the chunk
+  // pass is checked against its own oracle with the same strict gates. With
+  // Q8_1 rounding that oracle differs (decode rounding); otherwise it is the
+  // same exact oracle as the full pass.
+  const bool chunk_differs = tokens > 8;
+  const bool chunk_q8_oracle = q8 && chunk_differs;
   const auto routes = config.num_experts_used;
 
   // GPU first: with q_down the oracle rounds the GPU's own down input, so the
@@ -428,7 +433,7 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
                                 hidden, mid, routing, weights.clamp_exp,
                                 output);
     auto* output_chunks = want_chunks.data() + std::size_t(t) * hidden;
-    if (chunk_differs)
+    if (chunk_q8_oracle)
       RoutedFfnQ8(input, gate_up.data(), down.host.data(), hidden, mid,
                   routing, weights.clamp_exp, q_gate_up, q_down, /*vec=*/true,
                   q_down ? act_chunks.data() + row * mid : nullptr,
@@ -439,7 +444,7 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
                                weights.clamp_shexp, shared_y.data());
       for (std::uint32_t d = 0; d < hidden; ++d) {
         output[d] += shared_y[d];
-        if (chunk_differs)
+        if (chunk_q8_oracle)
           output_chunks[d] += shared_y[d];
       }
     }
@@ -447,7 +452,8 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
   for (std::size_t i = 0; i < got.size(); ++i) {
     full.Add("CPU", i, got[i], want[i]);
     if (chunk_differs)
-      chunk.Add("chunk Q8_1", i, chunks[i], want_chunks[i]);
+      chunk.Add("chunk", i, chunks[i],
+                chunk_q8_oracle ? want_chunks[i] : want[i]);
     else
       Require(std::isfinite(chunks[i]), "nonfinite FFN chunk output");
   }

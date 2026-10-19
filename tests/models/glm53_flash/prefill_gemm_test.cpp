@@ -102,6 +102,10 @@ void Case(GgmlType type, std::size_t rows, std::size_t cols,
 }  // namespace
 
 int main() {
+  if (glm::ExactPrefill()) {  // the WMMA path is off by request
+    std::printf("SKIP GUFO_GLM53_EXACT_PREFILL is set\n");
+    return 77;
+  }
   try {
     std::mt19937 rng(682);
     // >= 64 tokens: every GLM type/width. 77 exercises partial token tiles.
