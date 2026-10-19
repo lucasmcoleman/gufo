@@ -42,6 +42,7 @@
 #include "src/models/glm53_flash/config.hpp"
 #include "src/models/glm53_flash/executor.hpp"
 #include "src/models/glm53_flash/kernels/mla.hpp"
+#include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/layer_ops.hpp"
 #include "src/models/glm53_flash/reference.hpp"
 #include "src/models/glm53_flash/reference_mla.hpp"
@@ -54,6 +55,17 @@ namespace ref = gufo::models::glm53_flash::reference;
 namespace {
 
 constexpr double kTol = 1e-5;
+// Default mode runs the approximate prefill paths (kernels/prefill_gemm.hpp:
+// Q8_1 WMMA projections from 64 tokens, fp16 dense attention while every pool
+// is kept). Their outputs depend on how a sequence is chunked, so there the
+// chunking checks compare against the one-call result at these tolerances
+// instead of bitwise; GUFO_GLM53_EXACT_PREFILL=1 (ctest mla_ops_exact) keeps
+// every check exact. kDenseTol covers fp16 attention inputs (measured
+// 1.6e-3 max token rel); kQ8Tol covers Q8_1 activations (prefill_gemm_test
+// measures ~8e-3 rel L2 at these shapes).
+constexpr double kDenseTol = 5e-3;
+constexpr double kQ8Tol = 1.5e-2;
+bool Approx() { return !glm::ExactPrefill(); }
 
 void Hip(hipError_t e, const char* what) {
   if (e != hipSuccess) {
@@ -594,10 +606,14 @@ bool FixtureCheck(Verdict& v) {
       const auto y_dec = seq.Run(x.data, T, {});
       const double r_split = MaxTokenRel(
           y_split, get("sparse.y_split_5_plus_10").data, 32, T, nullptr);
-      v.Check(Same(y_split, y) && Same(y_dec, y) && r_split <= kTol,
-              "fixture sparse: prefill 5+10 and 15 decode steps bit-identical "
-              "to prefill 15; vs HF split rel " +
-                  Sci(r_split));
+      const bool chunks_ok =
+          Approx() ? MaxTokenRel(y_split, y, 32, T, nullptr) <= kDenseTol &&
+                         MaxTokenRel(y_dec, y, 32, T, nullptr) <= kDenseTol
+                   : Same(y_split, y) && Same(y_dec, y);
+      v.Check(chunks_ok && r_split <= (Approx() ? kDenseTol : kTol),
+              std::string("fixture sparse: prefill 5+10 and 15 decode steps ") +
+                  (Approx() ? "within kDenseTol of" : "bit-identical to") +
+                  " prefill 15; vs HF split rel " + Sci(r_split));
     }
   }
   return true;
@@ -713,15 +729,27 @@ void SyntheticCheck(Verdict& v, const std::string& label, const glm::Config& c,
     const auto ys = seq.Run(x, T, split);
     std::uint32_t bad = 0;
     const double rs = MaxTokenRel(ys, y, c.hidden_size, T, &bad);
-    v.Check(Same(ys, y), label + ": " + name + " bit-identical to prefill " +
-                             std::to_string(T) + " (max rel " + Sci(rs) + ")");
+    if (Approx())
+      v.Check(rs <= kDenseTol, label + ": " + name + " vs prefill " +
+                                   std::to_string(T) + " max rel " + Sci(rs) +
+                                   " (<= " + Sci(kDenseTol) + ")");
+    else
+      v.Check(Same(ys, y), label + ": " + name + " bit-identical to prefill " +
+                               std::to_string(T) + " (max rel " + Sci(rs) + ")");
   }
   if (limited_scratch > 0) {
     GpuSeq small(c, w, 0, T + 3, limited_scratch);
     const auto yl = small.Run(x, T, {T});
-    v.Check(Same(yl, y), label + ": one call with scratch for " +
-                             std::to_string(limited_scratch) +
-                             " tokens (internal passes) bit-identical");
+    const double rl = MaxTokenRel(yl, y, c.hidden_size, T, nullptr);
+    if (Approx())
+      v.Check(rl <= kDenseTol, label + ": one call with scratch for " +
+                                   std::to_string(limited_scratch) +
+                                   " tokens (internal passes) max rel " +
+                                   Sci(rl) + " (<= " + Sci(kDenseTol) + ")");
+    else
+      v.Check(Same(yl, y), label + ": one call with scratch for " +
+                               std::to_string(limited_scratch) +
+                               " tokens (internal passes) bit-identical");
   }
 }
 
@@ -854,12 +882,14 @@ void ProjectHeadsCheck(Verdict& v) {
         }
         const double vs_host = RelL2(got.data(), want.data(), yn);
         const double vs_old = RelL2(got.data(), old.data(), yn);
+        // Per-head Project takes the Q8_1 WMMA prefill path from 64 tokens.
+        const double tol_old = Approx() && tokens >= 64 ? kQ8Tol : kTol;
         char line[200];
         std::snprintf(line, sizeof line,
-                      "ProjectHeads Q6_K vs host oracle %.2e, vs per-head GEMM "
-                      "%.2e (<= %.0e): %s",
-                      vs_host, vs_old, kTol, label.c_str());
-        v.Check(vs_host <= kTol && vs_old <= kTol, line);
+                      "ProjectHeads Q6_K vs host oracle %.2e (<= %.0e), vs "
+                      "per-head GEMM %.2e (<= %.1e): %s",
+                      vs_host, kTol, vs_old, tol_old, label.c_str());
+        v.Check(vs_host <= kTol && vs_old <= tol_old, line);
       }
     }
   }
@@ -1004,11 +1034,18 @@ int RunRealGpu(const glm::ModelWeights& weights, const std::string& dir) {
                   "real layer %u: prefill %u max token rel %.3e (token %u); "
                   "prefill %u + %u decode %.3e (decode rows %.3e)",
                   il, T, r, at, kPrefill, kDecode, r_pd, r_dec);
-    v.Check(r <= kTol && r_pd <= kTol, line);
-    v.Check(Same(y, y_pd) && Same(y, y_odd),
-            "real layer " + l +
-                ": prefill 43, 40+3 decode, 7+1+20+decode "
-                "bit-identical");
+    const double tol = Approx() ? kDenseTol : kTol;
+    v.Check(r <= tol && r_pd <= tol, line);
+    if (Approx())
+      v.Check(RelL2(y_pd.data(), y.data(), y.size()) <= kDenseTol &&
+                  RelL2(y_odd.data(), y.data(), y.size()) <= kDenseTol,
+              "real layer " + l +
+                  ": prefill 43, 40+3 decode, 7+1+20+decode within kDenseTol");
+    else
+      v.Check(Same(y, y_pd) && Same(y, y_odd),
+              "real layer " + l +
+                  ": prefill 43, 40+3 decode, 7+1+20+decode "
+                  "bit-identical");
     bool full = true;
     for (std::uint32_t t = 0; t < T; ++t) {
       std::vector<std::int32_t> all(t + 1);

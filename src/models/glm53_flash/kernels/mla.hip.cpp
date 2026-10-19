@@ -6,7 +6,6 @@
 // sqrt(qk_dim)) over the indexer's selection (top pools + raw tail, causal),
 // v_b per head, then attn_output. Layouts are in kernels/mla.hpp.
 
-#include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/kernels/mla.hpp"
 
 #include <hip/hip_fp16.h>
@@ -16,11 +15,16 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <string_view>
 #include <type_traits>
 
+#include <hipblas/hipblas.h>
+
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/models/glm53_flash/executor.hpp"
+#include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/layer_ops.hpp"
 #include "src/models/glm53_flash/profile.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -325,6 +329,140 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+/// Dense prefill attention (DenseLatentAttention): row i = h * n + t of
+/// S [heads * n][r_len] holds token t's scaled scores against latent rows
+/// 0..r_len-1; P (fp16, same shape) gets the softmax over its causal rows
+/// 0..pos0 + t and 0 past them, so the P x latent GEMM sees only those rows.
+__global__ void __launch_bounds__(kThreads)
+    CausalSoftmaxKernel(const float* s, __half* p, std::uint32_t n,
+                        std::uint32_t r_len, std::uint32_t pos0) {
+  __shared__ float red[kThreads];
+  const std::size_t i = blockIdx.x;
+  const std::uint32_t valid = pos0 + static_cast<std::uint32_t>(i % n) + 1;
+  const float* row = s + (i * r_len);
+  __half* out = p + (i * r_len);
+  float m = -INFINITY;
+  for (std::uint32_t j = threadIdx.x; j < valid; j += blockDim.x) {
+    m = fmaxf(m, row[j]);
+  }
+  m = BlockReduce<true>(m, red);
+  float sum = 0.0F;
+  for (std::uint32_t j = threadIdx.x; j < valid; j += blockDim.x) {
+    sum += expf(row[j] - m);
+  }
+  const float inv = 1.0F / BlockReduce<false>(sum, red);
+  for (std::uint32_t j = threadIdx.x; j < r_len; j += blockDim.x) {
+    out[j] = __float2half(j < valid ? expf(row[j] - m) * inv : 0.0F);
+  }
+}
+
+/// y = fp16(x * scale), x and y [count].
+__global__ void ToHalfKernel(const float* x, __half* y, std::size_t count,
+                             float scale) {
+  for (std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+       i < count; i += std::size_t{gridDim.x} * blockDim.x) {
+    y[i] = __float2half(x[i] * scale);
+  }
+}
+
+hipblasHandle_t Blas() {
+  static const hipblasHandle_t handle = [] {
+    hipblasHandle_t h = nullptr;
+    return hipblasCreate(&h) == HIPBLAS_STATUS_SUCCESS ? h : nullptr;
+  }();
+  return handle;
+}
+
+/// Grow-only scratch for the dense path: scores F32 [m][r], then fp16 P
+/// [m][r], Q [m][L] and latent [r][L]. Managed (coarse grain): hipMalloc
+/// stalls on gfx1151 once the model is resident. One stream, so growing
+/// after a synchronize cannot race a GEMM still using the old buffer.
+void* DenseScratch(std::size_t bytes, hipStream_t stream) {
+  static void* buffer = nullptr;
+  static std::size_t capacity = 0;
+  if (bytes > capacity) {
+    if (hipStreamSynchronize(stream) != hipSuccess)
+      return nullptr;
+    if (buffer)
+      (void)hipFree(buffer);
+    buffer = nullptr;
+    capacity = 0;
+    if (::gufo::hip::AllocateManaged(&buffer, bytes) != hipSuccess)
+      return nullptr;
+    capacity = bytes;
+  }
+  return buffer;
+}
+
+/// Prefill latent attention as two fp16 GEMMs with F32 accumulation, when
+/// every token attends to all of its causal rows, which holds while the
+/// indexer keeps every pool (SelectKernel: pools <= budget selects
+/// 0..pools-1, plus the raw tail):
+///   S = (scale Q) L^T   (Q = qabs [heads * n][L], L = latent rows 0..R-1)
+///   P = causal softmax of S (CausalSoftmaxKernel, fp16 out)
+///   ctx = P L           ([heads][n][L], as LatentAttentionKernel writes it)
+/// All heads share the latent rows, so the GEMMs read them as one dense
+/// matrix instead of once per (token, 4 heads) like LatentAttentionKernel.
+/// The scale is folded into Q before the fp16 cast to keep it in range; Q,
+/// latent and P are rounded to fp16, products accumulate in F32. False
+/// (nothing written) if the BLAS handle or scratch is unavailable.
+bool DenseLatentAttention(const float* qabs, const float* latent, float* ctx,
+                          std::uint32_t heads, std::uint32_t n,
+                          std::uint32_t pos0, std::uint32_t L, float scale,
+                          Stream stream) {
+  const hipblasHandle_t h = Blas();
+  if (h == nullptr) {
+    return false;
+  }
+  const std::uint32_t r = pos0 + n;
+  const std::size_t m = std::size_t{heads} * n;
+  if (m > 0x7fffffffU || r > 0x7fffffffU) {
+    return false;
+  }
+  const auto align = [](std::size_t b) { return (b + 255) & ~std::size_t{255}; };
+  const std::size_t s_bytes = align(m * r * sizeof(float));
+  const std::size_t p_bytes = align(m * r * sizeof(__half));
+  const std::size_t q_bytes = align(m * L * sizeof(__half));
+  const std::size_t l_bytes = align(std::size_t{r} * L * sizeof(__half));
+  auto* base = static_cast<std::uint8_t*>(
+      DenseScratch(s_bytes + p_bytes + q_bytes + l_bytes, stream));
+  if (base == nullptr || hipblasSetStream(h, stream) != HIPBLAS_STATUS_SUCCESS) {
+    return false;
+  }
+  auto* scores = reinterpret_cast<float*>(base);
+  auto* p16 = reinterpret_cast<__half*>(base + s_bytes);
+  auto* q16 = reinterpret_cast<__half*>(base + s_bytes + p_bytes);
+  auto* l16 = reinterpret_cast<__half*>(base + s_bytes + p_bytes + q_bytes);
+  const auto grid = [](std::size_t count) {
+    return static_cast<unsigned>(std::min<std::size_t>((count + 255) / 256, 65535));
+  };
+  ToHalfKernel<<<grid(m * L), 256, 0, stream>>>(qabs, q16, m * L, scale);
+  ToHalfKernel<<<grid(std::size_t{r} * L), 256, 0, stream>>>(
+      latent, l16, std::size_t{r} * L, 1.0F);
+  const float zero = 0.0F, one = 1.0F;
+  const int mi = static_cast<int>(m), ri = static_cast<int>(r),
+            li = static_cast<int>(L);
+  // Row-major S[m][r] = Q[m][L] latent[r][L]^T is column-major
+  // S^T (r x m) = latent (op T of the L x r column-major view) Q^T (L x m).
+  if (hipblasGemmEx(h, HIPBLAS_OP_T, HIPBLAS_OP_N, ri, mi, li, &one, l16,
+                    HIP_R_16F, li, q16, HIP_R_16F, li, &zero, scores, HIP_R_32F,
+                    ri, HIPBLAS_COMPUTE_32F,
+                    HIPBLAS_GEMM_DEFAULT) != HIPBLAS_STATUS_SUCCESS) {
+    return false;
+  }
+  CausalSoftmaxKernel<<<static_cast<unsigned>(m), kThreads, 0, stream>>>(
+      scores, p16, n, r, pos0);
+  // Row-major ctx[m][L] = P[m][r] latent[r][L] is column-major
+  // ctx^T (L x m) = latent^T (L x r) P^T (r x m).
+  if (hipblasGemmEx(h, HIPBLAS_OP_N, HIPBLAS_OP_N, li, mi, ri, &one, l16,
+                    HIP_R_16F, li, p16, HIP_R_16F, ri, &zero, ctx, HIP_R_32F,
+                    li, HIPBLAS_COMPUTE_32F,
+                    HIPBLAS_GEMM_DEFAULT) != HIPBLAS_STATUS_SUCCESS) {
+    return false;
+  }
+  return hipGetLastError() == hipSuccess;
+}
+
 std::uint32_t SelectionRows(const Config& c) {
   return (c.IndexerPoolBudget() * c.indexer_kpool) + c.indexer_kpool - 1;
 }
@@ -494,7 +632,16 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   const std::size_t lds = AttentionLds(c, g);
   const std::uint32_t kpool = c.indexer_kpool;
   const std::uint32_t budget = c.IndexerPoolBudget();
-  if (g == 4) {
+  // Prefill while every token still sees all its rows: two SGEMMs.
+  static const bool dense_enabled = [] {
+    const char* v = std::getenv("GUFO_GLM53_MLA_DENSE");
+    return !(v && *v == '0');
+  }();
+  const bool dense = dense_enabled && n > 8 && !ExactPrefill() && kpool > 0 &&
+                     (pos0 + n) / kpool <= budget;
+  if (dense && DenseLatentAttention(s.qabs, cache.latent, s.ctx, heads, n,
+                                    pos0, L, scale, stream)) {
+  } else if (g == 4) {
     LatentAttentionKernel<4>
         <<<grid, kThreads, lds, stream>>>(s.qabs, cache.latent, s.sel, s.ctx, n,
                                           pos0, L, kpool, budget, smax, scale);

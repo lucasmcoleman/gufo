@@ -33,7 +33,11 @@ namespace glm = gufo::models::glm53_flash;
 
 namespace {
 
-constexpr std::size_t kT = 256;
+// Sequence length: 256 (the V6 set), or KL_T for longer-context checks.
+const std::size_t kT = [] {
+  const char* v = std::getenv("KL_T");
+  return v && *v ? static_cast<std::size_t>(std::atoll(v)) : std::size_t{256};
+}();
 
 double Now() {
   return std::chrono::duration<double>(
