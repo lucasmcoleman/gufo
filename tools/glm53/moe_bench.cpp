@@ -168,6 +168,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "pair_raw_vec failed\n"); std::exit(1); }
     });
     {
+      // Fixed per-call cost: same call with M=32 rows (same expert stride
+      // math reads a prefix of the weight buffer), where row work is ~1/64.
+      for (int m : {32, 256, 1024, M}) {
+        const float ms_m = time([&] {
+          if (ds4_mmq_iq2_xxs_moe_vec(wg, (const float*)x, (const int32_t*)ids, (float*)ga, m, K, 1,
+                                      E, used, s) != 0) std::exit(1);
+        });
+        std::printf("decode one moe_vec M=%d: %.4f ms\n", m, ms_m);
+      }
+    }
+    {
       // Host enqueue cost per call (no sync inside the loop): if this is close
       // to the GPU time, decode is launch-bound rather than kernel-bound.
       Check(hipStreamSynchronize(s), "sync");
@@ -245,7 +256,7 @@ int main(int argc, char** argv) {
     }
     std::printf("down %s rows=%d\n%-6s %-6s %9s\n", down_type == 0 ? "IQ3_XXS" : "IQ2_S", R, "width", "bound", "ms");
     for (int bound = 0; bound < 2; ++bound)
-      for (int width : {0, 16, 32, 48, 64}) {
+      for (int width : {0, 8, 12, 16, 20, 24, 32}) {
         ds4_mmq_set_moe_down_bounds(width, bound ? T : 0);
         down(yd);
         Check(hipStreamSynchronize(s), "warm");
