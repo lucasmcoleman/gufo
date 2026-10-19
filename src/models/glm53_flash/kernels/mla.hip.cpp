@@ -16,6 +16,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <type_traits>
@@ -365,33 +367,21 @@ __global__ void ToHalfKernel(const float* x, __half* y, std::size_t count,
   }
 }
 
-hipblasHandle_t Blas() {
-  static const hipblasHandle_t handle = [] {
+/// One hipBLAS handle per stream: hipblasSetStream changes handle state, so
+/// a shared handle would race between streams. Null if creation fails.
+hipblasHandle_t Blas(hipStream_t stream) {
+  static std::mutex mutex;
+  static std::map<hipStream_t, hipblasHandle_t> handles;
+  const std::lock_guard<std::mutex> lock(mutex);
+  auto it = handles.find(stream);
+  if (it == handles.end()) {
     hipblasHandle_t h = nullptr;
-    return hipblasCreate(&h) == HIPBLAS_STATUS_SUCCESS ? h : nullptr;
-  }();
-  return handle;
-}
-
-/// Grow-only scratch for the dense path: scores F32 [m][r], then fp16 P
-/// [m][r], Q [m][L] and latent [r][L]. Managed (coarse grain): hipMalloc
-/// stalls on gfx1151 once the model is resident. One stream, so growing
-/// after a synchronize cannot race a GEMM still using the old buffer.
-void* DenseScratch(std::size_t bytes, hipStream_t stream) {
-  static void* buffer = nullptr;
-  static std::size_t capacity = 0;
-  if (bytes > capacity) {
-    if (hipStreamSynchronize(stream) != hipSuccess)
+    if (hipblasCreate(&h) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasSetStream(h, stream) != HIPBLAS_STATUS_SUCCESS)
       return nullptr;
-    if (buffer)
-      (void)hipFree(buffer);
-    buffer = nullptr;
-    capacity = 0;
-    if (::gufo::hip::AllocateManaged(&buffer, bytes) != hipSuccess)
-      return nullptr;
-    capacity = bytes;
+    it = handles.emplace(stream, h).first;
   }
-  return buffer;
+  return it->second;
 }
 
 /// Prefill latent attention as two fp16 GEMMs with F32 accumulation, when
@@ -410,7 +400,7 @@ bool DenseLatentAttention(const float* qabs, const float* latent, float* ctx,
                           std::uint32_t heads, std::uint32_t n,
                           std::uint32_t pos0, std::uint32_t L, float scale,
                           Stream stream) {
-  const hipblasHandle_t h = Blas();
+  const hipblasHandle_t h = Blas(stream);
   if (h == nullptr) {
     return false;
   }
@@ -424,9 +414,9 @@ bool DenseLatentAttention(const float* qabs, const float* latent, float* ctx,
   const std::size_t p_bytes = align(m * r * sizeof(__half));
   const std::size_t q_bytes = align(m * L * sizeof(__half));
   const std::size_t l_bytes = align(std::size_t{r} * L * sizeof(__half));
-  auto* base = static_cast<std::uint8_t*>(
-      DenseScratch(s_bytes + p_bytes + q_bytes + l_bytes, stream));
-  if (base == nullptr || hipblasSetStream(h, stream) != HIPBLAS_STATUS_SUCCESS) {
+  auto* base = static_cast<std::uint8_t*>(StreamScratch(
+      kScratchDenseAttention, s_bytes + p_bytes + q_bytes + l_bytes, stream));
+  if (base == nullptr) {
     return false;
   }
   auto* scores = reinterpret_cast<float*>(base);

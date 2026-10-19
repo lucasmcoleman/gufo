@@ -174,6 +174,10 @@ __global__ void FloatProjectWave(const void* w, bool bf16, const float* x,
                                 << 16)
               : static_cast<const float*>(w)[offset + k];
       if constexpr (std::is_same_v<Acc, float>) {
+        // This library builds with -ffast-math, whose reassociation folds
+        // the compensation to carry = term - term (codexms #690). Keep the
+        // Kahan update exactly as written.
+#pragma clang fp reassociate(off) contract(off)
         const float term = fmaf(v, in[k], -carry);
         const float next = sum + term;
         carry = (next - sum) - term;

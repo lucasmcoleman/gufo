@@ -66,6 +66,11 @@ constexpr double kTol = 1e-5;
 constexpr double kDenseTol = 5e-3;
 constexpr double kQ8Tol = 1.5e-2;
 bool Approx() { return !glm::ExactPrefill(); }
+// The tolerance-only checks pair with this: MaxTokenRel's reductions can drop
+// a NaN row (max(NaN, 0) == 0), so nonfinite outputs are rejected first.
+bool AllFinite(const std::vector<float>& v) {
+  return std::all_of(v.begin(), v.end(), [](float f) { return std::isfinite(f); });
+}
 
 void Hip(hipError_t e, const char* what) {
   if (e != hipSuccess) {
@@ -607,7 +612,8 @@ bool FixtureCheck(Verdict& v) {
       const double r_split = MaxTokenRel(
           y_split, get("sparse.y_split_5_plus_10").data, 32, T, nullptr);
       const bool chunks_ok =
-          Approx() ? MaxTokenRel(y_split, y, 32, T, nullptr) <= kDenseTol &&
+          Approx() ? AllFinite(y_split) && AllFinite(y_dec) &&
+                         MaxTokenRel(y_split, y, 32, T, nullptr) <= kDenseTol &&
                          MaxTokenRel(y_dec, y, 32, T, nullptr) <= kDenseTol
                    : Same(y_split, y) && Same(y_dec, y);
       v.Check(chunks_ok && r_split <= (Approx() ? kDenseTol : kTol),
@@ -730,7 +736,7 @@ void SyntheticCheck(Verdict& v, const std::string& label, const glm::Config& c,
     std::uint32_t bad = 0;
     const double rs = MaxTokenRel(ys, y, c.hidden_size, T, &bad);
     if (Approx())
-      v.Check(rs <= kDenseTol, label + ": " + name + " vs prefill " +
+      v.Check(AllFinite(ys) && rs <= kDenseTol, label + ": " + name + " vs prefill " +
                                    std::to_string(T) + " max rel " + Sci(rs) +
                                    " (<= " + Sci(kDenseTol) + ")");
     else
@@ -742,7 +748,7 @@ void SyntheticCheck(Verdict& v, const std::string& label, const glm::Config& c,
     const auto yl = small.Run(x, T, {T});
     const double rl = MaxTokenRel(yl, y, c.hidden_size, T, nullptr);
     if (Approx())
-      v.Check(rl <= kDenseTol, label + ": one call with scratch for " +
+      v.Check(AllFinite(yl) && rl <= kDenseTol, label + ": one call with scratch for " +
                                    std::to_string(limited_scratch) +
                                    " tokens (internal passes) max rel " +
                                    Sci(rl) + " (<= " + Sci(kDenseTol) + ")");
@@ -1037,7 +1043,8 @@ int RunRealGpu(const glm::ModelWeights& weights, const std::string& dir) {
     const double tol = Approx() ? kDenseTol : kTol;
     v.Check(r <= tol && r_pd <= tol, line);
     if (Approx())
-      v.Check(RelL2(y_pd.data(), y.data(), y.size()) <= kDenseTol &&
+      v.Check(AllFinite(y_pd) && AllFinite(y_odd) &&
+                  RelL2(y_pd.data(), y.data(), y.size()) <= kDenseTol &&
                   RelL2(y_odd.data(), y.data(), y.size()) <= kDenseTol,
               "real layer " + l +
                   ": prefill 43, 40+3 decode, 7+1+20+decode within kDenseTol");

@@ -11,8 +11,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <utility>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace gufo::models::glm53_flash {
@@ -25,24 +29,40 @@ inline bool ExactPrefill() {
   return exact;
 }
 
-/// Grow-only device buffer for the Q8_1 activations. GLM runs one stream, so
-/// growing after a synchronize cannot race an earlier GEMM still reading it.
-inline void* PrefillQ8Scratch(std::size_t bytes, hipStream_t stream) {
-  static void* buffer = nullptr;
-  static std::size_t capacity = 0;
-  if (bytes > capacity) {
+/// Grow-only scratch owned by one stream. Buffers are keyed by (tag, stream),
+/// so operators on different streams never share one, and growth only waits
+/// for the owning stream (whose earlier work is the only user of the old
+/// buffer). Managed coarse-grain memory: hipMalloc stalls on gfx1151 once a
+/// large model is resident. A stream handle reused after its stream was
+/// destroyed inherits that stream's buffer, so destroy streams only after
+/// their work has finished (hipStreamDestroy's own requirement).
+inline void* StreamScratch(int tag, std::size_t bytes, hipStream_t stream) {
+  struct Buffer {
+    void* data = nullptr;
+    std::size_t capacity = 0;
+  };
+  static std::mutex mutex;
+  static std::map<std::pair<int, hipStream_t>, Buffer> buffers;
+  const std::lock_guard<std::mutex> lock(mutex);
+  Buffer& b = buffers[{tag, stream}];
+  if (bytes > b.capacity) {
     if (hipStreamSynchronize(stream) != hipSuccess)
       return nullptr;
-    if (buffer)
-      (void)hipFree(buffer);
-    buffer = nullptr;
-    capacity = 0;
-    if (hipMalloc(&buffer, bytes) != hipSuccess)
+    if (b.data)
+      (void)hipFree(b.data);
+    b = {};
+    if (::gufo::hip::AllocateManaged(&b.data, bytes) != hipSuccess) {
+      b = {};
       return nullptr;
-    capacity = bytes;
+    }
+    b.capacity = bytes;
   }
-  return buffer;
+  return b.data;
 }
+
+/// Scratch tags for StreamScratch.
+inline constexpr int kScratchPrefillQ8 = 0;
+inline constexpr int kScratchDenseAttention = 1;
 
 /// Y[tokens, rows] = X[tokens, cols] W^T through the prefill WMMA path when it
 /// applies; returns false (nothing launched) when the caller should use its
@@ -62,8 +82,9 @@ inline bool PrefillQuantGemm(core::GgmlType type, const void* w,
       (type != core::GgmlType::kQ8_0 && type != core::GgmlType::kQ6_K) ||
       !(tokens >= 64 || (tokens >= 24 && elements >= (std::size_t{8} << 20))))
     return false;
-  void* q8 = PrefillQ8Scratch(
-      ::gufo::hip::QuantizedActivationBytes(tokens, cols), stream);
+  void* q8 = StreamScratch(
+      kScratchPrefillQ8, ::gufo::hip::QuantizedActivationBytes(tokens, cols),
+      stream);
   if (!q8)
     return false;
   ::gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(x, q8, tokens, cols,
