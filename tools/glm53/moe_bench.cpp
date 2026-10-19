@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -166,6 +167,22 @@ int main(int argc, char** argv) {
                                            (float*)ub, M, K, 1, E, used, s) != 0) {
         std::fprintf(stderr, "pair_raw_vec failed\n"); std::exit(1); }
     });
+    {
+      // Host enqueue cost per call (no sync inside the loop): if this is close
+      // to the GPU time, decode is launch-bound rather than kernel-bound.
+      Check(hipStreamSynchronize(s), "sync");
+      const int n = 200;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < n; ++i)
+        if (ds4_mmq_iq2_xxs_moe_vec(wg, (const float*)x, (const int32_t*)ids, (float*)ga, M, K, 1,
+                                    E, used, s) != 0) std::exit(1);
+      const auto t1 = std::chrono::steady_clock::now();
+      Check(hipStreamSynchronize(s), "sync");
+      const auto t2 = std::chrono::steady_clock::now();
+      std::printf("decode one moe_vec: host enqueue %.4f ms/call, enqueue+drain %.4f ms/call\n",
+                  std::chrono::duration<double, std::milli>(t1 - t0).count() / n,
+                  std::chrono::duration<double, std::milli>(t2 - t0).count() / n);
+    }
     std::vector<float> a(o1 / 4), b(o1 / 4), c(o1 / 4), dd(o1 / 4);
     Check(hipMemcpy(a.data(), ga, o1, hipMemcpyDeviceToHost), "a");
     Check(hipMemcpy(b.data(), gb, o1, hipMemcpyDeviceToHost), "b");
@@ -210,6 +227,22 @@ int main(int argc, char** argv) {
     Check(hipStreamSynchronize(s), "down ref");
     std::vector<float> rd(dout / 4), gd(dout / 4);
     Check(hipMemcpy(rd.data(), yr, dout, hipMemcpyDeviceToHost), "rd");
+    {
+      // Decode down (1 token, 8 routes flattened to 8 rows of 1 route), as
+      // Ds4Down calls it for tokens <= 8.
+      auto vdown = [&] {
+        const int rc = down_type == 0
+            ? ds4_mmq_iq3_xxs_moe_vec(wd, (const float*)xd, (const int32_t*)ids, (float*)yd, DM, DK, used, E, 1, s)
+            : ds4_mmq_iq2_s_moe_vec(wd, (const float*)xd, (const int32_t*)ids, (float*)yd, DM, DK, used, E, 1, s);
+        if (rc != 0) { std::fprintf(stderr, "vec down failed\n"); std::exit(1); }
+      };
+      vdown(); Check(hipStreamSynchronize(s), "warm");
+      Check(hipEventRecord(e0, s), "rec");
+      for (int i = 0; i < reps * 20; ++i) vdown();
+      Check(hipEventRecord(e1, s), "rec"); Check(hipEventSynchronize(e1), "sync");
+      float ms = 0; Check(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+      std::printf("decode down %s (1 token, 8 routes): %.4f ms\n", down_type == 0 ? "IQ3_XXS" : "IQ2_S", ms / (reps * 20));
+    }
     std::printf("down %s rows=%d\n%-6s %-6s %9s\n", down_type == 0 ? "IQ3_XXS" : "IQ2_S", R, "width", "bound", "ms");
     for (int bound = 0; bound < 2; ++bound)
       for (int width : {0, 16, 32, 48, 64}) {
