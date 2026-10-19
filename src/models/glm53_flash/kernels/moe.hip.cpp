@@ -12,6 +12,7 @@
 #include "ds4_mmq.h"
 #include "ds4_pool.h"
 #include "src/models/glm53_flash/kernels/mmq/iq.hpp"
+#include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/profile.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
@@ -262,7 +263,11 @@ bool Project(const DeviceMatrix& w, const float* x, const std::int32_t* ids,
           w.data, w.type == GgmlType::kBF16, x, ids, y, n, routes, w.rows,
           w.cols, broadcast);
     }
-  } else {
+  } else if (ids || routes != 1 || w.experts != 1 ||
+             !PrefillQuantGemm(w.type, w.data, x, y, tokens, w.rows, w.cols,
+                               stream)) {
+    // Dense and shared-expert projections take the prefill WMMA path when it
+    // applies (prefill_gemm.hpp); everything else stays on the exact path.
     ::gufo::hip::LaunchBatchedQuantGEMMFp32(w.type, w.data, x, y, tokens,
                                             w.rows, w.cols, stream);
   }
