@@ -20,6 +20,16 @@
 #include "src/models/deepseek_v4_flash/kernels/rocm/mmq/ds4_pool.h"
 
 namespace {
+// MOE_BENCH_MANAGED=1: weights in coarse-grain managed memory, as GLM's
+// executor allocates them (gufo::hip::AllocateManaged), instead of hipMalloc.
+hipError_t WeightAlloc(void** p, std::size_t bytes) {
+  const char* v = std::getenv("MOE_BENCH_MANAGED");
+  if (!(v && *v == '1')) return hipMalloc(p, bytes);
+  const hipError_t e = hipMallocManaged(p, bytes, hipMemAttachGlobal);
+  if (e == hipSuccess && hipMemAdvise(*p, bytes, hipMemAdviseSetCoarseGrain, 0) != hipSuccess)
+    (void)hipGetLastError();
+  return e;
+}
 void Check(hipError_t e, const char* what) {
   if (e != hipSuccess) {
     std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e));
@@ -42,8 +52,8 @@ int main(int argc, char** argv) {
     std::memcpy(host.data() + o, &scale, 2);
   }
   void *wg, *wu, *x, *ids, *ga, *ua, *gb, *ub;
-  Check(hipMalloc(&wg, matrix), "wg");
-  Check(hipMalloc(&wu, matrix), "wu");
+  Check(WeightAlloc(&wg, matrix), "wg");
+  Check(WeightAlloc(&wu, matrix), "wu");
   Check(hipMemcpy(wg, host.data(), matrix, hipMemcpyHostToDevice), "wg copy");
   for (auto& v : host) v ^= 0x5a;
   Check(hipMemcpy(wu, host.data(), matrix, hipMemcpyHostToDevice), "wu copy");
@@ -168,9 +178,10 @@ int main(int argc, char** argv) {
 
   // Down: [288][4096][2048] IQ3_XXS, one row per token-route (n_expert_used 1),
   // as Ds4Down calls it.
-  {
+  for (int down_type = 0; down_type < 2; ++down_type) {
     constexpr int DM = 4096, DK = 2048;
-    constexpr std::size_t dblock = 98;  // IQ3_XXS: fp16 d + 96 bytes per 256
+    // IQ3_XXS: fp16 d + 96 bytes per 256; IQ2_S: d + 64 qs + 8 qh + 8 scales.
+    const std::size_t dblock = down_type == 0 ? 98 : 82;
     const std::size_t dmat = std::size_t{E} * DM * (DK / 256) * dblock;
     std::vector<std::uint8_t> dh(dmat);
     for (auto& v : dh) v = static_cast<std::uint8_t>(rng());
@@ -180,7 +191,7 @@ int main(int argc, char** argv) {
     }
     void *wd, *xd, *yd, *yr;
     const int R = T * used;
-    Check(hipMalloc(&wd, dmat), "wd");
+    Check(WeightAlloc(&wd, dmat), "wd");
     Check(hipMemcpy(wd, dh.data(), dmat, hipMemcpyHostToDevice), "wd copy");
     std::vector<float> hxd(std::size_t{R} * DK);
     for (auto& v : hxd) v = d(rng);
@@ -189,15 +200,17 @@ int main(int argc, char** argv) {
     const std::size_t dout = std::size_t{R} * DM * 4;
     Check(hipMalloc(&yd, dout), "yd"); Check(hipMalloc(&yr, dout), "yr");
     auto down = [&](void* y) {
-      if (ds4_mmq_iq3_xxs_moe(wd, (const float*)xd, (const int32_t*)ids, (float*)y, DM, DK, R,
-                              E, 1, s) != 0) { std::fprintf(stderr, "down failed\n"); std::exit(1); }
+      const int rc = down_type == 0
+          ? ds4_mmq_iq3_xxs_moe(wd, (const float*)xd, (const int32_t*)ids, (float*)y, DM, DK, R, E, 1, s)
+          : ds4_mmq_iq2_s_moe(wd, (const float*)xd, (const int32_t*)ids, (float*)y, DM, DK, R, E, 1, s);
+      if (rc != 0) { std::fprintf(stderr, "down failed\n"); std::exit(1); }
     };
     ds4_mmq_set_moe_down_bounds(0, 0);
     down(yr);
     Check(hipStreamSynchronize(s), "down ref");
     std::vector<float> rd(dout / 4), gd(dout / 4);
     Check(hipMemcpy(rd.data(), yr, dout, hipMemcpyDeviceToHost), "rd");
-    std::printf("down IQ3_XXS rows=%d\n%-6s %-6s %9s\n", R, "width", "bound", "ms");
+    std::printf("down %s rows=%d\n%-6s %-6s %9s\n", down_type == 0 ? "IQ3_XXS" : "IQ2_S", R, "width", "bound", "ms");
     for (int bound = 0; bound < 2; ++bound)
       for (int width : {0, 16, 32, 48, 64}) {
         ds4_mmq_set_moe_down_bounds(width, bound ? T : 0);
@@ -218,6 +231,7 @@ int main(int argc, char** argv) {
         std::printf("%-6d %-6d %9.3f max|delta|=%.3g max|ref|=%.3g\n", width, bound, ms / reps, md, mr);
       }
     ds4_mmq_set_moe_down_bounds(0, 0);
+    (void)hipFree(wd); (void)hipFree(xd); (void)hipFree(yd); (void)hipFree(yr);
   }
   return 0;
 }

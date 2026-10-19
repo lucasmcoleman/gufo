@@ -162,6 +162,7 @@ int main(int argc, char** argv) {
       std::cout << "[" << s + 1 << "/" << n_seq << "] " << Now() - t0 << " s\n"
                 << std::flush;
     }
+    exec->PrintProfile(std::cout);  // GUFO_GLM53_PROFILE=1 only
     return 0;
   } catch (const std::exception& e) {
     std::cout << "FAIL: " << e.what() << "\n";
