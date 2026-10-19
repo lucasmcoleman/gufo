@@ -19,6 +19,7 @@
 
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/glm53_flash/kernels/moe.hpp"
+#include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/layer_ops.hpp"
 #include "src/models/glm53_flash/reference_moe.hpp"
 
@@ -281,12 +282,12 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
                       (type == GgmlType::kIQ2_S || type == GgmlType::kIQ3_XXS);
   const bool q8 = q_gate_up || q_down;
   // The 6-token chunk pass always runs the decode kernels. Past 8 tokens the
-  // full pass runs the prefill ones (DS4 MMQ, the float-accumulated router),
-  // so bitwise chunk parity only holds up to 8 tokens; past that the chunk
-  // pass is checked against its own oracle with the same strict gates. With
-  // Q8_1 rounding that oracle differs (decode rounding); otherwise it is the
-  // same exact oracle as the full pass.
-  const bool chunk_differs = tokens > 8;
+  // full pass runs the prefill ones: DS4 MMQ (Q8_1 cases, in any mode) and,
+  // unless GUFO_GLM53_EXACT_PREFILL is set, the float-accumulated router. Only
+  // then may the two differ; the chunk pass is checked against its own oracle
+  // with the same strict gates (the decode-rounding one for Q8_1 cases, else
+  // the full pass's exact oracle). Otherwise bitwise chunk parity is required.
+  const bool chunk_differs = tokens > 8 && (q8 || !glm::ExactPrefill());
   const bool chunk_q8_oracle = q8 && chunk_differs;
   const auto routes = config.num_experts_used;
 
