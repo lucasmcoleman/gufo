@@ -7,9 +7,12 @@
 #include <cstdlib>
 #include <limits>
 
+#include <optional>
+
 #include "ds4_mmq.h"
 #include "ds4_pool.h"
 #include "src/models/glm53_flash/kernels/mmq/iq.hpp"
+#include "src/models/glm53_flash/profile.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace gufo::models::glm53_flash {
@@ -332,6 +335,100 @@ __global__ void Route(const float* logits, const float* bias, float* probs,
     weights[s] = norm[s] * scale;
   }
 }
+// Route, one block per token: the same scores (sigmoid + bias in F32), the
+// same selection rule (strictly greater wins, so a tie goes to the lower
+// expert index) and the same sum order, so it is bit-identical to Route. The
+// one-thread-per-token Route spent ~0.5 ms per MoE layer in decode looping
+// used x experts serially. Shared memory: experts scores + selected flags.
+constexpr std::uint32_t kRouteThreads = 256;
+constexpr std::uint32_t kRouteBlockMaxExperts = 4096;
+__global__ void __launch_bounds__(kRouteThreads)
+    RouteBlock(const float* logits, const float* bias, float* probs,
+               std::int32_t* ids, float* weights, float* raw, float* norm,
+               std::uint32_t experts, std::uint32_t used, float scale,
+               bool normalize) {
+  extern __shared__ float route_shared[];
+  float* score = route_shared;
+  auto* taken = reinterpret_cast<unsigned char*>(score + experts);
+  __shared__ float best_score[kRouteThreads];
+  __shared__ std::int32_t best_id[kRouteThreads];
+  __shared__ int nonfinite;
+  const auto t = std::size_t{blockIdx.x};
+  const unsigned tid = threadIdx.x;
+  probs += t * experts;
+  logits += t * experts;
+  ids += t * used;
+  weights += t * used;
+  raw += t * used;
+  norm += t * used;
+  if (tid == 0)
+    nonfinite = 0;
+  __syncthreads();
+  for (std::uint32_t e = tid; e < experts; e += kRouteThreads)
+    if (!isfinite(logits[e]) || (bias && !isfinite(bias[e])))
+      nonfinite = 1;
+  __syncthreads();
+  if (nonfinite) {
+    for (std::uint32_t e = tid; e < experts; e += kRouteThreads)
+      probs[e] = NAN;
+    for (std::uint32_t s = tid; s < used; s += kRouteThreads) {
+      ids[s] = s;
+      weights[s] = raw[s] = norm[s] = NAN;
+    }
+    return;
+  }
+  for (std::uint32_t e = tid; e < experts; e += kRouteThreads) {
+    const float p = Sigmoid(logits[e]);
+    probs[e] = p;
+    score[e] = p + (bias ? bias[e] : 0);
+    taken[e] = 0;
+  }
+  __syncthreads();
+  for (std::uint32_t s = 0; s < used; ++s) {
+    // Each thread scans its experts in ascending order with strict >, so
+    // its candidate is its lowest-index maximum; the tree then prefers the
+    // higher score and, on equal scores, the lower index.
+    std::int32_t best = -1;
+    float best_value = -INFINITY;
+    for (std::uint32_t e = tid; e < experts; e += kRouteThreads)
+      if (!taken[e] && (best < 0 || score[e] > best_value)) {
+        best = static_cast<std::int32_t>(e);
+        best_value = score[e];
+      }
+    best_id[tid] = best;
+    best_score[tid] = best_value;
+    __syncthreads();
+    for (unsigned stride = kRouteThreads / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        const std::int32_t o = best_id[tid + stride];
+        const float ov = best_score[tid + stride];
+        const std::int32_t m = best_id[tid];
+        if (o >= 0 && (m < 0 || ov > best_score[tid] ||
+                       (ov == best_score[tid] && o < m))) {
+          best_id[tid] = o;
+          best_score[tid] = ov;
+        }
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      ids[s] = best_id[0];
+      taken[best_id[0]] = 1;
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float sum = 0;
+    for (std::uint32_t s = 0; s < used; ++s)
+      sum += probs[ids[s]];
+    const float denom = normalize ? fmaxf(sum, 0x1p-14F) : 1.0F;
+    for (std::uint32_t s = 0; s < used; ++s) {
+      raw[s] = probs[ids[s]];
+      norm[s] = raw[s] / denom;
+      weights[s] = norm[s] * scale;
+    }
+  }
+}
 __global__ void Gather(const float* down, const float* weights, float* y,
                        std::size_t n, std::uint32_t hidden,
                        std::uint32_t used) {
@@ -412,9 +509,14 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
     if (ctx.tap && *ctx.tap)
       (*ctx.tap)(name, layer, {p, type, ne0, ne1, ne2});
   };
+  // GUFO_GLM53_PROFILE sub-op timers (no events or syncs when it is off).
+  std::optional<OpScope> scope;
   const auto ff = [&](const DeviceMatrix& gate, const DeviceMatrix& up,
                       const DeviceMatrix& down, std::uint32_t routes,
                       const std::int32_t* selected, float clamp, float* out) {
+    const bool routed = selected != nullptr;
+    scope.emplace(ctx.profiler, routed ? "ffn_moe/gate_up" : "ffn/gate_up",
+                  ctx.stream);
     if (UseDs4(gate, up, selected)) {
       if (!Ds4GateUp(gate, up, x, selected, g, u, tokens, routes, ctx.stream))
         return false;
@@ -423,6 +525,7 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
                !Project(up, x, selected, u, tokens, routes, true, ctx.stream)) {
       return false;
     }
+    scope.emplace(ctx.profiler, routed ? "ffn_moe/act" : "ffn/act", ctx.stream);
     const auto n = std::size_t{tokens} * routes * gate.rows;
     Activate<<<Grid(n), 256, 0, ctx.stream>>>(g, u, n, clamp);
     if (hipGetLastError() != hipSuccess)
@@ -431,9 +534,15 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
     // quantized down kernels see ([tokens * routes][rows]).
     tap(selected ? "ffn_moe_act" : "ffn_act", g, gate.rows,
         std::uint64_t{tokens} * routes);
-    if (UseDs4Down(down, selected))
-      return Ds4Down(down, g, selected, out, tokens, routes, ctx.stream);
-    return Project(down, g, selected, out, tokens, routes, false, ctx.stream);
+    scope.emplace(ctx.profiler, routed ? "ffn_moe/down" : "ffn/down",
+                  ctx.stream);
+    const bool ok =
+        UseDs4Down(down, selected)
+            ? Ds4Down(down, g, selected, out, tokens, routes, ctx.stream)
+            : Project(down, g, selected, out, tokens, routes, false,
+                      ctx.stream);
+    scope.reset();
+    return ok;
   };
   if (w.dense) {
     if (!ff(w.gate, w.up, w.down, 1, nullptr, w.clamp_exp, y))
@@ -442,15 +551,25 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
     const DeviceMatrix router{w.router, GgmlType::kF32,
                               h,        c.num_experts,
                               1,        std::size_t{h} * sizeof(float)};
+    scope.emplace(ctx.profiler, "ffn_moe/router", ctx.stream);
     if (!Project(router, x, nullptr, ptr(b.logits), tokens, 1, true,
                  ctx.stream))
       return false;
     tap("ffn_moe_logits", ptr(b.logits), c.num_experts, tokens);
-    Route<<<static_cast<unsigned>((std::size_t{tokens} + 255) / 256), 256, 0,
-            ctx.stream>>>(
-        ptr(b.logits), w.router_bias, ptr(b.probs), ids, ptr(b.weights),
-        ptr(b.raw_weights), ptr(b.norm_weights), tokens, c.num_experts,
-        c.num_experts_used, c.expert_weights_scale, c.expert_weights_norm);
+    scope.emplace(ctx.profiler, "ffn_moe/topk", ctx.stream);
+    if (c.num_experts <= kRouteBlockMaxExperts && tokens <= 0x7fffffffU)
+      RouteBlock<<<tokens, kRouteThreads,
+                   std::size_t{c.num_experts} * (sizeof(float) + 1),
+                   ctx.stream>>>(
+          ptr(b.logits), w.router_bias, ptr(b.probs), ids, ptr(b.weights),
+          ptr(b.raw_weights), ptr(b.norm_weights), c.num_experts,
+          c.num_experts_used, c.expert_weights_scale, c.expert_weights_norm);
+    else
+      Route<<<static_cast<unsigned>((std::size_t{tokens} + 255) / 256), 256,
+              0, ctx.stream>>>(
+          ptr(b.logits), w.router_bias, ptr(b.probs), ids, ptr(b.weights),
+          ptr(b.raw_weights), ptr(b.norm_weights), tokens, c.num_experts,
+          c.num_experts_used, c.expert_weights_scale, c.expert_weights_norm);
     if (hipGetLastError() != hipSuccess)
       return false;
     tap("ffn_moe_probs", ptr(b.probs), c.num_experts, tokens);
@@ -466,8 +585,10 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
             w.clamp_exp, ptr(b.down)))
       return false;
     const auto n = std::size_t{tokens} * h;
+    scope.emplace(ctx.profiler, "ffn_moe/gather", ctx.stream);
     Gather<<<Grid(n), 256, 0, ctx.stream>>>(ptr(b.down), ptr(b.weights), y, n,
                                             h, c.num_experts_used);
+    scope.reset();
     if (hipGetLastError() != hipSuccess)
       return false;
     tap("ffn_moe_out", y, h, tokens);
