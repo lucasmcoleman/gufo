@@ -132,14 +132,7 @@ bool Ds4Active() {
 // Q8_1 activation rounding, 32 values per scale. Prefill (MMQ, tokens > 8)
 // keeps d = 1 / (127 / amax) in F32 (quantize_mmq_q8_1, D4 layout); decode
 // (MMVQ) uses d = amax / 127 and stores it as fp16 (quantize_q8_1).
-//
-// GPU and CPU inputs to a rounding can differ by float noise, so a value
-// within kTieQuanta of a .5 boundary may round either way. Q8Round adds each
-// such index's quantum d to `tie` (when given) so the caller can bound it.
-constexpr double kTieQuanta = 2e-4;
-
-void Q8Round(float* x, std::size_t n, bool vec,
-             std::vector<float>* tie = nullptr) {
+void Q8Round(float* x, std::size_t n, bool vec) {
   for (std::size_t b = 0; b < n; b += 32) {
     const auto end = std::min(n, b + 32);
     float amax = 0;
@@ -152,12 +145,8 @@ void Q8Round(float* x, std::size_t n, bool vec,
     const float d_inv = 127.0F / amax;
     const float d = vec ? amax / 127.0F : 1.0F / d_inv;
     const float scale = vec ? __half2float(__float2half(d)) : d;
-    for (auto i = b; i < end; ++i) {
-      const float v = vec ? x[i] / d : x[i] * d_inv;
-      if (tie && std::abs(v - std::floor(v) - 0.5) < kTieQuanta)
-        (*tie)[i] = scale;
-      x[i] = std::round(v) * scale;
-    }
+    for (auto i = b; i < end; ++i)
+      x[i] = std::round(vec ? x[i] / d : x[i] * d_inv) * scale;
   }
 }
 
@@ -170,38 +159,38 @@ double Dot(const float* a, const float* b, std::size_t n) {
 
 // reference::RoutedFfn with optional Q8_1 rounding of the gate/up input and
 // of each route's down input (the SwiGLU output). The gate/up input is the
-// host fixture, identical on both sides; the down input is computed on the
-// GPU, so a tie there may round the other way. `slack[d]` gets the largest
-// change such a flip can make to output d: |weight| * quantum * |down[d][i]|.
+// host fixture, identical on both sides. For the down input, `gpu_act`
+// ([routes][mid] for this token, from the ffn_moe_act tap) replaces the CPU's
+// SwiGLU output when given: a value on a .5 boundary may otherwise round
+// differently on the two sides. The CPU and GPU activations are compared on
+// their own (CheckAct) so the substitution hides nothing.
 void RoutedFfnQ8(const float* x, const float* gate_up, const float* down,
                  std::size_t hidden, std::size_t mid,
                  const glm::reference::Routing& routing, float clamp,
-                 bool q_gate_up, bool q_down, bool vec, float* y,
-                 float* slack) {
-  std::vector<float> xin(x, x + hidden), act(mid), tie(mid);
+                 bool q_gate_up, bool q_down, bool vec, const float* gpu_act,
+                 float* y) {
+  std::vector<float> xin(x, x + hidden), act(mid);
   if (q_gate_up)
     Q8Round(xin.data(), hidden, vec);
   std::fill(y, y + hidden, 0.0F);
-  std::fill(slack, slack + hidden, 0.0F);
   for (std::size_t r = 0; r < routing.ids.size(); ++r) {
     const auto e = routing.ids[r];
     const float* gate = gate_up + e * 2 * mid * hidden;
     const float* up = gate + mid * hidden;
-    for (std::size_t i = 0; i < mid; ++i)
-      act[i] = glm::reference::ClampedSwiGlu(
-          static_cast<float>(Dot(gate + i * hidden, xin.data(), hidden)),
-          static_cast<float>(Dot(up + i * hidden, xin.data(), hidden)), clamp);
-    std::fill(tie.begin(), tie.end(), 0.0F);
+    if (gpu_act)
+      std::copy_n(gpu_act + r * mid, mid, act.data());
+    else
+      for (std::size_t i = 0; i < mid; ++i)
+        act[i] = glm::reference::ClampedSwiGlu(
+            static_cast<float>(Dot(gate + i * hidden, xin.data(), hidden)),
+            static_cast<float>(Dot(up + i * hidden, xin.data(), hidden)),
+            clamp);
     if (q_down)
-      Q8Round(act.data(), mid, vec, &tie);
+      Q8Round(act.data(), mid, vec);
     const float* w = down + e * hidden * mid;
-    for (std::size_t d = 0; d < hidden; ++d) {
+    for (std::size_t d = 0; d < hidden; ++d)
       y[d] += routing.weights[r] *
               static_cast<float>(Dot(w + d * mid, act.data(), mid));
-      for (std::size_t i = 0; i < mid; ++i)
-        slack[d] += std::abs(routing.weights[r]) * tie[i] *
-                    std::abs(w[d * mid + i]);
-    }
   }
 }
 
@@ -294,9 +283,94 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
   // The 6-token chunk pass runs the decode kernels; with Q8_1 rounding its
   // oracle differs from the full pass whenever that pass is a prefill.
   const bool chunk_differs = q8 && tokens > 8;
-  std::vector<float> want(x.size()), want_chunks(x.size()), got(x.size()),
-      chunks(x.size()), slack(x.size()), slack_chunks(x.size());
-  std::vector<float> logits(config.num_experts), shared_y(hidden);
+  const auto routes = config.num_experts_used;
+
+  // GPU first: with q_down the oracle rounds the GPU's own down input, so the
+  // ffn_moe_act and ffn_moe_topk taps are captured (in token order, across
+  // the chunked calls too).
+  std::vector<float> got(x.size()), chunks(x.size()), act_full, act_chunks;
+  std::vector<std::int32_t> ids_full, ids_chunks;
+  std::vector<float>* act_sink = &act_full;
+  std::vector<std::int32_t>* ids_sink = &ids_full;
+  Stream stream;
+  const glm::TapFn capture = [&](std::string_view name, std::uint32_t,
+                                 const glm::TapView& view) {
+    if (name != "ffn_moe_act" && name != "ffn_moe_topk")
+      return;
+    Hip(hipStreamSynchronize(stream.value));
+    if (name == "ffn_moe_act") {
+      const auto at = act_sink->size();
+      act_sink->resize(at + view.count());
+      Hip(hipMemcpy(act_sink->data() + at, view.device,
+                    view.count() * sizeof(float), hipMemcpyDeviceToHost));
+    } else {
+      const auto at = ids_sink->size();
+      ids_sink->resize(at + view.count());
+      Hip(hipMemcpy(ids_sink->data() + at, view.device,
+                    view.count() * sizeof(std::int32_t),
+                    hipMemcpyDeviceToHost));
+    }
+  };
+  const auto scratch_bytes = glm::FfnScratchBytes(config, tokens);
+  Require(scratch_bytes > 0, "scratch query returned zero");
+  Buffer scratch(scratch_bytes), dx(x.size() * sizeof(float)),
+      dy(x.size() * sizeof(float));
+  glm::OpContext ctx{stream.value, scratch.p, scratch_bytes,
+                     q_down ? &capture : nullptr};
+  const auto layer = dense ? 0U : 1U;
+  Hip(hipMemcpyAsync(dx.p, x.data(), x.size() * sizeof(float),
+                     hipMemcpyHostToDevice, stream.value));
+  Hip(hipMemsetAsync(dy.p, 0xff, x.size() * sizeof(float), stream.value));
+  Require(glm::FfnForward(ctx, config, layer, weights, dx.f(), tokens, dy.f()),
+          "FfnForward rejected valid fixture");
+  Hip(hipMemcpyAsync(got.data(), dy.p, got.size() * sizeof(float),
+                     hipMemcpyDeviceToHost, stream.value));
+  Hip(hipStreamSynchronize(stream.value));
+  Hip(hipMemsetAsync(dy.p, 0xff, x.size() * sizeof(float), stream.value));
+  act_sink = &act_chunks;
+  ids_sink = &ids_chunks;
+  for (std::uint32_t t = 0; t < tokens; t += 6) {
+    const auto count = std::min(6U, tokens - t);
+    // Each chunk advertises exactly its own required scratch size.
+    ctx.scratch_bytes = glm::FfnScratchBytes(config, count);
+    Require(glm::FfnForward(ctx, config, layer, weights,
+                            dx.f() + std::size_t(t) * hidden, count,
+                            dy.f() + std::size_t(t) * hidden),
+            "FfnForward rejected chunk");
+  }
+  Hip(hipMemcpyAsync(chunks.data(), dy.p, chunks.size() * sizeof(float),
+                     hipMemcpyDeviceToHost, stream.value));
+  Hip(hipStreamSynchronize(stream.value));
+  ctx.tap = nullptr;
+  if (q_down) {
+    const auto rows = std::size_t(tokens) * routes;
+    Require(act_full.size() == rows * mid && act_chunks.size() == rows * mid &&
+                ids_full.size() == rows && ids_chunks.size() == rows,
+            "ffn_moe_act/topk taps missing");
+  }
+
+  // Exact-path tolerances, used for every comparison below.
+  struct Gate {
+    double diff = 0, norm = 0, max_abs = 0;
+    void Add(const char* what, std::size_t i, float got, float want) {
+      if (!std::isfinite(got) || !std::isfinite(want))
+        throw std::runtime_error(std::string("nonfinite FFN ") + what);
+      const double error = std::abs(double(got) - want);
+      max_abs = std::max(max_abs, error);
+      diff += error * error;
+      norm += double(want) * want;
+      if (error > 2e-5 + 2e-4 * std::abs(want))
+        throw std::runtime_error(std::string("FFN ") + what +
+                                 " pointwise parity failed at " +
+                                 std::to_string(i) +
+                                 " got=" + std::to_string(got) +
+                                 " want=" + std::to_string(want));
+    }
+    double Rel() const { return std::sqrt(diff / std::max(norm, 1e-30)); }
+  } full, chunk, act_gate, act_chunk_gate;
+
+  std::vector<float> want(x.size()), want_chunks(x.size());
+  std::vector<float> logits(config.num_experts), shared_y(hidden), cpu_act(mid);
   for (std::uint32_t t = 0; t < tokens; ++t) {
     const auto* input = x.data() + std::size_t(t) * hidden;
     auto* output = want.data() + std::size_t(t) * hidden;
@@ -322,10 +396,33 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
     if (routing_case == 2)
       Require(routing.ids == std::vector<std::uint32_t>({3, 1, 4}),
               "fixture bias selection changed");
+    const auto row = std::size_t(t) * routes;
+    if (q_down) {
+      // The substituted GPU activations must belong to the same experts in
+      // the same order, and match the CPU's own SwiGLU to exact tolerance.
+      for (std::uint32_t r = 0; r < routes; ++r)
+        Require(ids_full[row + r] == std::int32_t(routing.ids[r]) &&
+                    ids_chunks[row + r] == std::int32_t(routing.ids[r]),
+                "GPU expert selection differs from the oracle");
+      for (std::uint32_t r = 0; r < routes; ++r) {
+        const float* gw = gate_up.data() + routing.ids[r] * 2 * mid * hidden;
+        for (std::size_t i = 0; i < mid; ++i)
+          cpu_act[i] = glm::reference::ClampedSwiGlu(
+              static_cast<float>(Dot(gw + i * hidden, input, hidden)),
+              static_cast<float>(Dot(gw + (mid + i) * hidden, input, hidden)),
+              weights.clamp_exp);
+        for (std::size_t i = 0; i < mid; ++i) {
+          act_gate.Add("act", (row + r) * mid + i, act_full[(row + r) * mid + i],
+                       cpu_act[i]);
+          act_chunk_gate.Add("chunk act", (row + r) * mid + i,
+                             act_chunks[(row + r) * mid + i], cpu_act[i]);
+        }
+      }
+    }
     if (q8)
       RoutedFfnQ8(input, gate_up.data(), down.host.data(), hidden, mid,
-                  routing, weights.clamp_exp, q_gate_up, q_down,
-                  tokens <= 8, output, slack.data() + std::size_t(t) * hidden);
+                  routing, weights.clamp_exp, q_gate_up, q_down, tokens <= 8,
+                  q_down ? act_full.data() + row * mid : nullptr, output);
     else
       glm::reference::RoutedFfn(input, gate_up.data(), down.host.data(),
                                 hidden, mid, routing, weights.clamp_exp,
@@ -333,9 +430,9 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
     auto* output_chunks = want_chunks.data() + std::size_t(t) * hidden;
     if (chunk_differs)
       RoutedFfnQ8(input, gate_up.data(), down.host.data(), hidden, mid,
-                  routing, weights.clamp_exp, q_gate_up, q_down,
-                  /*vec=*/true, output_chunks,
-                  slack_chunks.data() + std::size_t(t) * hidden);
+                  routing, weights.clamp_exp, q_gate_up, q_down, /*vec=*/true,
+                  q_down ? act_chunks.data() + row * mid : nullptr,
+                  output_chunks);
     if (shared) {
       glm::reference::DenseFfn(input, sg->host.data(), su->host.data(),
                                sd->host.data(), hidden, config.shared_expert_ff,
@@ -347,71 +444,34 @@ void Run(bool dense, bool shared, bool clamp, bool normalize, int routing_case,
       }
     }
   }
-  Stream stream;
-  const auto scratch_bytes = glm::FfnScratchBytes(config, tokens);
-  Require(scratch_bytes > 0, "scratch query returned zero");
-  Buffer scratch(scratch_bytes), dx(x.size() * sizeof(float)),
-      dy(x.size() * sizeof(float));
-  glm::OpContext ctx{stream.value, scratch.p, scratch_bytes, nullptr};
-  const auto layer = dense ? 0U : 1U;
-  Hip(hipMemcpyAsync(dx.p, x.data(), x.size() * sizeof(float),
-                     hipMemcpyHostToDevice, stream.value));
-  Hip(hipMemsetAsync(dy.p, 0xff, x.size() * sizeof(float), stream.value));
-  Require(glm::FfnForward(ctx, config, layer, weights, dx.f(), tokens, dy.f()),
-          "FfnForward rejected valid fixture");
-  Hip(hipMemcpyAsync(got.data(), dy.p, got.size() * sizeof(float),
-                     hipMemcpyDeviceToHost, stream.value));
-  Hip(hipStreamSynchronize(stream.value));
-  Hip(hipMemsetAsync(dy.p, 0xff, x.size() * sizeof(float), stream.value));
-  for (std::uint32_t t = 0; t < tokens; t += 6) {
-    const auto count = std::min(6U, tokens - t);
-    // Each chunk advertises exactly its own required scratch size.
-    ctx.scratch_bytes = glm::FfnScratchBytes(config, count);
-    Require(glm::FfnForward(ctx, config, layer, weights,
-                            dx.f() + std::size_t(t) * hidden, count,
-                            dy.f() + std::size_t(t) * hidden),
-            "FfnForward rejected chunk");
-  }
-  Hip(hipMemcpyAsync(chunks.data(), dy.p, chunks.size() * sizeof(float),
-                     hipMemcpyDeviceToHost, stream.value));
-  Hip(hipStreamSynchronize(stream.value));
-  double diff = 0, norm = 0, max_abs = 0;
-  std::size_t ties = 0;
   for (std::size_t i = 0; i < got.size(); ++i) {
-    Require(std::isfinite(got[i]) && std::isfinite(chunks[i]) &&
-                std::isfinite(want[i]),
-            "nonfinite FFN output");
-    const double error = std::abs(double(got[i]) - want[i]);
-    max_abs = std::max(max_abs, error);
-    const double beyond = std::max(0.0, error - slack[i]);
-    diff += beyond * beyond;
-    norm += double(want[i]) * want[i];
-    ties += slack[i] > 0;
-    if (error > 2e-5 + 2e-4 * std::abs(want[i]) + slack[i])
-      throw std::runtime_error("FFN pointwise CPU parity failed at " +
-                               std::to_string(i) +
-                               " got=" + std::to_string(got[i]) +
-                               " want=" + std::to_string(want[i]));    if (chunk_differs &&
-        std::abs(double(chunks[i]) - want_chunks[i]) >
-            2e-5 + 2e-4 * std::abs(want_chunks[i]) + slack_chunks[i])
-      throw std::runtime_error("FFN chunk Q8_1 parity failed at " +
-                               std::to_string(i) +
-                               " got=" + std::to_string(chunks[i]) +
-                               " want=" + std::to_string(want_chunks[i]));
+    full.Add("CPU", i, got[i], want[i]);
+    if (chunk_differs)
+      chunk.Add("chunk Q8_1", i, chunks[i], want_chunks[i]);
+    else
+      Require(std::isfinite(chunks[i]), "nonfinite FFN chunk output");
   }
-  const auto rel = std::sqrt(diff / std::max(norm, 1e-30));
   const bool exact =
       std::memcmp(got.data(), chunks.data(), got.size() * sizeof(float)) == 0;
   std::cout << "FFN dense=" << dense << " shared=" << shared
             << " clamp=" << clamp << " norm=" << normalize
             << " routing=" << routing_case << " tokens=" << tokens
             << " type=" << static_cast<int>(type) << " q8=" << q8
-            << " rel_l2=" << rel << " max_abs=" << max_abs
-            << " tie_outputs=" << ties
-            << " chunk_exact=" << exact << '\n';
-  Require(rel <= 5e-5, "FFN relative CPU parity failed");
-  // Bitwise chunk parity holds when both passes run the same kernels.
-  Require(exact || chunk_differs, "FFN chunk parity failed");
+            << " rel_l2=" << full.Rel() << " max_abs=" << full.max_abs;
+  if (q_down)
+    std::cout << " act_rel_l2=" << act_gate.Rel()
+              << " chunk_act_rel_l2=" << act_chunk_gate.Rel();
+  if (chunk_differs)
+    std::cout << " chunk_rel_l2=" << chunk.Rel();
+  std::cout << " chunk_exact=" << exact << '\n';
+  Require(full.Rel() <= 5e-5, "FFN relative CPU parity failed");
+  if (q_down)
+    Require(act_gate.Rel() <= 5e-5 && act_chunk_gate.Rel() <= 5e-5,
+            "FFN activation relative parity failed");
+  if (chunk_differs)
+    Require(chunk.Rel() <= 5e-5, "FFN chunk relative Q8_1 parity failed");
+  else  // Both passes run the same kernels: bitwise chunk parity.
+    Require(exact, "FFN chunk parity failed");
 
   ctx.scratch_bytes = scratch_bytes;
   auto invalid = weights;

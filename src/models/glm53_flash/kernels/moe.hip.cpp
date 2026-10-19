@@ -427,6 +427,10 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
     Activate<<<Grid(n), 256, 0, ctx.stream>>>(g, u, n, clamp);
     if (hipGetLastError() != hipSuccess)
       return false;
+    // The down projection's input: lets a test round exactly what the
+    // quantized down kernels see ([tokens * routes][rows]).
+    tap(selected ? "ffn_moe_act" : "ffn_act", g, gate.rows,
+        std::uint64_t{tokens} * routes);
     if (UseDs4Down(down, selected))
       return Ds4Down(down, g, selected, out, tokens, routes, ctx.stream);
     return Project(down, g, selected, out, tokens, routes, false, ctx.stream);
