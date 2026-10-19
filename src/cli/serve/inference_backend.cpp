@@ -73,15 +73,17 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
-/// Draft ceiling for a speculative step shared by `active` sessions. Batched
-/// verification costs grow with the stacked rows, and independent sessions
-/// share little of that work, so concurrent sessions shorten their drafts.
-/// Measured on Qwen3.6-35B-A3B DFlash2 (gfx1151) under sustained load, total
-/// tok/s for ceilings 1/2/3/4 at temperature 0.6: two sessions
-/// 87.9/95.8/94.8/90.2, three 105.7/103.0/98.9/98.2, four
-/// 117.1/113.4/109.6/110.1, against 79.0/95.7/106.0 without drafting.
-std::uint32_t ConcurrentDraftCap(std::size_t active) {
-  if (active <= 1)
+/// Draft ceiling for a speculative step shared by `active` sessions. On an MoE
+/// target each stacked verification row reads mostly different experts, so
+/// batched verification costs grow with the rows and concurrent sessions
+/// shorten their drafts. Measured on Qwen3.6-35B-A3B DFlash2 (gfx1151) under
+/// sustained load, total tok/s for ceilings 1/2/3/4 at temperature 0.6: two
+/// sessions 87.9/95.8/94.8/90.2, three 105.7/103.0/98.9/98.2, four
+/// 117.1/113.4/109.6/110.1, against 79.0/95.7/106.0 without drafting. Dense
+/// targets share their weights across the rows and keep the full draft: the
+/// cap cost Qwen3.8-27B 6% at two sessions and 26% at four.
+std::uint32_t ConcurrentDraftCap(std::size_t active, bool moe_target) {
+  if (active <= 1 || !moe_target)
     return std::numeric_limits<std::uint32_t>::max();
   return active == 2 ? 2 : 1;
 }
@@ -1517,7 +1519,8 @@ public:
         indices.push_back(index);
       }
     }
-    const auto draft_cap = ConcurrentDraftCap(requests.size());
+    const auto draft_cap =
+        ConcurrentDraftCap(requests.size(), model_->GetConfig().IsMoE());
     for (auto& request : requests)
       request.max_draft_tokens = draft_cap;
     auto verified = speculative::SpeculativeVerifier::VerifyBatch(requests);
