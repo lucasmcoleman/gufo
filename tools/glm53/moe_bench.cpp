@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
   const std::size_t out = std::size_t{T} * used * M * 4;
   Check(hipMalloc(&ga, out), "ga"); Check(hipMalloc(&ua, out), "ua");
   Check(hipMalloc(&gb, out), "gb"); Check(hipMalloc(&ub, out), "ub");
-  ds4_pool_use_stack_arena(1);
+  ds4_pool_use_stack_arena(std::getenv("MOE_BENCH_ARENA") ? std::atoi(std::getenv("MOE_BENCH_ARENA")) : 1);
   hipStream_t s;
   Check(hipStreamCreate(&s), "stream");
   hipEvent_t e0, e1;
@@ -132,6 +132,39 @@ int main(int argc, char** argv) {
                   ms / reps, same ? "yes" : "NO", std::sqrt(diff / norm), max_rel, nonfinite);
     }
   ds4_mmq_set_routed_tile_cols(0);
+
+  // Decode gate/up (1 token): two ds4_mmq_iq2_xxs_moe_vec calls (what
+  // Ds4GateUp does today) vs one ds4_mmq_iq2_xxs_moe_pair_raw_vec.
+  {
+    auto time = [&](auto&& fn) {
+      fn(); Check(hipStreamSynchronize(s), "warm");
+      Check(hipEventRecord(e0, s), "rec");
+      for (int i = 0; i < reps * 20; ++i) fn();
+      Check(hipEventRecord(e1, s), "rec"); Check(hipEventSynchronize(e1), "sync");
+      float ms = 0; Check(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+      return ms / (reps * 20);
+    };
+    const std::size_t o1 = std::size_t{used} * M * 4;
+    const float ms_two = time([&] {
+      if (ds4_mmq_iq2_xxs_moe_vec(wg, (const float*)x, (const int32_t*)ids, (float*)ga, M, K, 1,
+                                  E, used, s) != 0 ||
+          ds4_mmq_iq2_xxs_moe_vec(wu, (const float*)x, (const int32_t*)ids, (float*)ua, M, K, 1,
+                                  E, used, s) != 0) { std::fprintf(stderr, "vec failed\n"); std::exit(1); }
+    });
+    const float ms_pair = time([&] {
+      if (ds4_mmq_iq2_xxs_moe_pair_raw_vec(wg, wu, (const float*)x, (const int32_t*)ids, (float*)gb,
+                                           (float*)ub, M, K, 1, E, used, s) != 0) {
+        std::fprintf(stderr, "pair_raw_vec failed\n"); std::exit(1); }
+    });
+    std::vector<float> a(o1 / 4), b(o1 / 4), c(o1 / 4), dd(o1 / 4);
+    Check(hipMemcpy(a.data(), ga, o1, hipMemcpyDeviceToHost), "a");
+    Check(hipMemcpy(b.data(), gb, o1, hipMemcpyDeviceToHost), "b");
+    Check(hipMemcpy(c.data(), ua, o1, hipMemcpyDeviceToHost), "c");
+    Check(hipMemcpy(dd.data(), ub, o1, hipMemcpyDeviceToHost), "d");
+    const bool same = std::memcmp(a.data(), b.data(), o1) == 0 && std::memcmp(c.data(), dd.data(), o1) == 0;
+    std::printf("decode gate/up (1 token): two moe_vec %.4f ms, pair_raw_vec %.4f ms, bitwise %s\n",
+                ms_two, ms_pair, same ? "yes" : "NO");
+  }
 
   // Down: [288][4096][2048] IQ3_XXS, one row per token-route (n_expert_used 1),
   // as Ds4Down calls it.
