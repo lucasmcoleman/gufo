@@ -170,4 +170,9 @@ if (ENGINE_ENABLE_HIP)
   target_compile_definitions(glm53_flash_mla_ops_test PRIVATE
     GLM53_ROCM_BUILD=1
     GLM53_LANE_B_FIXTURE_DIR="${GLM53_LANE_B_FIXTURE_DIR}")
+  # The same binary with every prefill path exact: bitwise chunking checks.
+  add_test(NAME glm53_flash.mla_ops_exact COMMAND glm53_flash_mla_ops_test)
+  set_tests_properties(glm53_flash.mla_ops_exact PROPERTIES
+    LABELS "glm53_flash;hip;gpu;gfx1151"
+    ENVIRONMENT "GUFO_GLM53_EXACT_PREFILL=1")
 endif()
