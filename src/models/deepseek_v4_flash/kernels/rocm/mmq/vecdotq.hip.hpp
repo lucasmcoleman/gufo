@@ -970,9 +970,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
     }
 
     const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
-    sumi = sumi * ls / 8;           // (sumi * scale + sumi / 2) / 4
+    // As for IQ2_S/IQ3_XXS: keep the half-scale fraction until the float
+    // scaling. Upstream's integer / 8 truncates it (~3e-5 rel per output).
+    sumi *= ls;
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    return (0.125f * d) * sumi;
 }
 
 #define VDR_IQ2_XS_Q8_1_MMVQ 2
