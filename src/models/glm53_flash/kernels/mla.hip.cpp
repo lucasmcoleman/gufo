@@ -6,6 +6,7 @@
 // sqrt(qk_dim)) over the indexer's selection (top pools + raw tail, causal),
 // v_b per head, then attn_output. Layouts are in kernels/mla.hpp.
 
+#include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/kernels/mla.hpp"
 
 #include <hip/hip_fp16.h>
@@ -560,6 +561,8 @@ bool Project(const DeviceMatrix& w, std::uint64_t expert, const float* x,
     }
     return true;
   }
+  if (PrefillQuantGemm(w.type, base, x, y, tokens, rows, cols, stream))
+    return true;
   ::gufo::hip::LaunchBatchedQuantGEMMFp32(w.type, base, x, y, tokens, rows,
                                           cols, stream);
   return true;

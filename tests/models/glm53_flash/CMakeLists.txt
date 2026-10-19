@@ -75,6 +75,9 @@ if (ENGINE_ENABLE_HIP)
   # ReferenceModel.
   add_glm53_flash_test(generator_gpu gufo_glm53_flash_reference
     "hip;gpu;gfx1151")
+  # Prefill WMMA projection (kernels/prefill_gemm.hpp) vs an FP64 CPU product,
+  # within the Q8_1 activation-rounding bound.
+  add_glm53_flash_test(prefill_gemm gufo_glm53_flash "hip;gpu;gfx1151")
   target_compile_definitions(glm53_flash_generator_gpu_test PRIVATE
     GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
 endif()
@@ -120,6 +123,22 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(glm53_flash_model_probe PRIVATE
     gufo_glm53_flash_reference)
   set_target_properties(glm53_flash_model_probe PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
+
+# Prefill projection micro-benchmark (not a test): tools/glm53/proj_bench.cpp.
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_proj_bench
+    ${PROJECT_SOURCE_DIR}/tools/glm53/proj_bench.cpp)
+  target_link_libraries(glm53_flash_proj_bench PRIVATE gufo_glm53_flash)
+  set_target_properties(glm53_flash_proj_bench PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
+
+# MoE prefill gate/up micro-benchmark (not a test): tools/glm53/moe_bench.cpp.
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_moe_bench
+    ${PROJECT_SOURCE_DIR}/tools/glm53/moe_bench.cpp)
+  target_link_libraries(glm53_flash_moe_bench PRIVATE gufo_glm53_flash)
+  set_target_properties(glm53_flash_moe_bench PROPERTIES EXCLUDE_FROM_ALL ON)
 endif()
 
 # V6 KL probe (not a test): full logits for a token set (tools/glm53/kl_probe.cpp).

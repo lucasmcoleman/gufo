@@ -12,6 +12,7 @@
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/glm53_flash/kernels/hc.hpp"
 #include "src/models/glm53_flash/kernels/kda.hpp"
+#include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/profile.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
@@ -363,6 +364,8 @@ bool LaunchProjection(const DeviceMatrix& w, const float* x, float* y,
     }
     return true;
   }
+  if (PrefillQuantGemm(w.type, w.data, x, y, tokens, w.rows, w.cols, stream))
+    return true;
   ::gufo::hip::LaunchBatchedQuantGEMMFp32(w.type, w.data, x, y, tokens, w.rows,
                                           w.cols, stream);
   return true;
