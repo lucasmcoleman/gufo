@@ -40,6 +40,10 @@
 #include "src/models/glm53_flash/layer_ops.hpp"
 #include "src/models/glm53_flash/weights.hpp"
 
+namespace gufo::hip {
+class WeightUpload;  // src/core/hip/weight_upload.hpp
+}  // namespace gufo::hip
+
 namespace gufo::models::glm53_flash {
 
 class OpProfiler;  // profile.hpp
@@ -60,9 +64,18 @@ public:
   /// Bytes allocated so far.
   [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
 
+  /// Routes later Copy calls through `upload` (disk to device, queued), or
+  /// back to hipMemcpy from the mapping when nullptr. Whoever sets it calls
+  /// upload->Finish before the copied weights are used.
+  void StageFrom(hip::WeightUpload* upload) noexcept { upload_ = upload; }
+  /// Copies the first `bytes` of `t`'s encoding to `dst`.
+  [[nodiscard]] bool Copy(void* dst, const TensorRef& t,
+                          std::size_t bytes) const;
+
 private:
   std::vector<void*> blocks_;
   std::size_t bytes_{0};
+  hip::WeightUpload* upload_{nullptr};
 };
 
 /// True if `type` with `cols` reduction elements has a projection route
@@ -218,6 +231,10 @@ struct ExecutorOptions {
   /// consecutive passes, which is exact (state carries across passes).
   std::uint32_t max_tokens{64};
   std::uint32_t capacity{4096};  ///< Positions per MLA cache.
+  /// The reader's mapped GGUF shards (GetMappedRegions). When set, weights
+  /// stream from the files with O_DIRECT instead of being copied out of the
+  /// mapping, so the model never also occupies the page cache.
+  std::span<const core::GgufMappedRegion> shards;
 };
 
 /// Host copies of a Forward's results.

@@ -251,6 +251,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   executor_options.max_tokens =
       std::max<std::uint32_t>(options.prefill_chunk, 1);
   executor_options.capacity = max_context;
+  executor_options.shards = reader->GetMappedRegions();
   model->impl_->executor = Executor::Create(
       *model->impl_->weights, executor_options, std::move(ops), &detail);
   if (model->impl_->executor == nullptr) {
