@@ -32,6 +32,9 @@ static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
 static int    g_routed_max_expert_rows = 0;
 static int    g_routed_tile_cols = 0;
+/* ds4_mmq_moe_impl only (set by ds4_mmq_set_moe_down_bounds; 0 = default). */
+static int    g_moe_down_tile_cols = 0;
+static int    g_moe_down_max_expert_rows = 0;
 
 struct ds4_hip_persistent_scratch {
     void *ptr = nullptr;
@@ -88,6 +91,11 @@ extern "C" void ds4_mmq_set_routed_max_expert_rows(int rows) {
 
 extern "C" void ds4_mmq_set_routed_tile_cols(int cols) {
     g_routed_tile_cols = cols > 0 ? cols : 0;
+}
+
+extern "C" void ds4_mmq_set_moe_down_bounds(int tile_cols, int max_expert_rows) {
+    g_moe_down_tile_cols = tile_cols > 0 ? tile_cols : 0;
+    g_moe_down_max_expert_rows = max_expert_rows > 0 ? max_expert_rows : 0;
 }
 
 extern "C" int ds4_mmq_routed_tile_cols_for_counts(
@@ -929,7 +937,7 @@ int ds4_mmq_moe_impl(
         }
     }
 
-    const mmq_args args = {
+    mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
         /*y=*/(const int *)src1_q8_1.get(),
@@ -953,10 +961,14 @@ int ds4_mmq_moe_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
-        /*ncols_max=*/ne_get_rows,
+        /*ncols_max=*/(g_moe_down_max_expert_rows > 0 &&
+                       (int64_t)g_moe_down_max_expert_rows < ne_get_rows)
+                          ? (int64_t)g_moe_down_max_expert_rows
+                          : ne_get_rows,
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
     };
+    args.mmq_x_request = g_moe_down_tile_cols;
 
     mul_mat_q_case<type>(*ctx, args, stream);
 
