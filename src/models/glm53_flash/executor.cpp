@@ -1181,7 +1181,8 @@ bool Executor::RewindNextn(std::uint32_t position) {
 
 bool Executor::ForwardLast(std::span<const std::int32_t> tokens,
                            bool want_logits, ForwardResult* out,
-                           const TapFn* tap, std::string* error) {
+                           const TapFn* tap, std::string* error,
+                           bool want_hidden) {
   if (embd_.empty()) {
     return Fail(error,
                 "ForwardLast needs the embedding (ExecutorOptions::embed)");
@@ -1192,7 +1193,8 @@ bool Executor::ForwardLast(std::span<const std::int32_t> tokens,
     }
   }
   return Run(tokens.data(), nullptr, static_cast<std::uint32_t>(tokens.size()),
-             want_logits, Head::kLastRow, out, tap, error);
+             want_logits, want_hidden ? Head::kLastRowHidden : Head::kLastRow,
+             out, tap, error);
 }
 
 bool Executor::ForwardStreams(const float* streams, std::uint32_t n_tokens,
@@ -1321,11 +1323,13 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
   };
   bool ok = true;
   // kLastRow needs the head only for the last pass's logits row (and for taps,
-  // which see the whole head); it never downloads `hidden`.
-  const bool last_row = head == Head::kLastRow;
+  // which see the whole head); it never downloads `hidden`. kLastRowHidden
+  // runs the head norm on every pass for `hidden` but projects only that row.
+  const bool last_row = head != Head::kPerToken;
+  const bool want_hidden = head != Head::kLastRow;
   const bool need_logits = want_logits && !output_.empty();
   if (output_norm_ != nullptr &&
-      (!last_row || (last_pass && need_logits) || (tap != nullptr && *tap))) {
+      (want_hidden || (last_pass && need_logits) || (tap != nullptr && *tap))) {
     // Mean head, then the final RMSNorm (HF:1509) and the output projection.
     {
       const OpScope scope(profiler_.get(), "head_norm", stream_);
@@ -1335,7 +1339,7 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
                                         hidden, c.rms_eps, stream_);
       Emit(tap, "final_norm.out", kNoLayer, xn_, hidden, n);
     }
-    if (!last_row) {
+    if (want_hidden) {
       const OpScope scope(profiler_.get(), "head_hidden_download", stream_);
       ok = ok && download(out->hidden, xn_, hidden);
     }
