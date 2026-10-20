@@ -1,0 +1,141 @@
+{
+  "date": "2026-10-19",
+  "job": 724,
+  "baseline": "98daaee",
+  "scope": "C1 direct synchronous Model session Forward; 128 calls; model loading, reset, greedy argmax and logit writes excluded; repeated seed tokens; baseline then candidate, three resets per prompt length",
+  "variants": {
+    "baseline": {
+      "rows": [
+        {
+          "prompt": 32,
+          "rep": 0,
+          "prefill_s": 0.452376,
+          "decode_s": 7.53248,
+          "tok_s": 16.9931
+        },
+        {
+          "prompt": 32,
+          "rep": 1,
+          "prefill_s": 0.396685,
+          "decode_s": 7.4223,
+          "tok_s": 17.2453
+        },
+        {
+          "prompt": 32,
+          "rep": 2,
+          "prefill_s": 0.401386,
+          "decode_s": 7.63224,
+          "tok_s": 16.771
+        },
+        {
+          "prompt": 2048,
+          "rep": 0,
+          "prefill_s": 12.9839,
+          "decode_s": 10.0551,
+          "tok_s": 12.7298
+        },
+        {
+          "prompt": 2048,
+          "rep": 1,
+          "prefill_s": 10.2741,
+          "decode_s": 10.0543,
+          "tok_s": 12.7309
+        },
+        {
+          "prompt": 2048,
+          "rep": 2,
+          "prefill_s": 10.2545,
+          "decode_s": 10.0641,
+          "tok_s": 12.7184
+        }
+      ],
+      "median": {
+        "32": {
+          "prefill_s": 0.401386,
+          "decode_s": 7.53248,
+          "tok_s": 16.9931
+        },
+        "2048": {
+          "prefill_s": 10.2741,
+          "decode_s": 10.0551,
+          "tok_s": 12.7298
+        }
+      }
+    },
+    "candidate": {
+      "rows": [
+        {
+          "prompt": 32,
+          "rep": 0,
+          "prefill_s": 0.460887,
+          "decode_s": 7.4662,
+          "tok_s": 17.1439
+        },
+        {
+          "prompt": 32,
+          "rep": 1,
+          "prefill_s": 0.397415,
+          "decode_s": 7.42803,
+          "tok_s": 17.232
+        },
+        {
+          "prompt": 32,
+          "rep": 2,
+          "prefill_s": 0.396343,
+          "decode_s": 7.42434,
+          "tok_s": 17.2406
+        },
+        {
+          "prompt": 2048,
+          "rep": 0,
+          "prefill_s": 11.6024,
+          "decode_s": 10.0909,
+          "tok_s": 12.6847
+        },
+        {
+          "prompt": 2048,
+          "rep": 1,
+          "prefill_s": 10.2696,
+          "decode_s": 10.0896,
+          "tok_s": 12.6863
+        },
+        {
+          "prompt": 2048,
+          "rep": 2,
+          "prefill_s": 10.2963,
+          "decode_s": 10.089,
+          "tok_s": 12.6871
+        }
+      ],
+      "median": {
+        "32": {
+          "prefill_s": 0.397415,
+          "decode_s": 7.42803,
+          "tok_s": 17.232
+        },
+        "2048": {
+          "prefill_s": 10.2963,
+          "decode_s": 10.0896,
+          "tok_s": 12.6863
+        }
+      }
+    }
+  },
+  "decode_rate_percent": {
+    "32": 1.405864733332951,
+    "2048": -0.34171785888230666
+  },
+  "logits": {
+    "baseline": {
+      "bytes": 475791360,
+      "sha256": "62a6a5f65753dce0b21d4dd3a04c86441419ea88880718eac8730faaf95a9070"
+    },
+    "candidate": {
+      "bytes": 475791360,
+      "sha256": "62a6a5f65753dce0b21d4dd3a04c86441419ea88880718eac8730faaf95a9070"
+    },
+    "bitwise_equal": true
+  },
+  "limitation": "128 full-vocabulary rows per case checked finite and stored (prefill output plus first 127 decode outputs). Final 128th decode output is timed but not saved or checked.",
+  "decision": "Rejected: no decode gain at pp2048/tg128; short-prompt ranges overlap. Prototype removed; baseline implementation retained."
+}
