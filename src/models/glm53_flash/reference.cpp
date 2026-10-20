@@ -285,9 +285,11 @@ ReferenceModel::ReferenceModel(const Config& config,
 
 void ReferenceModel::Reset() {
   position_ = 0;
+  nextn_position_ = 0;
   failed_ = false;
   kda_.assign(config_.num_layers, {});
-  mla_.assign(config_.num_layers, {});
+  // One more MLA cache for the NextN block when the model has one.
+  mla_.assign(std::max(config_.num_layers, config_.num_layers_all), {});
   const std::size_t kda_dim = config_.KdaDim();
   for (std::uint32_t il = 0; il < config_.num_layers; ++il) {
     if (config_.IsKdaLayer(il)) {
@@ -363,6 +365,92 @@ ReferenceModel::Output ReferenceModel::Forward(
     }
   }
   position_ += n;
+  failed_ = false;
+  return out;
+}
+
+ReferenceModel::Output ReferenceModel::ForwardNextn(
+    std::span<const std::int32_t> tokens, std::span<const float> h,
+    bool want_logits) {
+  const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
+  const std::size_t hidden = config_.hidden_size;
+  const std::uint32_t il = config_.num_layers;
+  Output out;
+  if (failed_) {
+    throw std::logic_error(
+        "ReferenceModel: a previous Forward failed partway; call Reset()");
+  }
+  if (config_.nextn_layers == 0 || il >= mla_.size() ||
+      !config_.IsMlaLayer(il) || h.size() != std::size_t{n} * hidden) {
+    throw std::invalid_argument("ReferenceModel: no NextN block or bad h");
+  }
+  if (n == 0) {
+    return out;
+  }
+  const std::string p = "blk." + std::to_string(il) + ".";
+  const MatrixView embd = weights_.Matrix("token_embd.weight");
+  const MatrixView eh = weights_.Matrix(p + "nextn.eh_proj.weight");
+  CheckShape(eh, p + "nextn.eh_proj.weight", 2 * hidden, hidden);
+  const float* enorm = weights_.Vector(p + "nextn.enorm.weight", hidden);
+  const float* hnorm = weights_.Vector(p + "nextn.hnorm.weight", hidden);
+  const float* head_norm =
+      weights_.Has(p + "nextn.shared_head_norm.weight")
+          ? weights_.Vector(p + "nextn.shared_head_norm.weight", hidden)
+          : weights_.Vector("output_norm.weight", hidden);
+  const float* attn_norm = weights_.Vector(p + "attn_norm.weight", hidden);
+  const float* ffn_norm = weights_.Vector(p + "ffn_norm.weight", hidden);
+
+  // x = eh_proj([enorm(embed) | hnorm(h)]); the residual is x itself.
+  std::vector<float> x(std::size_t{n} * hidden);
+  std::vector<float> e(hidden);
+  std::vector<float> cat(2 * hidden);
+  for (std::uint32_t t = 0; t < n; ++t) {
+    if (tokens[t] < 0 || static_cast<std::uint32_t>(tokens[t]) >= embd.rows()) {
+      throw std::out_of_range("ReferenceModel: token id out of range");
+    }
+    embd.Row(0, static_cast<std::uint64_t>(tokens[t]), e.data());
+    RmsNorm(e.data(), enorm, hidden, config_.rms_eps, cat.data());
+    RmsNorm(h.data() + (t * hidden), hnorm, hidden, config_.rms_eps,
+            cat.data() + hidden);
+    eh.MatVec(cat.data(), x.data() + (t * hidden));
+  }
+  failed_ = true;
+  std::vector<float> xn(std::size_t{n} * hidden);
+  std::vector<float> a(std::size_t{n} * hidden);
+  for (std::uint32_t t = 0; t < n; ++t) {
+    RmsNorm(x.data() + (t * hidden), attn_norm, hidden, config_.rms_eps,
+            xn.data() + (t * hidden));
+  }
+  // Mla reads position_ for the causal range; the NextN cache has its own.
+  const std::uint32_t trunk_position = position_;
+  position_ = nextn_position_;
+  Mla(il, xn.data(), n, a.data());
+  position_ = trunk_position;
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    x[i] += a[i];
+  }
+  for (std::uint32_t t = 0; t < n; ++t) {
+    RmsNorm(x.data() + (t * hidden), ffn_norm, hidden, config_.rms_eps,
+            xn.data() + (t * hidden));
+    Ffn(il, xn.data() + (t * hidden), a.data() + (t * hidden));
+  }
+  out.hidden.resize(std::size_t{n} * hidden);
+  for (std::uint32_t t = 0; t < n; ++t) {
+    for (std::size_t i = 0; i < hidden; ++i) {
+      x[(t * hidden) + i] += a[(t * hidden) + i];
+    }
+    RmsNorm(x.data() + (t * hidden), head_norm, hidden, config_.rms_eps,
+            out.hidden.data() + (t * hidden));
+  }
+  if (want_logits && weights_.Has("output.weight")) {
+    const MatrixView output = weights_.Matrix("output.weight");
+    out.logits.resize(std::size_t{n} * config_.vocab_size);
+    for (std::uint32_t t = 0; t < n; ++t) {
+      output.MatVec(out.hidden.data() + (t * hidden),
+                    out.logits.data() + (std::size_t{t} * config_.vocab_size));
+    }
+  }
+  nextn_position_ += n;
   failed_ = false;
   return out;
 }
