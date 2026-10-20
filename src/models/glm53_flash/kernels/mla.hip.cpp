@@ -809,14 +809,9 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   const bool dense = dense_enabled && n > 8 && !ExactPrefill() && kpool > 0 &&
                      (pos0 + n) / kpool <= budget;
   // Decode: split the rows across blocks once there are enough of them.
-  static const bool split_enabled = [] {
-    const char* v = std::getenv("GUFO_GLM53_MLA_SPLIT");
-    return !(v && *v == '0');
-  }();
   const std::uint32_t splits = std::min(
       SplitCount(c), (pos0 + n + kSplitRows - 1) / kSplitRows);
-  const bool split = split_enabled && !ExactPrefill() &&
-                     n <= kSplitMaxTokens && splits > 1;
+  const bool split = !ExactPrefill() && n <= kSplitMaxTokens && splits > 1;
   if (dense && DenseLatentAttention(s.qabs, cache.latent, s.ctx, heads, n,
                                     pos0, L, scale, stream)) {
   } else if (split) {

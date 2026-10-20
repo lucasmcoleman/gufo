@@ -914,6 +914,24 @@ int RunDefault() {
   SyntheticCheck(v, "synthetic-long",
                  TinyConfig(64, 4, 32, 64, 16, 16, 8, 128, 2048, 4), 2600,
                  {{1000, 1, 1, 777, 300, 500}, {2049, 3}}, 33);
+  // Split decode attention (passes of <= 4 tokens past 128 rows): 2- and
+  // 4-token passes, the 128 -> 129 row chunk boundary, a 4-token pass whose
+  // first token has an empty trailing chunk (rows 127 of 2 chunks), and
+  // passes after pools start dropping.
+  SyntheticCheck(v, "synthetic-split-g4",
+                 TinyConfig(64, 4, 32, 64, 16, 16, 8, 128, 2048, 4), 2400,
+                 {{126, 4, 1, 1, 2, 4, 900, 2, 4, 1000, 4, 4, 2, 1},
+                  {127, 1, 1, 2049, 4, 2}},
+                 33);
+  // G = 2 (6 heads) and G = 1 (3 heads) with a selection long enough to
+  // split (top_k 512: up to 515 rows, 5 chunks). T exceeds top_k so the
+  // one-call prefill takes the exact sparse kernel, not the FP16 dense one.
+  SyntheticCheck(v, "synthetic-split-g2",
+                 TinyConfig(64, 6, 32, 64, 16, 16, 8, 128, 512, 4), 700,
+                 {{126, 4, 2, 1, 300, 4}, {128, 1, 2, 4, 400, 4, 2}}, 33);
+  SyntheticCheck(v, "synthetic-split-g1",
+                 TinyConfig(48, 3, 32, 64, 16, 16, 8, 128, 512, 4), 700,
+                 {{126, 4, 2, 1, 300, 4}, {128, 1, 2, 4, 400, 4, 2}}, 33);
   std::cout << (v.pass ? "PASS" : "FAIL")
             << (fixture ? "" : " (fixture part skipped)") << '\n';
   return v.pass ? 0 : 1;
