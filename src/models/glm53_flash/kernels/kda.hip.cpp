@@ -46,7 +46,8 @@ constexpr std::uint32_t kConvTokensPerThread = 8;
 template<bool kSaveHistory>
 __global__ void KdaConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
                                const float* w, float* conv_state, float* out,
-                               std::uint32_t n_tokens, std::uint32_t channels) {
+                               std::uint32_t n_tokens, std::uint32_t channels,
+                               float* checkpoint) {
   const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= channels) {
     return;
@@ -79,6 +80,15 @@ __global__ void KdaConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
     window[0] = window[1];
     window[1] = window[2];
     window[2] = v;
+    if constexpr (kSaveHistory) {
+      // The history after token t, for a rollback that keeps t + 1 tokens.
+      if (checkpoint != nullptr && t + 1 < n_tokens) {
+        float* ck = checkpoint + (std::size_t{t} * (kKdaConvTaps - 1) * channels);
+#pragma unroll
+        for (std::uint32_t j = 0; j < kKdaConvTaps - 1; ++j)
+          ck[std::size_t{j} * channels + c] = window[j];
+      }
+    }
   }
   if constexpr (kSaveHistory) {
 #pragma unroll
@@ -189,7 +199,8 @@ __global__ void __launch_bounds__(kRecRows* kRecLanes)
     KdaRecurrentKernel(const float* qn, const float* kn, const float* v,
                        std::uint32_t v_stride, const float* decay,
                        const float* beta, float* state, float* o,
-                       std::uint32_t n_tokens, std::uint32_t heads) {
+                       std::uint32_t n_tokens, std::uint32_t heads,
+                       float* checkpoint) {
   constexpr std::uint32_t slice = kD / kRecLanes;
   const std::uint32_t h = blockIdx.x;
   const std::uint32_t j = blockIdx.y * kRecRows + threadIdx.x / kRecLanes;
@@ -234,6 +245,15 @@ __global__ void __launch_bounds__(kRecRows* kRecLanes)
     }
     if (lane == 0) {
       o[th * kD + j] = acc;
+    }
+    // The state after token t, for a rollback that keeps t + 1 tokens.
+    if (checkpoint != nullptr && t + 1 < n_tokens) {
+      float* ck = checkpoint + (std::size_t{t} * heads * kD * kD) +
+                  (static_cast<std::size_t>(h) * kD * kD) + (j * kD) + i0;
+#pragma unroll
+      for (std::uint32_t i = 0; i < slice; ++i) {
+        ck[i] = row[i];
+      }
     }
   }
 #pragma unroll
@@ -285,7 +305,7 @@ unsigned Blocks(std::uint64_t n, unsigned threads) {
 
 bool KdaConv(const float* qkv, std::uint32_t qkv_stride, const float* conv_w,
              float* conv_state, float* conv_out, std::uint32_t n_tokens,
-             std::uint32_t channels, hipStream_t stream) {
+             std::uint32_t channels, hipStream_t stream, float* checkpoint) {
   if (qkv == nullptr || conv_w == nullptr || conv_state == nullptr ||
       conv_out == nullptr || channels == 0 || qkv_stride < channels ||
       !Aligned16(conv_w)) {
@@ -293,14 +313,18 @@ bool KdaConv(const float* qkv, std::uint32_t qkv_stride, const float* conv_w,
   }
   if (n_tokens == 0)
     return true;
+  if (checkpoint != nullptr && n_tokens > kConvTokensPerThread)
+    return false;
   if (n_tokens <= kConvTokensPerThread) {
     KdaConv4Kernel<true><<<Blocks(channels, kThreads), kThreads, 0, stream>>>(
-        qkv, qkv_stride, conv_w, conv_state, conv_out, n_tokens, channels);
+        qkv, qkv_stride, conv_w, conv_state, conv_out, n_tokens, channels,
+        checkpoint);
   } else {
     const dim3 grid(Blocks(channels, kThreads),
                     Blocks(n_tokens, kConvTokensPerThread));
     KdaConv4Kernel<false><<<grid, kThreads, 0, stream>>>(
-        qkv, qkv_stride, conv_w, conv_state, conv_out, n_tokens, channels);
+        qkv, qkv_stride, conv_w, conv_state, conv_out, n_tokens, channels,
+        nullptr);
     // Ordered after every tile has read the old history.
     KdaConvHistoryKernel<<<Blocks(channels, kThreads), kThreads, 0, stream>>>(
         qkv, qkv_stride, conv_state, n_tokens, channels);
@@ -347,7 +371,7 @@ bool KdaPrep(const float* conv_out, std::uint32_t conv_stride,
 bool KdaRecurrent(const float* qn, const float* kn, const float* v,
                   std::uint32_t v_stride, const float* decay, const float* beta,
                   float* state, float* o, std::uint32_t n_tokens,
-                  std::uint32_t heads, hipStream_t stream) {
+                  std::uint32_t heads, hipStream_t stream, float* checkpoint) {
   if (qn == nullptr || kn == nullptr || v == nullptr || decay == nullptr ||
       beta == nullptr || state == nullptr || o == nullptr || heads == 0 ||
       v_stride < heads * kD) {
@@ -357,7 +381,7 @@ bool KdaRecurrent(const float* qn, const float* kn, const float* v,
     return true;
   KdaRecurrentKernel<<<dim3(heads, kD / kRecRows), kRecRows * kRecLanes, 0,
                        stream>>>(qn, kn, v, v_stride, decay, beta, state, o,
-                                 n_tokens, heads);
+                                 n_tokens, heads, checkpoint);
   return hipGetLastError() == hipSuccess;
 }
 

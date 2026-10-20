@@ -41,10 +41,13 @@ constexpr std::uint32_t kKdaConvTaps = 4;
 
 /// Causal depthwise 4-tap conv over [conv_state ; qkv] then SiLU, and the
 /// conv_state update to the last three inputs. conv_w must be 16-byte
-/// aligned. conv_out may not alias qkv.
+/// aligned. conv_out may not alias qkv. With `checkpoint`
+/// [n_tokens - 1][3][channels], also writes the history after each token
+/// but the last (speculative verify; at most 8 tokens).
 bool KdaConv(const float* qkv, std::uint32_t qkv_stride, const float* conv_w,
              float* conv_state, float* conv_out, std::uint32_t n_tokens,
-             std::uint32_t channels, hipStream_t stream);
+             std::uint32_t channels, hipStream_t stream,
+             float* checkpoint = nullptr);
 
 /// Forget gate: z = f + dt_bias, a = -exp(A_log) per head (GGUF ssm_a);
 /// g = lower_bound * sigmoid(-a z) for a finite lower_bound, else
@@ -66,10 +69,13 @@ bool KdaPrep(const float* conv_out, std::uint32_t conv_stride,
 /// S += k delta^T; o = S^T qn (HF layout notation; see `state` above).
 /// v is read at v[t * v_stride + h * D + j] (conv_out + 2*H*D with the conv
 /// stride).
+/// With `checkpoint` [n_tokens - 1][heads][D][D], also writes the state
+/// after each token but the last, bit-identical to stopping there.
 bool KdaRecurrent(const float* qn, const float* kn, const float* v,
                   std::uint32_t v_stride, const float* decay, const float* beta,
                   float* state, float* o, std::uint32_t n_tokens,
-                  std::uint32_t heads, hipStream_t stream);
+                  std::uint32_t heads, hipStream_t stream,
+                  float* checkpoint = nullptr);
 
 /// out = RMSNorm(o row of D) * norm_w * sigmoid(gate), eps = rms_norm_eps.
 /// out may alias o.

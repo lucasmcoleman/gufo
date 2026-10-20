@@ -142,6 +142,14 @@ if (ENGINE_ENABLE_HIP)
   set_target_properties(glm53_flash_moe_bench PROPERTIES EXCLUDE_FROM_ALL ON)
 endif()
 
+# Speculative verify/rollback probe (not a test): tools/glm53/rollback_probe.cpp.
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_rollback_probe
+    ${PROJECT_SOURCE_DIR}/tools/glm53/rollback_probe.cpp)
+  target_link_libraries(glm53_flash_rollback_probe PRIVATE gufo_glm53_flash_reference)
+  set_target_properties(glm53_flash_rollback_probe PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
+
 # V6 KL probe (not a test): full logits for a token set (tools/glm53/kl_probe.cpp).
 if (ENGINE_ENABLE_HIP)
   add_executable(glm53_flash_kl_probe

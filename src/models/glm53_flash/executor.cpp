@@ -245,7 +245,8 @@ bool KdaPass(const OpContext& ctx, const Config& config,
   bool ok = LaunchProjection(w.qkv, x, s.qkv, n, stream);
   scope.emplace(ctx.profiler, "kda/conv", stream);
   ok = ok && rocm::KdaConv(s.qkv, channels, w.conv_w, state.conv, s.conv, n,
-                           channels, stream);
+                           channels, stream,
+                           state.record ? state.conv_ckpt : nullptr);
   scope.emplace(ctx.profiler, "kda/proj_f", stream);
   ok = ok && LaunchProjection(w.f_a, x, s.low, n, stream);
   ok = ok && LaunchProjection(w.f_b, s.low, s.f, n, stream);
@@ -264,7 +265,8 @@ bool KdaPass(const OpContext& ctx, const Config& config,
                            n, heads, kKdaL2Eps, stream);
   scope.emplace(ctx.profiler, "kda/recurrent", stream);
   ok = ok && rocm::KdaRecurrent(qn, kn, s.conv + (2 * width), channels, s.decay,
-                                s.beta, state.recurrent, o, n, heads, stream);
+                                s.beta, state.recurrent, o, n, heads, stream,
+                                state.record ? state.recurrent_ckpt : nullptr);
   scope.emplace(ctx.profiler, "kda/out_norm", stream);
   ok = ok && rocm::KdaOutput(o, s.gate, width, w.norm, config.rms_eps, o, n,
                              heads, stream);
@@ -516,6 +518,10 @@ bool KdaMixerForward(const OpContext& ctx, const Config& config,
   }
   const std::uint32_t chunk = lo;
   const std::size_t hidden = config.hidden_size;
+  // Checkpoints index tokens within one pass.
+  if (state.record && chunk < tokens) {
+    return false;
+  }
   for (std::uint32_t t0 = 0; t0 < tokens; t0 += chunk) {
     const std::uint32_t n = std::min(chunk, tokens - t0);
     if (!KdaPass(ctx, config, w, state, x + (t0 * hidden), n,
@@ -735,6 +741,16 @@ bool Executor::Init(std::string* error) {
   if (!ops_.ffn) {
     return Fail(error, "no FFN operator is bound (LayerOps::ffn)");
   }
+  // KdaConv checkpoints need the verify pass in one conv tile (8), and the
+  // indexer ring (2 * kpool rows) keeps a rolled-back pass's kept rows only
+  // while it is at most kpool + 1 tokens.
+  const std::uint32_t verify_max =
+      std::min<std::uint32_t>(8, config_.indexer_kpool + 1);
+  if (options_.max_verify_tokens == 0 ||
+      options_.max_verify_tokens > verify_max) {
+    return Fail(error, "max_verify_tokens must be 1.." +
+                           std::to_string(verify_max));
+  }
   if (hipStreamCreate(&stream_) != hipSuccess) {
     return Fail(error, "hipStreamCreate failed");
   }
@@ -795,6 +811,22 @@ bool Executor::Init(std::string* error) {
       }
       if (!AllocateKdaState(arena_, c, &kda_[il])) {
         return layer_fail("KDA state allocation failed");
+      }
+      if (options_.max_verify_tokens > 1) {
+        const std::size_t keep = options_.max_verify_tokens - 1;
+        const std::size_t conv = std::size_t{c.ssm_conv_kernel - 1} * 3 *
+                                 c.KdaDim() * sizeof(float);
+        const std::size_t recurrent = std::size_t{c.num_heads} *
+                                      c.kda_head_dim * c.kda_head_dim *
+                                      sizeof(float);
+        kda_[il].conv_ckpt =
+            static_cast<float*>(arena_.Allocate(keep * conv));
+        kda_[il].recurrent_ckpt =
+            static_cast<float*>(arena_.Allocate(keep * recurrent));
+        if (kda_[il].conv_ckpt == nullptr ||
+            kda_[il].recurrent_ckpt == nullptr) {
+          return layer_fail("KDA verify checkpoint allocation failed");
+        }
       }
     } else {
       if (!UploadMlaLayer(arena_, c, l, il, &d.mla, &why)) {
@@ -893,6 +925,7 @@ bool Executor::Reset() {
   }
   ok = ok && hipStreamSynchronize(stream_) == hipSuccess;
   position_ = 0;
+  verify_open_ = false;
   failed_ = !ok;
   return ok;
 }
@@ -910,6 +943,74 @@ bool Executor::Forward(std::span<const std::int32_t> tokens, bool want_logits,
   }
   return Run(tokens.data(), nullptr, static_cast<std::uint32_t>(tokens.size()),
              want_logits, Head::kPerToken, out, tap, error);
+}
+
+bool Executor::ForwardVerify(std::span<const std::int32_t> tokens,
+                             bool want_logits, ForwardResult* out,
+                             std::string* error) {
+  const auto n = static_cast<std::uint32_t>(tokens.size());
+  if (n == 0 || n > options_.max_verify_tokens) {
+    return Fail(error, "ForwardVerify of " + std::to_string(n) +
+                           " tokens; max_verify_tokens is " +
+                           std::to_string(options_.max_verify_tokens));
+  }
+  if (n > options_.max_tokens) {
+    return Fail(error, "ForwardVerify needs one pass (max_tokens)");
+  }
+  const std::uint32_t base = position_;
+  for (auto& k : kda_) {
+    k.record = k.recurrent_ckpt != nullptr;
+  }
+  const bool ok = Forward(tokens, want_logits, out, nullptr, error);
+  for (auto& k : kda_) {
+    k.record = false;
+  }
+  if (ok) {
+    verify_open_ = true;
+    verify_base_ = base;
+    verify_n_ = n;
+  }
+  return ok;
+}
+
+bool Executor::Rollback(std::uint32_t keep) {
+  if (!verify_open_ || failed_ || keep == 0 || keep > verify_n_) {
+    return false;
+  }
+  verify_open_ = false;
+  if (keep == verify_n_) {
+    return true;
+  }
+  const Config& c = config_;
+  const std::size_t conv =
+      std::size_t{c.ssm_conv_kernel - 1} * 3 * c.KdaDim() * sizeof(float);
+  const std::size_t recurrent = std::size_t{c.num_heads} * c.kda_head_dim *
+                                c.kda_head_dim * sizeof(float);
+  bool ok = true;
+  for (std::uint32_t il = options_.first_layer; ok && il < options_.last_layer;
+       ++il) {
+    if (!c.IsKdaLayer(il)) {
+      continue;
+    }
+    const KdaState& k = kda_[il];
+    const std::size_t at = keep - 1;
+    ok = hipMemcpyAsync(k.recurrent,
+                        reinterpret_cast<const std::uint8_t*>(k.recurrent_ckpt) +
+                            (at * recurrent),
+                        recurrent, hipMemcpyDeviceToDevice,
+                        stream_) == hipSuccess &&
+         hipMemcpyAsync(k.conv,
+                        reinterpret_cast<const std::uint8_t*>(k.conv_ckpt) +
+                            (at * conv),
+                        conv, hipMemcpyDeviceToDevice, stream_) == hipSuccess;
+  }
+  ok = ok && hipStreamSynchronize(stream_) == hipSuccess;
+  if (!ok) {
+    failed_ = true;
+    return false;
+  }
+  position_ = verify_base_ + keep;
+  return true;
 }
 
 bool Executor::ForwardLast(std::span<const std::int32_t> tokens,
@@ -960,6 +1061,8 @@ bool Executor::Run(const std::int32_t* tokens, const float* streams,
                       " exceeded at position " + std::to_string(position_));
     }
   }
+  // Any other call ends the window in which Rollback can undo a verify.
+  verify_open_ = false;
   // State is advanced pass by pass; a failure partway leaves it ahead of
   // position_, so the executor refuses further calls until Reset().
   failed_ = true;

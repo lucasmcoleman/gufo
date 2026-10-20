@@ -981,8 +981,8 @@ std::size_t LayoutCache(const Config& c, std::uint32_t capacity, void* base,
   };
   take(r.latent, std::size_t{capacity} * c.kv_lora_rank);
   take(r.pooled, pools * idim);
-  take(r.ring_key, std::size_t{c.indexer_kpool} * idim);
-  take(r.ring_gate, std::size_t{c.indexer_kpool} * idim);
+  take(r.ring_key, std::size_t{2} * c.indexer_kpool * idim);
+  take(r.ring_gate, std::size_t{2} * c.indexer_kpool * idim);
   take(r.scores, std::size_t{kSelectTokens} * pools);
   r.pool_capacity = static_cast<std::uint32_t>(pools);
   return offset;

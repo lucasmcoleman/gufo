@@ -115,6 +115,14 @@ struct KdaLayerDevice {
 struct KdaState {
   float* conv{nullptr};       ///< [3][3*kda_dim] last three q|k|v inputs
   float* recurrent{nullptr};  ///< [heads][D value][D key] (kernels/kda.hpp)
+  /// Speculative verify (Executor::ForwardVerify): when `record`, a pass of
+  /// n tokens also writes the conv history and recurrent state after each
+  /// of its first n - 1 tokens, [n - 1][...] in the layouts above, so
+  /// Executor::Rollback can keep any prefix. Null without
+  /// ExecutorOptions::max_verify_tokens > 1.
+  float* conv_ckpt{nullptr};
+  float* recurrent_ckpt{nullptr};
+  bool record{false};
 };
 
 /// Uploads layer `layer`'s KDA weights. Fails (with `error`) on a non-KDA
@@ -231,6 +239,10 @@ struct ExecutorOptions {
   /// consecutive passes, which is exact (state carries across passes).
   std::uint32_t max_tokens{64};
   std::uint32_t capacity{4096};  ///< Positions per MLA cache.
+  /// Largest ForwardVerify call (draft tokens + 1). Above 1, each KDA layer
+  /// holds max_verify_tokens - 1 checkpoints of its state (4 MiB each at
+  /// GLM-5.3-Flash's shapes) for Rollback.
+  std::uint32_t max_verify_tokens{1};
   /// The reader's mapped GGUF shards (GetMappedRegions). When set, weights
   /// stream from the files with O_DIRECT instead of being copied out of the
   /// mapping, so the model never also occupies the page cache.
@@ -317,6 +329,25 @@ public:
                                  bool want_logits, ForwardResult* out,
                                  const TapFn* tap, std::string* error);
 
+  /// Speculative verify: Forward over `tokens` (at most max_verify_tokens),
+  /// with the per-token state checkpoints Rollback needs. Until the next
+  /// call, Rollback(keep) can return the sequence to Position() before this
+  /// call plus `keep`.
+  [[nodiscard]] bool ForwardVerify(std::span<const std::int32_t> tokens,
+                                   bool want_logits, ForwardResult* out,
+                                   std::string* error);
+
+  /// Keeps the first `keep` (1..T) tokens of the last ForwardVerify and
+  /// drops the rest: KDA state and conv history from the checkpoints, the
+  /// position back to base + keep (MLA caches are position addressed; the
+  /// indexer ring holds the last 2 * kpool rows, so a dropped row never
+  /// hides a kept one). The state is exactly what the verify pass reached
+  /// after its kept tokens, whatever the dropped ones were (a one-token
+  /// Forward of the same tokens agrees to F32 rounding, not bitwise:
+  /// batch-dependent GEMM routes). Fails unless the previous call was
+  /// ForwardVerify.
+  [[nodiscard]] bool Rollback(std::uint32_t keep);
+
   /// As Forward, from host residual streams [T][hc][hidden] entering
   /// first_layer instead of token ids (a layer range starting past 0).
   [[nodiscard]] bool ForwardStreams(const float* streams,
@@ -369,6 +400,10 @@ private:
   std::size_t scratch_bytes_{0};
   std::uint32_t position_{0};
   bool failed_{false};
+  // Last ForwardVerify, while Rollback may still undo it.
+  bool verify_open_{false};
+  std::uint32_t verify_base_{0};
+  std::uint32_t verify_n_{0};
   std::unique_ptr<OpProfiler> profiler_;  ///< null unless profiling
 };
 
