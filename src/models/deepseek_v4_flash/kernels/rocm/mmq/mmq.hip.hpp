@@ -3529,7 +3529,7 @@ static __global__ void mul_mat_q(
         const uint3 ntx, const char * __restrict__ x_soa, const int64_t soa_blocks,
         const float * __restrict__ epilogue_gate, const float * __restrict__ epilogue_weights,
         float * __restrict__ epilogue_mid, half * __restrict__ epilogue_mid_h,
-        const float epilogue_clamp) {
+        const float epilogue_clamp, const int * __restrict__ compact_tiles = nullptr) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3544,6 +3544,12 @@ static __global__ void mul_mat_q(
     constexpr int mmq_y = get_mmq_y_device();
 
     const uint32_t nty = (nrows_x + mmq_y - 1) / mmq_y; // Number of tiles y
+
+    // The list count is produced on this stream. This uniform exit happens
+    // before any shared-memory initialization or block barrier.
+    if (compact_tiles && blockIdx.y >= static_cast<unsigned>(compact_tiles[0])) {
+        return;
+    }
 
     // Initialize the ids for writing back data with just the index.
     // For regular matrix multiplications this is never changed.
@@ -3566,7 +3572,8 @@ static __global__ void mul_mat_q(
     {
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
-        const int zt = tmp2.y;
+        const int zt = compact_tiles ? compact_tiles[1 + 2*blockIdx.y] : tmp2.y;
+        const int first_jt = compact_tiles ? compact_tiles[2 + 2*blockIdx.y] : blockIdx.y;
         const int it = blockIdx.x;
 
         // Defaults for regular matrix multiplication:
@@ -3600,7 +3607,9 @@ static __global__ void mul_mat_q(
          *
          * Same tiles, same per-tile reduction order, disjoint outputs.
          */
-        for (int jt = blockIdx.y, iter = 0; jt*mmq_x < col_diff; jt += gridDim.y, ++iter) {
+        for (int jt = first_jt, iter = 0;
+             jt*mmq_x < col_diff && (!compact_tiles || iter == 0);
+             jt += gridDim.y, ++iter) {
             if (ids_dst) {
                 if (iter != 0) {
                     // The previous tile's write-back read ids_dst_shared.
@@ -4004,6 +4013,39 @@ static size_t mmq_get_nbytes_shared(
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
 
+// Build a stable expert-major list without downloading its length. The host
+// bounds its storage by ceil(assignments / width) + experts - 1: each nonempty
+// expert contributes at most one partial tile. The original MMQ body still
+// consumes precisely the same local column tiles and walks K unchanged.
+static __global__ void mmq_build_compact_tiles(
+        const int32_t * __restrict__ bounds, int * __restrict__ tiles,
+        int experts, int width) {
+    extern __shared__ int offsets[];
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        const int rows = bounds[e + 1] - bounds[e];
+        offsets[e] = (rows + width - 1) / width;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int total = 0;
+        for (int e = 0; e < experts; ++e) {
+            const int count = offsets[e];
+            offsets[e] = total;
+            total += count;
+        }
+        offsets[experts] = total;
+        tiles[0] = total;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        const int begin = offsets[e];
+        for (int i = begin; i < offsets[e + 1]; ++i) {
+            tiles[1 + 2*i] = e;
+            tiles[2 + 2*i] = i - begin;
+        }
+    }
+}
+
 template <ggml_type type, int mmq_x>
 static void launch_mul_mat_q(ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream) {
     const int id = ds4_ggml_hip_get_device();
@@ -4035,7 +4077,7 @@ static void launch_mul_mat_q(ds4_ggml_hip_context & ctx, const mmq_args & args, 
             : args.ncols_max;
     const int ntx  = (ncols_grid + mmq_x - 1) / mmq_x;
     const int ntzw = args.nchannels_y * args.nsamples_y;
-    const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
+    dim3 block_nums_xy_tiling(nty, ntx, ntzw);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
     GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
@@ -4052,6 +4094,34 @@ static void launch_mul_mat_q(ds4_ggml_hip_context & ctx, const mmq_args & args, 
     GGML_ASSERT(!args.epilogue_mid || !args.use_stream_k);
 
     if (!args.use_stream_k) {
+        ds4_ggml_hip_pool_alloc<int> compact_storage;
+        const int *compact_tiles = nullptr;
+        // Limit this prototype to raw 16-column routed IQ kernels on gfx1151.
+        // Dense, SoA, fused epilogues and other hardware retain their dispatch.
+        if constexpr (mmq_x == 16 && (type == GGML_TYPE_IQ2_XXS ||
+                                     type == GGML_TYPE_IQ2_S ||
+                                     type == GGML_TYPE_IQ3_XXS)) {
+            const int64_t tile_capacity =
+                (args.ncols_dst + mmq_x - 1) / mmq_x + args.nchannels_y - 1;
+            if (cc == DS4_GGML_HIP_CC_OFFSET_AMD + 0x1151 &&
+                args.ids_dst && args.expert_bounds && !args.x_soa &&
+                !args.epilogue_gate && !args.epilogue_mid &&
+                !args.epilogue_mid_h && !args.sanitize_output &&
+                args.nsamples_y == 1 && args.nsamples_x == 1 &&
+                args.nchannels_x == args.nchannels_y &&
+                args.nchannels_y > 1 && args.nchannels_y <= 1024 &&
+                args.ncols_dst > 0 && args.ncols_dst <= INT_MAX - mmq_x &&
+                tile_capacity > 0 && tile_capacity <= 65535 &&
+                tile_capacity < int64_t(ntx) * ntzw) {
+                int *list = compact_storage.alloc(ctx.pool(id), 1 + 2*tile_capacity);
+                mmq_build_compact_tiles<<<1, 256,
+                    (args.nchannels_y + 1)*sizeof(int), stream>>>(
+                    args.expert_bounds, list, args.nchannels_y, mmq_x);
+                DS4_HIP_CHECK(hipGetLastError());
+                compact_tiles = list;
+                block_nums_xy_tiling = dim3(nty, tile_capacity, 1);
+            }
+        }
         // The gfx1151 routed DeepSeek gate/up shape uses raw IQ2 weights with
         // 16 blocks per row. Keep one specialization instead of duplicating
         // the complete raw/SoA MMQ family.
@@ -4079,7 +4149,7 @@ static void launch_mul_mat_q(ds4_ggml_hip_context & ctx, const mmq_args & args, 
                         args.stride_sample_y, args.stride_sample_dst, ntx_fd,
                         args.x_soa, args.soa_blocks, args.epilogue_gate,
                         args.epilogue_weights, args.epilogue_mid, args.epilogue_mid_h,
-                        args.epilogue_clamp);
+                        args.epilogue_clamp, compact_tiles);
                 return;
             }
         }
@@ -4097,7 +4167,7 @@ static void launch_mul_mat_q(ds4_ggml_hip_context & ctx, const mmq_args & args, 
                         args.stride_sample_y, args.stride_sample_dst, ntx_fd,
                         args.x_soa, args.soa_blocks, args.epilogue_gate,
                         args.epilogue_weights, args.epilogue_mid, args.epilogue_mid_h,
-                        args.epilogue_clamp);
+                        args.epilogue_clamp, compact_tiles);
             } else {
                 constexpr bool need_check = true;
                 mul_mat_q<type, mmq_x, need_check, sanitize_output>
@@ -4110,7 +4180,7 @@ static void launch_mul_mat_q(ds4_ggml_hip_context & ctx, const mmq_args & args, 
                         args.stride_sample_y, args.stride_sample_dst, ntx_fd,
                         args.x_soa, args.soa_blocks, args.epilogue_gate,
                         args.epilogue_weights, args.epilogue_mid, args.epilogue_mid_h,
-                        args.epilogue_clamp);
+                        args.epilogue_clamp, compact_tiles);
             }
         };
         if constexpr (type == GGML_TYPE_Q8_0) {
