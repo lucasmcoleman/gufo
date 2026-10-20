@@ -1,0 +1,105 @@
+{
+  "256": {
+    "runs": [
+      {
+        "prefill_s": 12.0775,
+        "decode_s": 10.0824,
+        "tok_s": 12.6954
+      },
+      {
+        "prefill_s": 10.3058,
+        "decode_s": 10.0919,
+        "tok_s": 12.6835
+      },
+      {
+        "prefill_s": 10.2923,
+        "decode_s": 10.0912,
+        "tok_s": 12.6843
+      }
+    ],
+    "median": {
+      "prefill_s": 10.3058,
+      "decode_s": 10.0912,
+      "tok_s": 12.6843
+    },
+    "bitwise_equal": true,
+    "argmax_equal_rows": 387,
+    "rows": 387,
+    "first_argmax_difference_per_rep": [
+      null,
+      null,
+      null
+    ],
+    "kl_mean": 0.0,
+    "kl_max": 0.0
+  },
+  "512": {
+    "runs": [
+      {
+        "prefill_s": 12.0047,
+        "decode_s": 10.0906,
+        "tok_s": 12.6851
+      },
+      {
+        "prefill_s": 9.77203,
+        "decode_s": 10.0739,
+        "tok_s": 12.7061
+      },
+      {
+        "prefill_s": 9.78819,
+        "decode_s": 10.0573,
+        "tok_s": 12.727
+      }
+    ],
+    "median": {
+      "prefill_s": 9.78819,
+      "decode_s": 10.0739,
+      "tok_s": 12.7061
+    },
+    "bitwise_equal": false,
+    "argmax_equal_rows": 387,
+    "rows": 387,
+    "first_argmax_difference_per_rep": [
+      null,
+      null,
+      null
+    ],
+    "kl_mean": 0.000329738120205098,
+    "kl_max": 0.009751579681353702
+  },
+  "1024": {
+    "runs": [
+      {
+        "prefill_s": 11.1777,
+        "decode_s": 10.123,
+        "tok_s": 12.6445
+      },
+      {
+        "prefill_s": 9.82764,
+        "decode_s": 10.0915,
+        "tok_s": 12.6839
+      },
+      {
+        "prefill_s": 9.64712,
+        "decode_s": 10.0871,
+        "tok_s": 12.6895
+      }
+    ],
+    "median": {
+      "prefill_s": 9.82764,
+      "decode_s": 10.0915,
+      "tok_s": 12.6839
+    },
+    "bitwise_equal": false,
+    "argmax_equal_rows": 387,
+    "rows": 387,
+    "first_argmax_difference_per_rep": [
+      null,
+      null,
+      null
+    ],
+    "kl_mean": 0.00020681766238905364,
+    "kl_max": 0.0064824354989330615
+  },
+  "limitation": "Independent greedy trajectories: KL after first argmax difference compares different histories and is diagnostic only. No quality gate is changed by this probe."
+}
