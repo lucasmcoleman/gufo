@@ -10,7 +10,8 @@
 // prints both rates, the acceptance, and where the two token streams first
 // differ (verify rows run in batches of 2, so greedy may drift).
 //
-// usage: glm53_flash_mtp_bench MODEL.gguf [tokens=256]
+// usage: glm53_flash_mtp_bench MODEL.gguf [tokens=256] [prompt_tokens]
+// (prompt_tokens repeats the prompt text to that length, for long contexts)
 
 #include <hip/hip_runtime.h>
 
@@ -64,8 +65,8 @@ int main(int argc, char** argv) {
   const std::size_t H = weights->config.hidden_size;
   const std::size_t V = weights->config.vocab_size;
   glm::ExecutorOptions options;
-  options.max_tokens = 64;
   options.capacity = 4096;
+  options.max_tokens = 256;
   options.nextn = true;
   options.max_verify_tokens = 2;
   options.shards = reader->GetMappedRegions();
@@ -78,6 +79,12 @@ int main(int argc, char** argv) {
   for (const auto id : tokenizer->Encode(
            "Write a detailed story about a lighthouse keeper.", false)) {
     prompt.push_back(static_cast<std::int32_t>(id));
+  }
+  if (argc > 3) {
+    const std::size_t n = std::atoi(argv[3]);
+    const std::vector<std::int32_t> seed = prompt;
+    prompt.clear();
+    for (std::size_t i = 0; i < n; ++i) prompt.push_back(seed[i % seed.size()]);
   }
   const auto fail = [&](const char* what) {
     std::cerr << "FAIL " << what << ": " << error << "\n";
