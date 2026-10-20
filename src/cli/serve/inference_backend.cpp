@@ -197,6 +197,8 @@ constexpr std::array<std::uint8_t, 8> kQwenPersistentSnapshotMagic = {
     'G', 'Q', 'W', 'R', 'U', 'N', '0', '1'};
 constexpr std::uint32_t kQwenPersistentPayloadVersion = 3;
 constexpr std::size_t kQwenMaxResumeTokens = 9;
+/// GLM-5.3-Flash context when --context is not given (see its load).
+constexpr std::uint32_t kGlm53ServeContext = 65536;
 constexpr std::size_t kQwenPersistentSnapshotHeaderBytes = 112;
 constexpr std::uint32_t kQwenPersistentSpeculativeFlag = 1U << 0U;
 constexpr std::uint32_t kQwenPersistentPendingTokenFlag = 1U << 1U;
@@ -3234,6 +3236,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
+  const bool context_given = max_context != 0;
   if (max_context == 0) {
     const auto architecture =
         reader->GetMetadataString("general.architecture").value_or("");
@@ -3387,6 +3390,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       SetError(error, "GLM-5.3-Flash does not support --mmproj");
       return false;
     }
+    // The GGUF's native context is 1,048,576 tokens. Its caches take about
+    // 50 KB per token, about 52 GB at that length, on top of 90 GB of weights.
+    // Without --context, serve a context that fits beside the weights.
+    if (!context_given)
+      max_context = std::min(max_context, kGlm53ServeContext);
     auto model = models::glm53_flash::Model::Load(
         model_path,
         models::glm53_flash::ModelOptions{
