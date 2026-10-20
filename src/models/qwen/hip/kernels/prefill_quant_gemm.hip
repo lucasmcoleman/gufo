@@ -497,9 +497,14 @@ __launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
     w_row[p] = w_blocks + (static_cast<std::size_t>(r_clamped) * num_blocks);
     row_live[p] = (r < m_i) ? 1.0F : 0.0F;
   }
+  const std::size_t num_act_tiles =
+      (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
+  const std::size_t wanted = tt_block + static_cast<std::size_t>(b_tile);
+  const bool tile_live = wanted < num_act_tiles;
+  // A ragged macro tile may contain whole activation tiles beyond the
+  // allocation. Read tile zero for those lanes and zero their scale.
   const auto* b_base = reinterpret_cast<const std::int8_t*>(x_blocks) +
-                       ((tt_block + static_cast<std::size_t>(b_tile)) *
-                        num_blocks * kQ8ActTileBytes);
+                       ((tile_live ? wanted : 0) * num_blocks * kQ8ActTileBytes);
   const bool b_live = b_tile < kTokTiles;
 
   const auto fetch_stage = [&](int kb0) {
@@ -520,7 +525,7 @@ __launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
         const auto* tile =
             b_base + (static_cast<std::size_t>(kb_clamped) * kQ8ActTileBytes);
         r_b[i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
-        r_dx[i] = ((kb < num_kb) ? 1.0F : 0.0F) *
+        r_dx[i] = ((kb < num_kb && tile_live) ? 1.0F : 0.0F) *
                   reinterpret_cast<const float*>(
                       tile + kQ8ActScaleOffset)[lane_id & 15];
       }
