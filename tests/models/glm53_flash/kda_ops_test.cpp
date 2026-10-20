@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <random>
@@ -278,13 +279,14 @@ struct Device {
 /// Runs the GPU pipeline on tokens [t0, t0 + n), carrying conv history and
 /// state in the device buffers.
 bool RunGpu(const Inputs& in, Device& d, std::uint32_t t0, std::uint32_t n,
-            hipStream_t stream) {
+            hipStream_t stream, float* conv_ckpt = nullptr,
+            float* state_ckpt = nullptr) {
   const std::uint32_t H = in.H;
   const std::size_t tw = std::size_t{t0} * in.width;
   float* conv = d.conv.get() + (std::size_t{t0} * in.channels);
   bool ok = rocm::KdaConv(d.qkv.get() + (std::size_t{t0} * in.qkv_stride),
                           in.qkv_stride, d.conv_w.get(), d.hist.get(), conv, n,
-                          in.channels, stream);
+                          in.channels, stream, conv_ckpt);
   ok = ok && rocm::KdaGate(d.f.get() + (std::size_t{t0} * in.f_stride),
                            in.f_stride, d.dt.get(), d.a.get(), kLowerBound,
                            d.g.get() + tw, d.decay.get() + tw, n, H, stream);
@@ -297,7 +299,8 @@ bool RunGpu(const Inputs& in, Device& d, std::uint32_t t0, std::uint32_t n,
                                 conv + (2 * in.width), in.channels,
                                 d.decay.get() + tw,
                                 d.beta.get() + (std::size_t{t0} * H),
-                                d.state.get(), d.o.get() + tw, n, H, stream);
+                                d.state.get(), d.o.get() + tw, n, H, stream,
+                                state_ckpt);
   ok = ok && rocm::KdaOutput(d.o.get() + tw,
                              d.gate.get() + (std::size_t{t0} * in.gate_stride),
                              in.gate_stride, d.norm_w.get(), kRmsEps,
@@ -374,6 +377,57 @@ void RunCase(std::uint32_t T, std::uint32_t H, std::uint32_t prefill,
   }
 }
 
+/// Speculative verify checkpoints: a pass of n tokens after `prefill`
+/// records the conv history and state after each of its first n - 1
+/// tokens; each must equal, bit for bit, a pass that stopped there.
+void RunCheckpointCase(std::uint32_t T, std::uint32_t H, std::uint32_t prefill,
+                       unsigned seed) {
+  const Inputs in = MakeInputs(T, H, seed);
+  const std::uint32_t n = T - prefill;
+  const std::size_t hist = in.hist0.size();
+  const std::size_t state = in.state0.size();
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreate(&stream), "hipStreamCreate");
+  DeviceBuffer conv_ckpt((n - 1) * hist);
+  DeviceBuffer state_ckpt((n - 1) * state);
+  bool ok = true;
+  {
+    Device d(in);
+    ok = RunGpu(in, d, 0, prefill, stream) &&
+         RunGpu(in, d, prefill, n, stream, conv_ckpt.get(), state_ckpt.get());
+  }
+  CheckHip(hipStreamSynchronize(stream), "hipStreamSynchronize");
+  const auto ck_conv = conv_ckpt.Download();
+  const auto ck_state = state_ckpt.Download();
+  for (std::uint32_t keep = 1; ok && keep < n; ++keep) {
+    Device d(in);
+    ok = RunGpu(in, d, 0, prefill, stream) &&
+         RunGpu(in, d, prefill, keep, stream);
+    CheckHip(hipStreamSynchronize(stream), "hipStreamSynchronize");
+    const auto h = d.hist.Download();
+    const auto st = d.state.Download();
+    const bool same =
+        std::memcmp(h.data(), ck_conv.data() + ((keep - 1) * hist),
+                    hist * sizeof(float)) == 0 &&
+        std::memcmp(st.data(), ck_state.data() + ((keep - 1) * state),
+                    state * sizeof(float)) == 0;
+    const std::string what = "H=" + std::to_string(H) + " verify " +
+                             std::to_string(n) + " after " +
+                             std::to_string(prefill) + ": checkpoint " +
+                             std::to_string(keep) +
+                             " bit-identical to a pass of " +
+                             std::to_string(keep);
+    std::cout << (same ? "ok   " : "FAIL ") << what << "\n";
+    if (!same)
+      ++failures;
+  }
+  CheckHip(hipStreamDestroy(stream), "hipStreamDestroy");
+  if (!ok) {
+    std::cout << "FAIL checkpoint case launcher returned false\n";
+    ++failures;
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -387,6 +441,8 @@ int main() {
     RunCase(5, 64, 2, 12);    // short prefill; split reads history + new tokens
     RunCase(64, 16, 40, 13);  // multi-tile conv + history kernel
     RunCase(9, 3, 8, 14);     // partial final conv tile + partial norm group
+    RunCheckpointCase(7, 64, 2, 15);  // verify 5 after a 2-token prefill
+    RunCheckpointCase(2, 16, 0, 16);  // verify 2 from the initial state
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << "\n";
     return 1;

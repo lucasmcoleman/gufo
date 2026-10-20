@@ -32,7 +32,8 @@ __device__ __forceinline__ float WaveSum(float v) {
 
 /// Pools [first, first + gridDim.x): softmax over the pool's tokens of
 /// gate + ape per channel, weighting the LayerNorm keys (PoolKeys). Tokens
-/// before pos0 come from the ring, the others from this pass's rows.
+/// before pos0 come from the ring (slot pos % (2 * kpool)), the others from
+/// this pass's rows.
 __global__ void PoolKernel(const float* ik, const float* ig,
                            const float* ring_key, const float* ring_gate,
                            const float* ape, float* pooled, std::uint32_t pos0,
@@ -42,13 +43,13 @@ __global__ void PoolKernel(const float* ik, const float* ig,
   for (std::uint32_t d = threadIdx.x; d < idim; d += blockDim.x) {
     const auto key_at = [&](std::uint32_t i) {
       const std::uint32_t pos = (p * kpool) + i;
-      return pos < pos0 ? ring_key[(std::size_t{pos % kpool} * idim) + d]
+      return pos < pos0 ? ring_key[(std::size_t{pos % (2 * kpool)} * idim) + d]
                         : ik[(std::size_t{pos - pos0} * idim) + d];
     };
     const auto logit_at = [&](std::uint32_t i) {
       const std::uint32_t pos = (p * kpool) + i;
       const float g = pos < pos0
-                          ? ring_gate[(std::size_t{pos % kpool} * idim) + d]
+                          ? ring_gate[(std::size_t{pos % (2 * kpool)} * idim) + d]
                           : ig[(std::size_t{pos - pos0} * idim) + d];
       return g + ape[(std::size_t{i} * idim) + d];
     };
@@ -67,14 +68,15 @@ __global__ void PoolKernel(const float* ik, const float* ig,
   }
 }
 
-/// Copies rows [first, first + gridDim.x) of this pass into ring slots.
+/// Copies rows [first, first + gridDim.x) of this pass into ring slots
+/// pos % (2 * kpool).
 __global__ void RingKernel(const float* ik, const float* ig, float* ring_key,
                            float* ring_gate, std::uint32_t pos0,
                            std::uint32_t first, std::uint32_t kpool,
                            std::uint32_t idim) {
   const std::uint32_t pos = first + blockIdx.x;
   const std::size_t src = std::size_t{pos - pos0} * idim;
-  const std::size_t dst = std::size_t{pos % kpool} * idim;
+  const std::size_t dst = std::size_t{pos % (2 * kpool)} * idim;
   for (std::uint32_t d = threadIdx.x; d < idim; d += blockDim.x) {
     ring_key[dst + d] = ik[src + d];
     ring_gate[dst + d] = ig[src + d];
@@ -335,7 +337,10 @@ bool IndexerForward(const Config& c, const MlaLayerDevice& w,
   ScaleKernel<<<static_cast<unsigned>((weights + 255) / 256), 256, 0, stream>>>(
       b.iw, weights, scale);
 
-  // Pools completed by this pass, then the incomplete tail into the ring.
+  // Pools completed by this pass, then the pass's last 2 * kpool rows into
+  // the ring. Keeping every recent row, not only the incomplete pool's,
+  // lets Executor::Rollback drop a pass's tail: a dropped row of a new pool
+  // takes a slot 2 * kpool away from any kept row of the pool before it.
   const std::uint32_t p_first = pos0 / kpool;
   const std::uint32_t p_end = pos_end / kpool;
   if (p_end > p_first) {
@@ -343,7 +348,8 @@ bool IndexerForward(const Config& c, const MlaLayerDevice& w,
         b.ik, b.ig, cache.ring_key, cache.ring_gate, w.idx_ape, cache.pooled,
         pos0, p_first, kpool, idim);
   }
-  const std::uint32_t ring_first = std::max(pos0, p_end * kpool);
+  const std::uint32_t ring_first =
+      pos_end > 2 * kpool ? std::max(pos0, pos_end - (2 * kpool)) : pos0;
   if (pos_end > ring_first) {
     RingKernel<<<pos_end - ring_first, kPoolThreads, 0, stream>>>(
         b.ik, b.ig, cache.ring_key, cache.ring_gate, pos0, ring_first, kpool,

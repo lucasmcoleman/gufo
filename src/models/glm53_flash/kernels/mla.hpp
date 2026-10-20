@@ -11,8 +11,10 @@
 //   latent   [capacity][kv_lora]      RMSNorm(kv_a x), the whole K = V cache
 //   pooled   [capacity / kpool][idim] pooled indexer keys, one per complete
 //                                     pool
-//   ring_key [kpool][idim]            LayerNorm indexer keys and gate logits
-//   ring_gate[kpool][idim]            of the incomplete pool, slot pos % kpool
+//   ring_key [2*kpool][idim]          LayerNorm indexer keys and gate logits
+//   ring_gate[2*kpool][idim]          of the last 2 * kpool positions, slot
+//                                     pos % (2 * kpool) (the incomplete pool's
+//                                     rows, and room for a rolled-back tail)
 //   scores   [kSelectTokens][capacity / kpool]
 //                                     pool scores of the query tokens being
 //                                     selected (workspace; sized by capacity,
