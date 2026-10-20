@@ -771,9 +771,11 @@ bool Executor::Init(std::string* error) {
 
   const std::size_t hidden = c.hidden_size;
   const std::size_t mix_dim = c.HcMixDim();
-  layers_.assign(c.num_layers, {});
+  // With the NextN block, its LayerDevice and MlaCache follow the trunk's.
+  const std::uint32_t slots = c.num_layers + (options_.nextn ? 1 : 0);
+  layers_.assign(slots, {});
   kda_.assign(c.num_layers, {});
-  mla_.assign(c.num_layers, {});
+  mla_.assign(slots, {});
   for (std::uint32_t il = first; il < last; ++il) {
     const LayerWeights& l = weights_.layers[il];
     LayerDevice& d = layers_[il];
@@ -846,6 +848,59 @@ bool Executor::Init(std::string* error) {
     }
     if (!UploadFfnLayer(arena_, c, l, il, &d.ffn, &why)) {
       return layer_fail(why);
+    }
+  }
+
+  if (options_.nextn) {
+    const std::uint32_t il = c.num_layers;
+    std::string why;
+    const auto nextn_fail = [&](const std::string& what) {
+      return Fail(error, "NextN block: " + what);
+    };
+    if (!options_.embed || !options_.head || weights_.layers.size() <= il ||
+        !weights_.layers[il].nextn || !c.IsMlaLayer(il)) {
+      return nextn_fail(
+          "needs the weights bound with NextN, the embedding and the head");
+    }
+    const LayerWeights& l = weights_.layers[il];
+    LayerDevice& d = layers_[il];
+    d.attn_norm = UploadF32(arena_, {&l.attn_norm}, hidden, "attn_norm", &why);
+    d.ffn_norm = d.attn_norm != nullptr ? UploadF32(arena_, {&l.ffn_norm},
+                                                    hidden, "ffn_norm", &why)
+                                        : nullptr;
+    enorm_ = d.ffn_norm != nullptr
+                 ? UploadF32(arena_, {&l.nextn_enorm}, hidden, "enorm", &why)
+                 : nullptr;
+    hnorm_ = enorm_ != nullptr
+                 ? UploadF32(arena_, {&l.nextn_hnorm}, hidden, "hnorm", &why)
+                 : nullptr;
+    // shared_head_norm, else the trunk's output_norm (llama.cpp graph_mtp).
+    const TensorRef& head_norm = l.nextn_head_norm.empty()
+                                     ? weights_.output_norm
+                                     : l.nextn_head_norm;
+    nextn_head_norm_ = hnorm_ != nullptr ? UploadF32(arena_, {&head_norm},
+                                                     hidden, "head_norm", &why)
+                                         : nullptr;
+    if (nextn_head_norm_ == nullptr) {
+      return nextn_fail(why);
+    }
+    if (!CheckMatrix(l.nextn_eh_proj, "eh_proj", 2 * hidden, hidden, error) ||
+        !UploadMatrix(arena_, l.nextn_eh_proj, &eh_proj_, error)) {
+      return false;
+    }
+    if (!UploadMlaLayer(arena_, c, l, il, &d.mla, &why) ||
+        !UploadFfnLayer(arena_, c, l, il, &d.ffn, &why)) {
+      return nextn_fail(why);
+    }
+    MlaCache& cache = mla_[il];
+    cache.bytes = ops_.mla_cache_bytes(c, options_.capacity);
+    cache.capacity = options_.capacity;
+    if (cache.bytes != 0) {
+      cache.data = arena_.Allocate(cache.bytes);
+      if (cache.data == nullptr ||
+          hipMemset(cache.data, 0, cache.bytes) != hipSuccess) {
+        return nextn_fail("MLA cache allocation failed");
+      }
     }
   }
 
@@ -923,8 +978,14 @@ bool Executor::Reset() {
                      hipSuccess;
     }
   }
+  if (options_.nextn && mla_[config_.num_layers].data != nullptr) {
+    const MlaCache& cache = mla_[config_.num_layers];
+    ok = ok && hipMemsetAsync(cache.data, 0, cache.bytes, stream_) ==
+                   hipSuccess;
+  }
   ok = ok && hipStreamSynchronize(stream_) == hipSuccess;
   position_ = 0;
+  nextn_position_ = 0;
   verify_open_ = false;
   failed_ = !ok;
   return ok;
@@ -1010,6 +1071,105 @@ bool Executor::Rollback(std::uint32_t keep) {
     return false;
   }
   position_ = verify_base_ + keep;
+  return true;
+}
+
+bool Executor::ForwardNextn(std::span<const std::int32_t> tokens,
+                            std::span<const float> h, bool want_logits,
+                            ForwardResult* out, std::string* error) {
+  const Config& c = config_;
+  const std::uint32_t il = c.num_layers;
+  const std::size_t hidden = c.hidden_size;
+  if (!options_.nextn) {
+    return Fail(error, "ForwardNextn needs ExecutorOptions::nextn");
+  }
+  if (failed_) {
+    return Fail(error, "a previous call failed partway; call Reset()");
+  }
+  if (out == nullptr || h.size() != tokens.size() * hidden) {
+    return Fail(error, "ForwardNextn: null result or h size mismatch");
+  }
+  *out = ForwardResult{};
+  for (const std::int32_t id : tokens) {
+    if (id < 0 || static_cast<std::uint32_t>(id) >= c.vocab_size) {
+      return Fail(error, "token id " + std::to_string(id) + " out of range");
+    }
+  }
+  const auto n_tokens = static_cast<std::uint32_t>(tokens.size());
+  if (std::uint64_t{nextn_position_} + n_tokens > mla_[il].capacity) {
+    return Fail(error, "NextN MLA cache capacity exceeded");
+  }
+  const LayerDevice& d = layers_[il];
+  const OpContext ctx{.stream = stream_,
+                      .scratch = scratch_,
+                      .scratch_bytes = scratch_bytes_,
+                      .tap = nullptr,
+                      .profiler = profiler_.get()};
+  const auto download = [&](std::vector<float>& dst, const float* src,
+                            std::uint32_t n, std::size_t width) {
+    const std::size_t at = dst.size();
+    dst.resize(at + (n * width));
+    return hipMemcpyAsync(dst.data() + at, src, n * width * sizeof(float),
+                          hipMemcpyDeviceToHost, stream_) == hipSuccess;
+  };
+  failed_ = true;
+  for (std::uint32_t t0 = 0; t0 < n_tokens; t0 += options_.max_tokens) {
+    const std::uint32_t n = std::min(options_.max_tokens, n_tokens - t0);
+    const std::vector<std::uint32_t> ids(tokens.begin() + t0,
+                                         tokens.begin() + t0 + n);
+    // [enorm(embed) | hnorm(h)] rows in streams_ (hc_dim >= 2 * hidden).
+    bool ok = hipMemcpyAsync(ids_, ids.data(), n * sizeof(std::uint32_t),
+                             hipMemcpyHostToDevice, stream_) == hipSuccess &&
+              hipMemcpyAsync(a_, h.data() + (std::size_t{t0} * hidden),
+                             n * hidden * sizeof(float), hipMemcpyHostToDevice,
+                             stream_) == hipSuccess;
+    ::gufo::hip::LaunchBatchedEmbeddingLookup(embd_.data, embd_.type, ids_, x_,
+                                              n, hidden, stream_);
+    ::gufo::hip::LaunchBatchedRMSNorm(x_, enorm_, xn_, nullptr, n, hidden,
+                                      c.rms_eps, stream_);
+    ::gufo::hip::LaunchBatchedRMSNorm(a_, hnorm_, x_, nullptr, n, hidden,
+                                      c.rms_eps, stream_);
+    const std::size_t row = hidden * sizeof(float);
+    ok = ok &&
+         hipMemcpy2DAsync(streams_, 2 * row, xn_, row, row, n,
+                          hipMemcpyDeviceToDevice, stream_) == hipSuccess &&
+         hipMemcpy2DAsync(streams_ + hidden, 2 * row, x_, row, row, n,
+                          hipMemcpyDeviceToDevice, stream_) == hipSuccess;
+    // x_ = eh_proj(...) is the attention residual.
+    ok = ok && LaunchProjection(eh_proj_, streams_, x_, n, stream_);
+    ::gufo::hip::LaunchBatchedRMSNorm(x_, d.attn_norm, xn_, nullptr, n, hidden,
+                                      c.rms_eps, stream_);
+    ok = ok && ops_.mla(ctx, c, il, d.mla, mla_[il], xn_, n,
+                        nextn_position_ + t0, a_);
+    ::gufo::hip::LaunchResidualAdd(x_, a_, x_, n * hidden, stream_);
+    ::gufo::hip::LaunchBatchedRMSNorm(x_, d.ffn_norm, xn_, nullptr, n, hidden,
+                                      c.rms_eps, stream_);
+    ok = ok && ops_.ffn(ctx, c, il, d.ffn, xn_, n, a_);
+    ::gufo::hip::LaunchResidualAdd(x_, a_, x_, n * hidden, stream_);
+    ::gufo::hip::LaunchBatchedRMSNorm(x_, nextn_head_norm_, xn_, nullptr, n,
+                                      hidden, c.rms_eps, stream_);
+    ok = ok && download(out->hidden, xn_, n, hidden);
+    if (want_logits && !output_.empty()) {
+      ok = ok && LaunchProjection(output_, xn_, logits_, n, stream_) &&
+           download(out->logits, logits_, n, c.vocab_size);
+    }
+    ok = ok && hipStreamSynchronize(stream_) == hipSuccess &&
+         hipPeekAtLastError() == hipSuccess;
+    if (!ok) {
+      return Fail(error, "NextN pass failed");
+    }
+  }
+  nextn_position_ += n_tokens;
+  failed_ = false;
+  return true;
+}
+
+bool Executor::RewindNextn(std::uint32_t position) {
+  if (position > nextn_position_ ||
+      nextn_position_ - position > config_.indexer_kpool + 1) {
+    return false;
+  }
+  nextn_position_ = position;
   return true;
 }
 

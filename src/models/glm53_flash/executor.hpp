@@ -239,6 +239,10 @@ struct ExecutorOptions {
   /// consecutive passes, which is exact (state carries across passes).
   std::uint32_t max_tokens{64};
   std::uint32_t capacity{4096};  ///< Positions per MLA cache.
+  /// Upload the NextN (MTP) block for ForwardNextn: its MLA layer (with its
+  /// own MlaCache), MoE, eh_proj and norms. Needs the weights bound with
+  /// NextN, `embed` and `head`.
+  bool nextn{false};
   /// Largest ForwardVerify call (draft tokens + 1). Above 1, each KDA layer
   /// holds max_verify_tokens - 1 checkpoints of its state (4 MiB each at
   /// GLM-5.3-Flash's shapes) for Rollback.
@@ -348,6 +352,21 @@ public:
   /// ForwardVerify.
   [[nodiscard]] bool Rollback(std::uint32_t keep);
 
+  /// NextN (MTP) draft block (ReferenceModel::ForwardNextn): token t at
+  /// NextnPosition() + t paired with h[t] [hidden], the trunk's
+  /// final_norm.out (ForwardResult::hidden) of the previous position. Fills
+  /// `out->hidden` (h_nextn, the next draft step's h) and, with
+  /// `want_logits`, `out->logits`. Advances NextnPosition(). Synchronous.
+  [[nodiscard]] bool ForwardNextn(std::span<const std::int32_t> tokens,
+                                  std::span<const float> h, bool want_logits,
+                                  ForwardResult* out, std::string* error);
+  [[nodiscard]] std::uint32_t NextnPosition() const noexcept {
+    return nextn_position_;
+  }
+  /// Moves the NextN position back to `position` (drafts that were not
+  /// accepted), at most kpool + 1 positions (the indexer ring's reach).
+  [[nodiscard]] bool RewindNextn(std::uint32_t position);
+
   /// As Forward, from host residual streams [T][hc][hidden] entering
   /// first_layer instead of token ids (a layer range starting past 0).
   [[nodiscard]] bool ForwardStreams(const float* streams,
@@ -384,6 +403,13 @@ private:
   std::vector<KdaState> kda_;        ///< Indexed by layer; KDA layers.
   std::vector<MlaCache> mla_;        ///< Indexed by layer; MLA layers.
   DeviceMatrix embd_;
+  // NextN block (ExecutorOptions::nextn); its LayerDevice and MlaCache are
+  // layers_[num_layers] and mla_[num_layers].
+  DeviceMatrix eh_proj_;
+  const float* enorm_{nullptr};
+  const float* hnorm_{nullptr};
+  const float* nextn_head_norm_{nullptr};
+  std::uint32_t nextn_position_{0};
   DeviceMatrix output_;
   const float* output_norm_{nullptr};
   // Activations of one pass, [max_tokens] rows each.

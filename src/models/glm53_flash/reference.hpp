@@ -173,6 +173,19 @@ public:
   Output Forward(std::span<const std::int32_t> tokens, bool want_logits = false,
                  const TapFn& tap = {});
 
+  /// The NextN (MTP) block, layer num_layers (llama.cpp glm5-next graph_mtp;
+  /// HF has no NextN). Token t runs at NextnPosition() + t paired with
+  /// h[t] [hidden], the trunk's final_norm.out of the previous position:
+  /// x = eh_proj([RMSNorm(embed, enorm) | RMSNorm(h, hnorm)]), then a plain
+  /// residual MLA + MoE layer (no hyper-connections) with its own caches,
+  /// then RMSNorm(shared_head_norm). `hidden` is that h_nextn (the next
+  /// draft step's h); logits use the trunk's output.weight.
+  Output ForwardNextn(std::span<const std::int32_t> tokens,
+                      std::span<const float> h, bool want_logits = false);
+  [[nodiscard]] std::uint32_t NextnPosition() const noexcept {
+    return nextn_position_;
+  }
+
 private:
   void Layer(std::uint32_t il, std::uint32_t n_tokens, std::vector<float>& H,
              const TapFn& tap);
@@ -183,6 +196,7 @@ private:
   const Config& config_;
   const WeightSource& weights_;
   std::uint32_t position_{0};
+  std::uint32_t nextn_position_{0};
   bool failed_{false};
   std::vector<KdaLayerState> kda_;  ///< Indexed by layer; empty on MLA layers.
   std::vector<MlaLayerState> mla_;  ///< Indexed by layer; empty on KDA layers.
