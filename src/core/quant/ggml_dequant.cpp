@@ -294,6 +294,35 @@ void DequantizeQ6_K(const void* src, float* dst, std::size_t k) {
   }
 }
 
+// ggml dequantize_row_q2_K: per 128-value half, four 2-bit planes of 32
+// values; each run of 16 has its own 4-bit scale (low) and min (high).
+void DequantizeQ2_K(const void* src, float* dst, std::size_t k) {
+  static_assert(sizeof(block_q2_K) == 84);
+  const auto* blocks = static_cast<const block_q2_K*>(src);
+  const std::size_t nb = k / 256;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = Fp16ToFloat(blocks[b].d);
+    const float dmin = Fp16ToFloat(blocks[b].dmin);
+    const std::uint8_t* q = blocks[b].qs;
+    float* y = dst + (b * 256);
+    int is = 0;
+    for (int n = 0; n < 256; n += 128) {
+      for (int shift = 0; shift < 8; shift += 2) {
+        for (int half = 0; half < 2; ++half) {
+          const std::uint8_t sc = blocks[b].scales[is++];
+          const float dl = d * static_cast<float>(sc & 0xF);
+          const float ml = dmin * static_cast<float>(sc >> 4);
+          for (int l = 0; l < 16; ++l) {
+            *y++ = (dl * static_cast<float>((q[(half * 16) + l] >> shift) & 3)) -
+                   ml;
+          }
+        }
+      }
+      q += 32;
+    }
+  }
+}
+
 void DequantizeQ3_K(const void* src, float* dst, std::size_t k) {
   const auto* blocks = static_cast<const block_q3_K*>(src);
   const std::size_t nb = k / 256;

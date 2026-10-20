@@ -41,6 +41,13 @@ struct block_q6_K {
   std::uint16_t d;
 };
 
+struct block_q2_K {
+  std::uint8_t scales[16];  // low nibble scale, high nibble min, per 16
+  std::uint8_t qs[64];      // 2-bit quants
+  std::uint16_t d;
+  std::uint16_t dmin;
+};
+
 struct block_q3_K {
   std::uint8_t hmask[32];
   std::uint8_t qs[64];
@@ -182,6 +189,9 @@ void DequantizeQ5_K(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of Q6_K to float
 void DequantizeQ6_K(const void* src, float* dst, std::size_t k);
+
+// Dequantize row of Q2_K to float
+void DequantizeQ2_K(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of Q3_K to float
 void DequantizeQ3_K(const void* src, float* dst, std::size_t k);

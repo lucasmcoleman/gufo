@@ -65,6 +65,7 @@ bool IsIq(GgmlType t) {
   return t == GgmlType::kIQ2_XXS || t == GgmlType::kIQ2_S ||
          t == GgmlType::kIQ3_XXS;
 }
+bool Ds4Enabled();
 bool Matrix(const DeviceMatrix& w, std::uint32_t rows, std::uint32_t cols,
             std::uint32_t experts, bool routed) {
   if (!rows || !cols || !experts || w.empty() || w.rows != rows ||
@@ -87,6 +88,13 @@ bool Matrix(const DeviceMatrix& w, std::uint32_t rows, std::uint32_t cols,
       if (routed || cols % 32)
         return false;
       bytes = std::size_t{cols / 32} * 34;
+      break;
+    case GgmlType::kQ2_K:
+    case GgmlType::kQ3_K:
+      // NextN routed experts; DS4 kernels only (no scalar routed path).
+      if (!routed || cols % 256 || !Ds4Enabled())
+        return false;
+      bytes = std::size_t{cols / 256} * (w.type == GgmlType::kQ2_K ? 84 : 110);
       break;
     case GgmlType::kIQ2_XXS:
     case GgmlType::kIQ2_S:
@@ -252,8 +260,8 @@ bool Ds4Shape(const DeviceMatrix& w, const std::int32_t* ids) {
 
 bool UseDs4(const DeviceMatrix& gate, const DeviceMatrix& up,
             const std::int32_t* ids) {
-  return Ds4Shape(gate, ids) && gate.type == GgmlType::kIQ2_XXS &&
-         up.type == GgmlType::kIQ2_XXS;
+  return Ds4Shape(gate, ids) && gate.type == up.type &&
+         (gate.type == GgmlType::kIQ2_XXS || gate.type == GgmlType::kQ2_K);
 }
 
 constexpr std::uint32_t kVecTokens = 8;
@@ -264,6 +272,12 @@ bool Ds4GateUp(const DeviceMatrix& gate, const DeviceMatrix& up,
   const int m = static_cast<int>(gate.rows), k = static_cast<int>(gate.cols),
             t = static_cast<int>(tokens), e = static_cast<int>(gate.experts),
             r = static_cast<int>(routes);
+  if (gate.type == GgmlType::kQ2_K) {
+    const auto project = tokens <= kVecTokens ? ds4_mmq_q2_K_moe_vec
+                                              : ds4_mmq_q2_K_moe;
+    return project(gate.data, x, ids, g, m, k, t, e, r, stream) == 0 &&
+           project(up.data, x, ids, u, m, k, t, e, r, stream) == 0;
+  }
   if (tokens <= kVecTokens)
     return ds4_mmq_iq2_xxs_moe_vec(gate.data, x, ids, g, m, k, t, e, r,
                                    stream) == 0 &&
@@ -279,8 +293,9 @@ bool Ds4GateUp(const DeviceMatrix& gate, const DeviceMatrix& up,
 }
 
 bool UseDs4Down(const DeviceMatrix& down, const std::int32_t* ids) {
-  return Ds4Shape(down, ids) && (down.type == GgmlType::kIQ2_S ||
-                                 down.type == GgmlType::kIQ3_XXS);
+  return Ds4Shape(down, ids) &&
+         (down.type == GgmlType::kIQ2_S || down.type == GgmlType::kIQ3_XXS ||
+          down.type == GgmlType::kQ3_K);
 }
 
 // Each route's down input differs, so the assignments are flattened to
@@ -300,12 +315,13 @@ bool Ds4Down(const DeviceMatrix& down, const float* x, const std::int32_t* ids,
   // IQ3_XXS: 20.9 -> 11.4 ms (order-only differences, max 1.1e-5).
   if (!vec)
     ds4_mmq_set_moe_down_bounds(Ds4TileCols(), static_cast<int>(tokens));
-  const bool ok =
+  const auto project =
       down.type == GgmlType::kIQ2_S
-          ? (vec ? ds4_mmq_iq2_s_moe_vec : ds4_mmq_iq2_s_moe)(
-                down.data, x, ids, y, m, k, n, e, 1, stream) == 0
-          : (vec ? ds4_mmq_iq3_xxs_moe_vec : ds4_mmq_iq3_xxs_moe)(
-                down.data, x, ids, y, m, k, n, e, 1, stream) == 0;
+          ? (vec ? ds4_mmq_iq2_s_moe_vec : ds4_mmq_iq2_s_moe)
+      : down.type == GgmlType::kQ3_K
+          ? (vec ? ds4_mmq_q3_K_moe_vec : ds4_mmq_q3_K_moe)
+          : (vec ? ds4_mmq_iq3_xxs_moe_vec : ds4_mmq_iq3_xxs_moe);
+  const bool ok = project(down.data, x, ids, y, m, k, n, e, 1, stream) == 0;
   if (!vec)
     ds4_mmq_set_moe_down_bounds(0, 0);
   return ok;
