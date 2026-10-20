@@ -22,3 +22,19 @@ outside decode timing. Loading took 25.11 s and 18.08 s respectively; the
 ordering and cache history prevent attributing that difference to graphs.
 Prefill includes allocation and warmup variation; raw per-run values are retained.
 These direct timings are not interchangeable with prior stdout-chunk timings.
+
+## Paired gate/up quantization, 2026-10-19
+
+Same model, prompts, compiler flags and timing scope as above; both binaries
+include the Q8_0 activation-tail safety fix. Baseline GLM code is unchanged
+from `98daaee` (the intervening `e9d79df` commit only records results).
+
+| Prompt tokens | Baseline prefill seconds | Paired prefill seconds | Baseline decode tok/s | Paired decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| 32 | 0.397890 | 0.398434 | 17.3074 | 17.2549 |
+| 2048 | 10.2768 | 10.3043 | 12.7381 | 12.7091 |
+
+Medians of three resets per variant, baseline before candidate. No measured
+gain; the candidate was removed. [Individual runs](artifacts/prefill-20261019.json)
+include cold-first-run variation. A separate profile put routed MoE at 57%
+of prefill time, KDA at 20%, and MLA at 19.3%.
