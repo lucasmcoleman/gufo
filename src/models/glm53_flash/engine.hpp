@@ -58,6 +58,11 @@ struct ModelOptions {
   /// NextN weights (~2.8 GB) and a KDA state checkpoint per layer. The
   /// environment variable GUFO_GLM53_MTP=0 turns it off.
   bool mtp{true};
+  /// Run a short prefill, a decode step and a draft cycle at the end of
+  /// Load, so the first request does not pay the weights' first GPU touch
+  /// and each kernel's first launch (about 1-4 s on a loaded MasterServer).
+  /// Off by default: a one-shot run pays the cost either way.
+  bool warm_up{false};
 };
 
 class Model final : public std::enable_shared_from_this<Model> {

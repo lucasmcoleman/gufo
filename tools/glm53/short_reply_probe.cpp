@@ -2,7 +2,7 @@
 // prompt generated `reps` times (session reset each time), timing prefill,
 // the first token and the rest of decode separately. Run once with
 // GUFO_GLM53_MTP=0 and once without to tell a one-time warm-up cost from a
-// per-request one.
+// per-request one. PROBE_WARM_UP=1 loads with ModelOptions::warm_up.
 //
 // usage: glm53_flash_short_reply_probe <model.gguf> <prompt text> [reps] [max_tokens]
 
@@ -36,7 +36,12 @@ int main(int argc, char** argv) {
   const std::size_t max_tokens = argc > 4 ? std::strtoul(argv[4], nullptr, 10) : 256;
   std::string error;
   const auto load0 = Clock::now();
-  auto model = glm::Model::Load(argv[1], glm::ModelOptions{.max_context = 4096}, &error);
+  const char* warm = std::getenv("PROBE_WARM_UP");
+  auto model = glm::Model::Load(
+      argv[1],
+      glm::ModelOptions{.max_context = 4096,
+                        .warm_up = warm != nullptr && *warm == '1'},
+      &error);
   if (model == nullptr) {
     std::cerr << "load: " << error << '\n';
     return 1;
@@ -48,6 +53,7 @@ int main(int argc, char** argv) {
   }
   std::cout << std::fixed << std::setprecision(3) << "load " << Since(load0)
             << " s, MTP " << (std::getenv("GUFO_GLM53_MTP") ? std::getenv("GUFO_GLM53_MTP") : "default")
+            << ", warm-up " << (std::getenv("PROBE_WARM_UP") ? std::getenv("PROBE_WARM_UP") : "0")
             << '\n';
   glm::Generator generator(*session, model->stop_tokens(), &model->tokenizer());
   std::vector<glm::ChatMessage> messages(1);
