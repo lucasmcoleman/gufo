@@ -50,14 +50,16 @@ public:
                std::string* error) override {
     if (tokens.empty())
       return Fail(error, "GLM-5.3-Flash forward needs at least one token");
-    ids_.clear();
-    for (const TokenId token : tokens) {
-      if (token >
-          static_cast<TokenId>(std::numeric_limits<std::int32_t>::max()))
-        return Fail(error, "GLM-5.3-Flash token id out of range");
-      ids_.push_back(static_cast<std::int32_t>(token));
-    }
+    if (!ToIds(tokens, error))
+      return false;
     const std::span<const std::int32_t> all(ids_);
+    if (draft_) {
+      // A Draft not followed by Verify left the anchor in the draft block.
+      if (drafted_ && !executor_.RewindNextn(executor_.NextnPosition() - 1))
+        return Fail(error, "GLM-5.3-Flash draft rewind failed");
+      drafted_ = false;
+      return ForwardWithDraft(all, logits, error);
+    }
     if (fused_) {
       // One pass per chunk: the final pass projects its last row only, and
       // no pass downloads the hidden states.
@@ -95,6 +97,10 @@ public:
   }
 
   bool Reset(std::string* error) override {
+    // The draft block's first token pairs with a zero h (llama.cpp's
+    // draft-mtp pending row).
+    h_last_.assign(hidden_, 0.0F);
+    drafted_ = false;
     return executor_.Reset() ||
            Fail(error, "GLM-5.3-Flash executor reset failed");
   }
@@ -104,13 +110,122 @@ public:
   }
   std::uint32_t Capacity() const noexcept override { return capacity_; }
 
+  bool CanDraft() const noexcept override { return draft_; }
+
+  bool Draft(TokenId anchor, TokenId* draft, std::string* error) override {
+    if (!draft_ || draft == nullptr)
+      return Fail(error, "GLM-5.3-Flash session has no draft block");
+    const std::int32_t id[1] = {static_cast<std::int32_t>(anchor)};
+    if (drafted_ && !executor_.RewindNextn(executor_.NextnPosition() - 1))
+      return Fail(error, "GLM-5.3-Flash draft rewind failed");
+    drafted_ = false;
+    if (!executor_.ForwardNextn(id, h_last_, true, &draft_result_, error))
+      return false;
+    drafted_ = true;
+    if (draft_result_.logits.size() != vocab_)
+      return Fail(error, "GLM-5.3-Flash draft returned no logits");
+    *draft = static_cast<TokenId>(
+        std::max_element(draft_result_.logits.begin(),
+                         draft_result_.logits.end()) -
+        draft_result_.logits.begin());
+    return true;
+  }
+
+  bool Verify(std::span<const TokenId> tokens, std::vector<float>* logits,
+              std::string* error) override {
+    if (!draft_ || logits == nullptr || tokens.empty())
+      return Fail(error, "GLM-5.3-Flash verify needs a draft block");
+    if (!drafted_ || !ToIds(tokens, error))
+      return Fail(error, "GLM-5.3-Flash verify needs a Draft first");
+    drafted_ = false;
+    verify_ids_ = ids_;
+    if (!executor_.ForwardVerify(ids_, true, &result_, error))
+      return false;
+    if (result_.logits.size() != tokens.size() * vocab_ ||
+        result_.hidden.size() != tokens.size() * hidden_)
+      return Fail(error, "GLM-5.3-Flash verify returned short rows");
+    logits->assign(result_.logits.begin(), result_.logits.end());
+    return true;
+  }
+
+  bool Accept(std::size_t keep, std::string* error) override {
+    if (keep == 0 || keep > verify_ids_.size() ||
+        !executor_.Rollback(static_cast<std::uint32_t>(keep)))
+      return Fail(error, "GLM-5.3-Flash rollback failed");
+    // Draft() already ran the anchor through the draft block; the other
+    // kept tokens pair with the trunk h of the row before them.
+    if (keep > 1) {
+      const std::span<const std::int32_t> rest(verify_ids_.data() + 1,
+                                               keep - 1);
+      const std::span<const float> h(result_.hidden.data(),
+                                     (keep - 1) * hidden_);
+      if (!executor_.ForwardNextn(rest, h, false, &draft_result_, error))
+        return false;
+    }
+    h_last_.assign(result_.hidden.begin() + ((keep - 1) * hidden_),
+                   result_.hidden.begin() + (keep * hidden_));
+    return true;
+  }
+
+  /// Enables Draft/Verify/Accept; the executor must have the NextN block.
+  void EnableDraft(std::uint32_t hidden) {
+    draft_ = true;
+    hidden_ = hidden;
+    h_last_.assign(hidden_, 0.0F);
+  }
+
 private:
+  bool ToIds(std::span<const TokenId> tokens, std::string* error) {
+    ids_.clear();
+    for (const TokenId token : tokens) {
+      if (token >
+          static_cast<TokenId>(std::numeric_limits<std::int32_t>::max()))
+        return Fail(error, "GLM-5.3-Flash token id out of range");
+      ids_.push_back(static_cast<std::int32_t>(token));
+    }
+    return true;
+  }
+
+  // Trunk forward that keeps every row's h, then the draft block's catch-up
+  // over the same tokens (token p with h at p - 1).
+  bool ForwardWithDraft(std::span<const std::int32_t> all,
+                        std::vector<float>* logits, std::string* error) {
+    std::vector<float> h_prev = h_last_;
+    if (all.size() > 1) {
+      if (!executor_.Forward(all.first(all.size() - 1), false, &result_,
+                             nullptr, error))
+        return false;
+      h_prev.insert(h_prev.end(), result_.hidden.begin(),
+                    result_.hidden.end());
+    }
+    if (!executor_.Forward(all.last(1), logits != nullptr, &result_, nullptr,
+                           error))
+      return false;
+    if (result_.hidden.size() != hidden_)
+      return Fail(error, "GLM-5.3-Flash forward returned no hidden row");
+    if (!executor_.ForwardNextn(all, h_prev, false, &draft_result_, error))
+      return false;
+    h_last_ = result_.hidden;
+    if (logits == nullptr)
+      return true;
+    if (result_.logits.size() != vocab_)
+      return Fail(error, "GLM-5.3-Flash executor returned no logits");
+    logits->assign(result_.logits.begin(), result_.logits.end());
+    return true;
+  }
+
   Executor& executor_;
   std::uint32_t capacity_;
   std::uint32_t vocab_;
   bool fused_;
+  bool draft_{false};
+  bool drafted_{false};  ///< Draft ran; the draft block holds the anchor.
+  std::uint32_t hidden_{0};
+  std::vector<float> h_last_;
   std::vector<std::int32_t> ids_;
+  std::vector<std::int32_t> verify_ids_;
   ForwardResult result_;
+  ForwardResult draft_result_;
 };
 #endif
 
@@ -136,9 +251,13 @@ bool RuntimeAvailable(std::string* error) {
 std::unique_ptr<ForwardSession> MakeExecutorSession(Executor& executor,
                                                     std::uint32_t capacity,
                                                     std::uint32_t vocab,
-                                                    bool fused_last_logits) {
-  return std::make_unique<ExecutorSession>(executor, capacity, vocab,
-                                           fused_last_logits);
+                                                    bool fused_last_logits,
+                                                    std::uint32_t draft_hidden) {
+  auto session = std::make_unique<ExecutorSession>(executor, capacity, vocab,
+                                                   fused_last_logits);
+  if (draft_hidden != 0)
+    session->EnableDraft(draft_hidden);
+  return session;
 }
 #endif
 
@@ -148,6 +267,7 @@ struct Model::Impl {
 #if defined(GLM53_ROCM_BUILD)
   std::unique_ptr<Executor> executor;
   bool fused_last_logits{true};
+  bool mtp{false};  ///< The executor has the NextN block.
 #endif
 };
 
@@ -168,6 +288,17 @@ public:
   }
   std::uint32_t Capacity() const noexcept override {
     return inner_->Capacity();
+  }
+  bool CanDraft() const noexcept override { return inner_->CanDraft(); }
+  bool Draft(TokenId anchor, TokenId* draft, std::string* error) override {
+    return inner_->Draft(anchor, draft, error);
+  }
+  bool Verify(std::span<const TokenId> tokens, std::vector<float>* logits,
+              std::string* error) override {
+    return inner_->Verify(tokens, logits, error);
+  }
+  bool Accept(std::size_t keep, std::string* error) override {
+    return inner_->Accept(keep, error);
   }
 
 private:
@@ -230,7 +361,12 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                     std::to_string(config->context_length));
     return nullptr;
   }
-  auto weights = ModelWeights::Bind(*reader, /*bind_nextn=*/false, &detail);
+  // MTP (NextN draft) when asked for and the GGUF has the block.
+  const char* mtp_env = std::getenv("GUFO_GLM53_MTP");
+  const bool want_mtp =
+      options.mtp && config->nextn_layers > 0 &&
+      !(mtp_env != nullptr && std::string_view(mtp_env) == "0");
+  auto weights = ModelWeights::Bind(*reader, want_mtp, &detail);
   if (!weights) {
     Fail(error, "GLM-5.3-Flash weights: " + detail);
     return nullptr;
@@ -252,6 +388,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
       std::max<std::uint32_t>(options.prefill_chunk, 1);
   executor_options.capacity = max_context;
   executor_options.shards = reader->GetMappedRegions();
+  executor_options.nextn = want_mtp;
+  executor_options.max_verify_tokens = want_mtp ? 2 : 1;
+  model->impl_->mtp = want_mtp;
   model->impl_->executor = Executor::Create(
       *model->impl_->weights, executor_options, std::move(ops), &detail);
   if (model->impl_->executor == nullptr) {
@@ -288,7 +427,8 @@ std::unique_ptr<ForwardSession> Model::CreateSession(std::string* error) {
   return std::make_unique<Session>(
       shared_from_this(),
       MakeExecutorSession(*impl_->executor, max_context_, VocabSize(),
-                          impl_->fused_last_logits));
+                          impl_->fused_last_logits,
+                          impl_->mtp ? config().hidden_size : 0));
 #else
   Fail(error, std::string(kLaneBMissingError));
   return nullptr;

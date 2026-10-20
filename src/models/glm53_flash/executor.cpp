@@ -1076,7 +1076,8 @@ bool Executor::Rollback(std::uint32_t keep) {
 
 bool Executor::ForwardNextn(std::span<const std::int32_t> tokens,
                             std::span<const float> h, bool want_logits,
-                            ForwardResult* out, std::string* error) {
+                            ForwardResult* out, std::string* error,
+                            bool all_rows) {
   const Config& c = config_;
   const std::uint32_t il = c.num_layers;
   const std::size_t hidden = c.hidden_size;
@@ -1149,9 +1150,14 @@ bool Executor::ForwardNextn(std::span<const std::int32_t> tokens,
     ::gufo::hip::LaunchBatchedRMSNorm(x_, nextn_head_norm_, xn_, nullptr, n,
                                       hidden, c.rms_eps, stream_);
     ok = ok && download(out->hidden, xn_, n, hidden);
-    if (want_logits && !output_.empty()) {
+    if (want_logits && !output_.empty() && all_rows) {
       ok = ok && LaunchProjection(output_, xn_, logits_, n, stream_) &&
            download(out->logits, logits_, n, c.vocab_size);
+    } else if (want_logits && !output_.empty() && t0 + n == n_tokens) {
+      ok = ok &&
+           LaunchProjection(output_, xn_ + ((n - 1) * hidden), logits_, 1,
+                            stream_) &&
+           download(out->logits, logits_, 1, c.vocab_size);
     }
     ok = ok && hipStreamSynchronize(stream_) == hipSuccess &&
          hipPeekAtLastError() == hipSuccess;

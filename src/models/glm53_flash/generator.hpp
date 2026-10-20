@@ -43,6 +43,40 @@ public:
   [[nodiscard]] virtual std::uint32_t Position() const noexcept = 0;
   /// Positions the sequence can hold.
   [[nodiscard]] virtual std::uint32_t Capacity() const noexcept = 0;
+
+  // Speculative decoding with a draft model (GLM-5.3-Flash's NextN block).
+  // One cycle: Draft(anchor), Verify({anchor, draft}), Accept(1 or 2).
+  /// True when Draft / Verify / Accept are available.
+  [[nodiscard]] virtual bool CanDraft() const noexcept { return false; }
+  /// The draft model's greedy guess for the token after `anchor`, the token
+  /// just sampled from the last logits (not yet forwarded).
+  [[nodiscard]] virtual bool Draft(TokenId anchor, TokenId* draft,
+                                   std::string* error) {
+    (void)anchor;
+    (void)draft;
+    if (error != nullptr)
+      *error = "this session has no draft model";
+    return false;
+  }
+  /// Forwards `tokens` (the anchor, then drafts) like Forward, returning
+  /// every row's logits ([tokens][vocab]); Accept must follow.
+  [[nodiscard]] virtual bool Verify(std::span<const TokenId> tokens,
+                                    std::vector<float>* logits,
+                                    std::string* error) {
+    (void)tokens;
+    (void)logits;
+    if (error != nullptr)
+      *error = "this session has no draft model";
+    return false;
+  }
+  /// Keeps the first `keep` tokens of the last Verify; the sequence ends
+  /// after them as if only they had been forwarded.
+  [[nodiscard]] virtual bool Accept(std::size_t keep, std::string* error) {
+    (void)keep;
+    if (error != nullptr)
+      *error = "this session has no draft model";
+    return false;
+  }
 };
 
 /// Tokens that end an assistant turn: the GGUF eos / eot / eom ids and the

@@ -190,34 +190,97 @@ bool Generator::Generate(std::span<const TokenId> prompt,
     return false;
   sampling::SamplerState sampler(options.sampling, prompt);
   result->finish_reason = FinishReason::kLength;
-  for (std::size_t n = 0; n < options.max_tokens; ++n) {
-    const auto frontier = logits();
-    if (frontier.empty())
-      return Fail(error, "GLM-5.3-Flash has no logits to sample");
-    const TokenId token = sampler.Sample(frontier);
-    if (options.stop_at_eos && IsStop(token)) {
-      result->finish_reason = FinishReason::kStop;
-      result->stop_token = token;
-      return true;
-    }
-    sampler.Accept(token);
+  // Emits `token` (already Accepted by the sampler); false ends generation
+  // with result->finish_reason set.
+  const auto emit = [&](TokenId token) {
     result->tokens.push_back(token);
     const std::string piece =
         tokenizer_ != nullptr ? tokenizer_->DecodeToken(token) : std::string{};
     result->text += piece;
     if (on_token && !on_token(token, piece)) {
       result->finish_reason = FinishReason::kCancelled;
+      return false;
+    }
+    return true;
+  };
+  // Speculative decoding (ForwardSession::Draft): the draft's guess for the
+  // token after `token` is forwarded with it; the next token is then sampled
+  // from the verified row as usual and the draft kept only if it matches
+  // (sample-and-match: the output follows the sampler exactly). On a
+  // mismatch, that sample is the next step's token.
+  std::optional<TokenId> deferred;
+  std::vector<float> rows;
+  for (std::size_t n = 0; n < options.max_tokens; ++n) {
+    TokenId token = 0;
+    if (deferred) {
+      token = *deferred;
+      deferred.reset();
+    } else {
+      const auto frontier = logits();
+      if (frontier.empty())
+        return Fail(error, "GLM-5.3-Flash has no logits to sample");
+      token = sampler.Sample(frontier);
+    }
+    if (options.stop_at_eos && IsStop(token)) {
+      result->finish_reason = FinishReason::kStop;
+      result->stop_token = token;
       return true;
     }
+    sampler.Accept(token);
+    if (!emit(token))
+      return true;
     if (n + 1 == options.max_tokens)
       break;
     if (tokens_.size() >= session_.Capacity()) {
       result->finish_reason = FinishReason::kContext;
       return true;
     }
-    if (!Extend(std::span<const TokenId>(&token, 1), /*want_logits=*/true,
-                error))
+    if (!session_.CanDraft() || tokens_.size() + 2 > session_.Capacity() ||
+        needs_reset_ || session_.Position() != tokens_.size()) {
+      if (!Extend(std::span<const TokenId>(&token, 1), /*want_logits=*/true,
+                  error))
+        return false;
+      continue;
+    }
+    TokenId draft = 0;
+    if (!session_.Draft(token, &draft, error)) {
+      Invalidate();
       return false;
+    }
+    const TokenId verify[2] = {token, draft};
+    logits_valid_ = false;
+    if (!session_.Verify(verify, &rows, error)) {
+      Invalidate();
+      return false;
+    }
+    const std::size_t vocab = rows.size() / 2;
+    const std::span<const float> row0(rows.data(), vocab);
+    const TokenId next = sampler.Sample(row0);
+    // Keep the draft when it is the sampled token, unless it ends the turn
+    // (a stop is never forwarded; the next step reports it).
+    const bool keep_draft =
+        next == draft && !(options.stop_at_eos && IsStop(next));
+    if (!session_.Accept(keep_draft ? 2 : 1, error)) {
+      Invalidate();
+      return false;
+    }
+    tokens_.push_back(token);
+    if (!keep_draft) {
+      logits_.assign(row0.begin(), row0.end());
+      logits_valid_ = true;
+      deferred = next;
+      continue;
+    }
+    tokens_.push_back(draft);
+    logits_.assign(rows.begin() + static_cast<std::ptrdiff_t>(vocab),
+                   rows.end());
+    logits_valid_ = true;
+    ++n;
+    sampler.Accept(draft);
+    if (!emit(draft))
+      return true;
+    if (n + 1 == options.max_tokens)
+      break;
   }
   return true;
 }

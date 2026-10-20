@@ -52,6 +52,12 @@ struct ModelOptions {
   /// environment variable GUFO_GLM53_FUSED_LAST_LOGITS=0 turns it off for A/B
   /// runs.
   bool fused_last_logits{true};
+  /// Speculative decoding with the GGUF's NextN (MTP) block when it has one:
+  /// one greedy draft token per step, verified by the trunk
+  /// (sample-and-match, so outputs follow the sampler exactly). Costs the
+  /// NextN weights (~2.8 GB) and a KDA state checkpoint per layer. The
+  /// environment variable GUFO_GLM53_MTP=0 turns it off.
+  bool mtp{true};
 };
 
 class Model final : public std::enable_shared_from_this<Model> {
@@ -109,9 +115,12 @@ private:
 /// `fused_last_logits` a Forward that wants logits computes the last token's
 /// inside the final pass (Executor::ForwardLast); without it (the default)
 /// the last token gets its own one-token pass, as before.
+/// A nonzero `draft_hidden` (the model's hidden size) enables
+/// Draft/Verify/Accept; the executor must have the NextN block and
+/// max_verify_tokens >= 2.
 [[nodiscard]] std::unique_ptr<ForwardSession> MakeExecutorSession(
     Executor& executor, std::uint32_t capacity, std::uint32_t vocab,
-    bool fused_last_logits = false);
+    bool fused_last_logits = false, std::uint32_t draft_hidden = 0);
 #endif
 
 }  // namespace gufo::models::glm53_flash

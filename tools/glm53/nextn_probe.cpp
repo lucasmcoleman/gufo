@@ -118,7 +118,8 @@ int main(int argc, char** argv) {
   std::vector<float> h_shift(T * H, 0.0F);
   std::copy(h_all.begin(), h_all.begin() + ((T - 1) * H), h_shift.begin() + H);
   glm::ForwardResult mtp;
-  if (!exec->ForwardNextn(seq, h_shift, true, &mtp, &error)) {
+  if (!exec->ForwardNextn(seq, h_shift, true, &mtp, &error,
+                          /*all_rows=*/true)) {
     std::cerr << "FAIL ForwardNextn: " << error << "\n";
     return 1;
   }
