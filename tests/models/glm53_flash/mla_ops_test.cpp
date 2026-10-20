@@ -584,7 +584,12 @@ bool FixtureCheck(Verdict& v) {
                   "fixture %s T=%u: GPU vs HF max token rel %.3e (token %u), "
                   "GPU vs CPU %.3e, CPU vs HF %.3e",
                   kase.c_str(), T, r_hf, at, r_cpu, r_cpu_hf);
-    v.Check(r_hf <= kTol && r_cpu <= kTol, line);
+    // The dense fixture takes fp16 attention in approximate prefill mode.
+    // Keep sparse/exact checks and the independent CPU oracle at kTol.
+    const double fixture_tol = Approx() && kase == "dense" ? kDenseTol : kTol;
+    v.Check(AllFinite(y) && AllFinite(y_cpu) && AllFinite(want.data) &&
+                r_hf <= fixture_tol && r_cpu <= fixture_tol && r_cpu_hf <= kTol,
+            line);
     // Selected token sets vs HF topk_indices (-1 padded) and the oracle.
     bool sets = true;
     std::uint32_t dropped = 0;
