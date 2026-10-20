@@ -331,6 +331,169 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+/// Rows per block of the split decode attention below.
+constexpr std::uint32_t kSplitRows = 128;
+/// Largest pass that takes the split path; its partials scratch is sized
+/// for this many tokens.
+constexpr std::uint32_t kSplitMaxTokens = 4;
+
+/// Split decode attention, pass 1: LatentAttentionKernel over the rows
+/// [s * kSplitRows, (s + 1) * kSplitRows) of token t's selection, s =
+/// blockIdx.z. A decode pass has only heads / G blocks, so one block per
+/// head group scanning every row leaves most of the GPU idle. Writes the
+/// chunk's unnormalized context and its (max, sum) to `part`; m = -inf
+/// marks an empty chunk.
+template<int G>
+__global__ void __launch_bounds__(kThreads)
+    LatentAttentionSplitKernel(const float* qabs, const float* latent,
+                               const std::int32_t* sel, float* part_o,
+                               float* part_ml, std::uint32_t n,
+                               std::uint32_t pos0, std::uint32_t L,
+                               std::uint32_t kpool, std::uint32_t budget,
+                               float scale) {
+  extern __shared__ float lds[];
+  float* q_s = lds;
+  float* s_s = q_s + (std::size_t{G} * L);
+  auto* row_s = reinterpret_cast<std::int32_t*>(s_s + (G * kSplitRows));
+  float* red = reinterpret_cast<float*>(row_s + kSplitRows);
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t h0 = blockIdx.y * G;
+  const std::uint32_t split = blockIdx.z;
+  const std::uint32_t splits = gridDim.z;
+  const std::uint32_t heads = gridDim.y * G;
+  const std::uint32_t pos = pos0 + t;
+  const std::uint32_t pools = (pos + 1) / kpool;
+  const std::uint32_t count = min(pools, budget);
+  const std::uint32_t pooled_rows = count * kpool;
+  const std::uint32_t rows = pooled_rows + (pos + 1 - (pools * kpool));
+  const std::uint32_t r0 = split * kSplitRows;
+  const std::uint32_t r1 = min(rows, r0 + kSplitRows);
+  const auto at = [&](int g) {
+    return (((std::size_t{t} * heads) + h0 + g) * splits) + split;
+  };
+  if (r0 >= rows) {
+    if (threadIdx.x < G) {
+      part_ml[at(static_cast<int>(threadIdx.x)) * 2] = -INFINITY;
+      part_ml[(at(static_cast<int>(threadIdx.x)) * 2) + 1] = 0.0F;
+    }
+    return;
+  }
+  const std::uint32_t cnt = r1 - r0;
+  for (std::uint32_t i = threadIdx.x; i < G * L; i += blockDim.x) {
+    const std::uint32_t g = i / L;
+    q_s[i] = qabs[(((std::size_t{h0 + g} * n) + t) * L) + (i % L)];
+  }
+  const std::int32_t* st = sel + (std::size_t{t} * budget);
+  for (std::uint32_t i = threadIdx.x; i < cnt; i += blockDim.x) {
+    const std::uint32_t r = r0 + i;
+    row_s[i] =
+        r < pooled_rows
+            ? (st[r / kpool] * static_cast<std::int32_t>(kpool)) +
+                  static_cast<std::int32_t>(r % kpool)
+            : static_cast<std::int32_t>((pools * kpool) + (r - pooled_rows));
+  }
+  __syncthreads();
+  const std::uint32_t lane = threadIdx.x % kWave;
+  for (std::uint32_t i = threadIdx.x / kWave; i < cnt;
+       i += blockDim.x / kWave) {
+    const float* lr = latent + (static_cast<std::size_t>(row_s[i]) * L);
+    float acc[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      acc[g] = 0.0F;
+    }
+    for (std::uint32_t d = lane; d < L; d += kWave) {
+      const float v = lr[d];
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        acc[g] += q_s[(g * L) + d] * v;
+      }
+    }
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      acc[g] = WaveSum(acc[g]);
+    }
+    if (lane == 0) {
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        s_s[(g * kSplitRows) + i] = acc[g] * scale;
+      }
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    float* sg = s_s + (g * kSplitRows);
+    float m = -INFINITY;
+    for (std::uint32_t i = threadIdx.x; i < cnt; i += blockDim.x) {
+      m = fmaxf(m, sg[i]);
+    }
+    m = BlockReduce<true>(m, red);
+    float sum = 0.0F;
+    for (std::uint32_t i = threadIdx.x; i < cnt; i += blockDim.x) {
+      const float e = expf(sg[i] - m);
+      sg[i] = e;
+      sum += e;
+    }
+    sum = BlockReduce<false>(sum, red);
+    if (threadIdx.x == 0) {
+      part_ml[at(g) * 2] = m;
+      part_ml[(at(g) * 2) + 1] = sum;
+    }
+  }
+  for (std::uint32_t d = threadIdx.x; d < L; d += blockDim.x) {
+    float acc[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      acc[g] = 0.0F;
+    }
+    for (std::uint32_t i = 0; i < cnt; ++i) {
+      const float v = latent[(static_cast<std::size_t>(row_s[i]) * L) + d];
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        acc[g] += s_s[(g * kSplitRows) + i] * v;
+      }
+    }
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      part_o[(at(g) * L) + d] = acc[g];
+    }
+  }
+}
+
+/// Split decode attention, pass 2: rescales each chunk to the global max
+/// and writes ctx [H][n][L], one block per (token, head).
+__global__ void __launch_bounds__(kThreads)
+    LatentAttentionCombineKernel(const float* part_o, const float* part_ml,
+                                 float* ctx, std::uint32_t n, std::uint32_t L,
+                                 std::uint32_t splits) {
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t h = blockIdx.y;
+  const std::size_t base = ((std::size_t{t} * gridDim.y) + h) * splits;
+  float m = -INFINITY;
+  for (std::uint32_t s = 0; s < splits; ++s) {
+    m = fmaxf(m, part_ml[(base + s) * 2]);
+  }
+  float total = 0.0F;
+  for (std::uint32_t s = 0; s < splits; ++s) {
+    const float ms = part_ml[(base + s) * 2];
+    if (ms != -INFINITY) {
+      total += expf(ms - m) * part_ml[((base + s) * 2) + 1];
+    }
+  }
+  const float inv = 1.0F / total;
+  for (std::uint32_t d = threadIdx.x; d < L; d += blockDim.x) {
+    float acc = 0.0F;
+    for (std::uint32_t s = 0; s < splits; ++s) {
+      const float ms = part_ml[(base + s) * 2];
+      if (ms != -INFINITY) {
+        acc += expf(ms - m) * part_o[((base + s) * L) + d];
+      }
+    }
+    ctx[(((std::size_t{h} * n) + t) * L) + d] = acc * inv;
+  }
+}
+
 /// Dense prefill attention (DenseLatentAttention): row i = h * n + t of
 /// S [heads * n][r_len] holds token t's scaled scores against latent rows
 /// 0..r_len-1; P (fp16, same shape) gets the softmax over its causal rows
@@ -457,6 +620,16 @@ std::uint32_t SelectionRows(const Config& c) {
   return (c.IndexerPoolBudget() * c.indexer_kpool) + c.indexer_kpool - 1;
 }
 
+/// Row chunks of the split decode attention.
+std::uint32_t SplitCount(const Config& c) {
+  return (SelectionRows(c) + kSplitRows - 1) / kSplitRows;
+}
+
+std::size_t SplitLds(int g, std::uint32_t L) {
+  return ((std::size_t(g) * (L + kSplitRows)) + kSplitRows + kThreads) *
+         sizeof(float);
+}
+
 std::size_t AttentionLds(const Config& c, int g) {
   const std::size_t smax = SelectionRows(c);
   return ((std::size_t(g) * (c.kv_lora_rank + smax)) + smax + kThreads) *
@@ -490,6 +663,8 @@ struct Scratch {
   float* iw{nullptr};            ///< [n][ih]
   std::int32_t* sel{nullptr};    ///< [n][budget]
   std::int32_t* top_k{nullptr};  ///< [n][budget]
+  float* part_o{nullptr};        ///< [min(n, kSplitMaxTokens)][H][splits][L]
+  float* part_ml{nullptr};       ///< [min(n, kSplitMaxTokens)][H][splits][2]
 };
 
 std::size_t LayoutScratch(const Config& c, std::uint32_t tokens, void* base,
@@ -521,6 +696,10 @@ std::size_t LayoutScratch(const Config& c, std::uint32_t tokens, void* base,
   take(r.iw, n * c.indexer_heads);
   take(r.sel, n * c.IndexerPoolBudget());
   take(r.top_k, n * c.IndexerPoolBudget());
+  const std::size_t split_heads =
+      std::min<std::size_t>(n, kSplitMaxTokens) * h * SplitCount(c);
+  take(r.part_o, split_heads * l);
+  take(r.part_ml, split_heads * 2);
   return offset;
 }
 
@@ -629,8 +808,35 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   }();
   const bool dense = dense_enabled && n > 8 && !ExactPrefill() && kpool > 0 &&
                      (pos0 + n) / kpool <= budget;
+  // Decode: split the rows across blocks once there are enough of them.
+  static const bool split_enabled = [] {
+    const char* v = std::getenv("GUFO_GLM53_MLA_SPLIT");
+    return !(v && *v == '0');
+  }();
+  const std::uint32_t splits = std::min(
+      SplitCount(c), (pos0 + n + kSplitRows - 1) / kSplitRows);
+  const bool split = split_enabled && !ExactPrefill() &&
+                     n <= kSplitMaxTokens && splits > 1;
   if (dense && DenseLatentAttention(s.qabs, cache.latent, s.ctx, heads, n,
                                     pos0, L, scale, stream)) {
+  } else if (split) {
+    const dim3 sgrid(n, heads / static_cast<std::uint32_t>(g), splits);
+    const std::size_t slds = SplitLds(g, L);
+    if (g == 4) {
+      LatentAttentionSplitKernel<4><<<sgrid, kThreads, slds, stream>>>(
+          s.qabs, cache.latent, s.sel, s.part_o, s.part_ml, n, pos0, L, kpool,
+          budget, scale);
+    } else if (g == 2) {
+      LatentAttentionSplitKernel<2><<<sgrid, kThreads, slds, stream>>>(
+          s.qabs, cache.latent, s.sel, s.part_o, s.part_ml, n, pos0, L, kpool,
+          budget, scale);
+    } else {
+      LatentAttentionSplitKernel<1><<<sgrid, kThreads, slds, stream>>>(
+          s.qabs, cache.latent, s.sel, s.part_o, s.part_ml, n, pos0, L, kpool,
+          budget, scale);
+    }
+    LatentAttentionCombineKernel<<<dim3(n, heads), kThreads, 0, stream>>>(
+        s.part_o, s.part_ml, s.ctx, n, L, splits);
   } else if (g == 4) {
     LatentAttentionKernel<4>
         <<<grid, kThreads, lds, stream>>>(s.qabs, cache.latent, s.sel, s.ctx, n,
