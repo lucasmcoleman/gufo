@@ -160,6 +160,14 @@ if (ENGINE_ENABLE_HIP)
   set_target_properties(glm53_flash_nextn_probe PROPERTIES EXCLUDE_FROM_ALL ON)
 endif()
 
+# Greedy MTP decode benchmark (not a test): tools/glm53/mtp_bench.cpp.
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_mtp_bench
+    ${PROJECT_SOURCE_DIR}/tools/glm53/mtp_bench.cpp)
+  target_link_libraries(glm53_flash_mtp_bench PRIVATE gufo_glm53_flash_reference)
+  set_target_properties(glm53_flash_mtp_bench PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
+
 # Speculative verify/rollback probe (not a test): tools/glm53/rollback_probe.cpp.
 if (ENGINE_ENABLE_HIP)
   add_executable(glm53_flash_rollback_probe
