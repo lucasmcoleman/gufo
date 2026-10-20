@@ -38,3 +38,40 @@ Medians of three resets per variant, baseline before candidate. No measured
 gain; the candidate was removed. [Individual runs](artifacts/prefill-20261019.json)
 include cold-first-run variation. A separate profile put routed MoE at 57%
 of prefill time, KDA at 20%, and MLA at 19.3%.
+
+## Existing prefill chunk sizes, 2026-10-20
+
+The same production binary was run at `ModelOptions.prefill_chunk` 256,
+512 and 1024, in that order, with three reset pp2048/tg128 runs each.
+This binary uses baseline GLM code and the Q8 tail fix. All 129 output
+vectors per run were saved and checked finite. Loading is excluded.
+
+| Chunk tokens | Median prefill seconds | Median decode tok/s |
+| --- | ---: | ---: |
+| 256 | 10.3058 | 12.6843 |
+| 512 | 9.78819 | 12.7061 |
+| 1024 | 9.82764 | 12.6839 |
+
+512 was 5.29% faster in this probe; the default remains 256. This uses the
+same repeated-token prompt as above, not a diverse quality corpus.
+[Individual runs and output comparisons](artifacts/prefill-chunks-20261020.json).
+
+## Retained compact expert tiles, 2026-10-20
+
+A device-built list maps workgroups to nonempty expert column tiles. The
+16-column matrix tile and its K accumulation order are unchanged. For the
+256-token, 8-route, 288-expert shape, the host launch bound falls from 4608
+to 415 column/expert tiles. Extra groups exit against the device list count.
+
+Matched production binaries, pp2048/tg128, chunk 256, three resets per binary:
+
+| Variant | Median prefill seconds | Median decode tok/s |
+| --- | ---: | ---: |
+| Baseline | 10.2846 | 12.6899 |
+| Compact expert tiles | 9.93388 | 12.6864 |
+
+Prefill improved 3.53%; warmed prefill ranges do not overlap. Baseline ran
+before candidate under one GPU lock. Loading, reset, sampling and file writes
+are excluded. Both binaries include the Q8 tail fix and identical GLM code.
+All 129 output vectors per run were saved. The default chunk remains 256.
+[Individual runs and hashes](artifacts/compact-tiles-20261020.json).
