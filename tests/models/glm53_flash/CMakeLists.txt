@@ -168,6 +168,7 @@ if (ENGINE_ENABLE_HIP)
   set_target_properties(glm53_flash_mtp_bench PROPERTIES EXCLUDE_FROM_ALL ON)
 endif()
 
+
 # Speculative verify/rollback probe (not a test): tools/glm53/rollback_probe.cpp.
 if (ENGINE_ENABLE_HIP)
   add_executable(glm53_flash_rollback_probe
@@ -209,4 +210,13 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(glm53_flash.mla_ops_exact PROPERTIES
     LABELS "glm53_flash;hip;gpu;gfx1151"
     ENVIRONMENT "GUFO_GLM53_EXACT_PREFILL=1")
+endif()
+
+
+# NextN Q2_K/Q3_K MoE prefill benchmark (not a test): tools/glm53/q2k_moe_bench.cpp.
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_q2k_moe_bench
+    ${PROJECT_SOURCE_DIR}/tools/glm53/q2k_moe_bench.cpp)
+  target_link_libraries(glm53_flash_q2k_moe_bench PRIVATE gufo_glm53_flash)
+  set_target_properties(glm53_flash_q2k_moe_bench PROPERTIES EXCLUDE_FROM_ALL ON)
 endif()
