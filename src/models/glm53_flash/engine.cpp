@@ -191,21 +191,32 @@ private:
   bool ForwardWithDraft(std::span<const std::int32_t> all,
                         std::vector<float>* logits, std::string* error) {
     std::vector<float> h_prev = h_last_;
-    if (all.size() > 1) {
-      if (!executor_.Forward(all.first(all.size() - 1), false, &result_,
+    if (fused_) {
+      // One pass per chunk as in Forward's fused path, keeping every row's h.
+      if (!executor_.ForwardLast(all, logits != nullptr, &result_, nullptr,
+                                 error, /*want_hidden=*/true))
+        return false;
+    } else {
+      if (all.size() > 1) {
+        if (!executor_.Forward(all.first(all.size() - 1), false, &result_,
+                               nullptr, error))
+          return false;
+        h_prev.insert(h_prev.end(), result_.hidden.begin(),
+                      result_.hidden.end());
+      }
+      if (!executor_.Forward(all.last(1), logits != nullptr, &result_,
                              nullptr, error))
         return false;
-      h_prev.insert(h_prev.end(), result_.hidden.begin(),
-                    result_.hidden.end());
     }
-    if (!executor_.Forward(all.last(1), logits != nullptr, &result_, nullptr,
-                           error))
-      return false;
-    if (result_.hidden.size() != hidden_)
+    if (result_.hidden.size() < hidden_ ||
+        result_.hidden.size() % hidden_ != 0)
       return Fail(error, "GLM-5.3-Flash forward returned no hidden row");
+    if (fused_)
+      h_prev.insert(h_prev.end(), result_.hidden.begin(),
+                    result_.hidden.end() - hidden_);
     if (!executor_.ForwardNextn(all, h_prev, false, &draft_result_, error))
       return false;
-    h_last_ = result_.hidden;
+    h_last_.assign(result_.hidden.end() - hidden_, result_.hidden.end());
     if (logits == nullptr)
       return true;
     if (result_.logits.size() != vocab_)

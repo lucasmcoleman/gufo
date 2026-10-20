@@ -327,6 +327,21 @@ void CheckLastLogits(const Model& m) {
     ok = exec->Forward(ids.subspan(kPrefill, 1), true, &next, nullptr, &error);
     CheckRel(label + ": decode after a logits-free ForwardLast", next.logits,
              step12.logits);
+
+    // want_hidden (the MTP session's prefill): every row's hidden, still one
+    // logits row and no extra pass.
+    Check(label + ": reset", exec->Reset());
+    const std::uint32_t calls = ops.mla_calls();
+    glm::ForwardResult rows;
+    ok = exec->ForwardLast(ids.first(kPrefill), true, &rows, nullptr, &error,
+                           /*want_hidden=*/true);
+    Check(label + ": ForwardLast(want_hidden) " + error,
+          ok && rows.logits.size() == vocab &&
+              rows.hidden.size() == kPrefill * hidden &&
+              ops.mla_calls() - calls == passes);
+    CheckRel(label + ": want_hidden rows vs reference", rows.hidden,
+             prefill.hidden);
+    CheckRel(label + ": want_hidden last logits", rows.logits, want_last);
   }
 }
 

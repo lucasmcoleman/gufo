@@ -329,9 +329,13 @@ public:
   /// state agree with a separate one-token Forward to F32 rounding, not
   /// bitwise (batch-dependent GEMM routes). Forward is unchanged and still
   /// returns hidden and logits for every token.
+  /// With `want_hidden`, `out->hidden` is filled for every token as in
+  /// Forward (the MTP draft block's catch-up needs each row's h); the head's
+  /// projection still runs for the last row only.
   [[nodiscard]] bool ForwardLast(std::span<const std::int32_t> tokens,
                                  bool want_logits, ForwardResult* out,
-                                 const TapFn* tap, std::string* error);
+                                 const TapFn* tap, std::string* error,
+                                 bool want_hidden = false);
 
   /// Speculative verify: Forward over `tokens` (at most max_verify_tokens),
   /// with the per-token state checkpoints Rollback needs. Until the next
@@ -382,7 +386,7 @@ private:
   bool Init(std::string* error);
   /// What the output head produces: every token's hidden (and logits when
   /// wanted), or only the call's last token's logits.
-  enum class Head : std::uint8_t { kPerToken, kLastRow };
+  enum class Head : std::uint8_t { kPerToken, kLastRow, kLastRowHidden };
   bool Run(const std::int32_t* tokens, const float* streams,
            std::uint32_t n_tokens, bool want_logits, Head head,
            ForwardResult* out, const TapFn* tap, std::string* error);
