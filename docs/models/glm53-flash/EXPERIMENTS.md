@@ -29,3 +29,20 @@ remains in `outputs/gufo-prefill-20261019/paired-rejected.patch` on MasterServer
 The separate Q8_0 tail-read fix remains: partial macro tiles could load whole
 activation tiles past the allocated scratch. Missing tiles now read tile zero
 with a zero scale, as the K-quant implementation already does.
+
+## Prefill chunk size, 2026-10-20
+
+The existing 512-token option reduced measured pp2048 time by 5.29%, while
+1024 reduced it by 4.87%. Both preserved the greedy sequence but changed
+logits. Keep the default at 256 pending broader quality qualification;
+retain the measurements as evidence for the existing option.
+
+## Compact expert tiles, 2026-10-20
+
+Retained after a 3.53% pp2048 gain with bitwise-identical saved logits.
+Build a device list of nonempty expert column tiles, then run the original
+16-column MMQ arithmetic. The path is limited to gfx1151 routed raw IQ
+matrices without fused epilogues or stream-K. The existing rectangular
+launch remains for other shapes. No environment switch was added.
+This differs from the earlier rejected grid-striding experiment: the new
+list removes empty expert/column combinations from the launch bound.

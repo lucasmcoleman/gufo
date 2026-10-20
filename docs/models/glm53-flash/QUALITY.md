@@ -49,3 +49,34 @@ checked at source: small cases decline that route; eligible ragged cases use
 `WKQuantA8BlockedWmmaGEMMKernel`, which already clamps missing activation
 tiles and zeros their scale. The failing 65-by-256-by-256 case reaches the
 fixed W8 kernel.
+
+## Chunk-size probe, 2026-10-20
+
+At both 512 and 1024 tokens, all 387 saved next-token argmax values matched
+chunk 256. The greedy histories therefore match. Logits differ: mean/max
+KL versus 256 were 0.000329738/0.00975158 for 512 and
+0.000206818/0.00648244 for 1024. Every saved value was finite, including
+output from the final decode call. These results cover one repeated-token
+prompt and three identical resets; they do not establish corpus-level
+quality. No quality gate or production chunk default was changed.
+
+## Compact expert tiles, 2026-10-20
+
+The retained schedule passed the independent FFN oracle in both default and
+exact modes. Existing cases include IQ2_XXS, IQ2_S and IQ3_XXS, partial tiles,
+and different expert routes. A CPU model checked the list bound and exact
+row coverage for 6699 cases, including empty and concentrated expert buckets;
+that model alone is not GPU validation.
+
+The full-model baseline and candidate each saved 387 finite vocabulary
+vectors, including every final decode output. Their 239754240-byte files
+match exactly, SHA-256
+`4885a4945d48c7763e275eb4d2eedbe767b0ac34c2eedaf1dbf7dc907a01e035`.
+No numerical tolerance changed. Claudems reviewed capacity, block mapping
+and scratch lifetime in Agentchattr message13709. Scratch reuse depends on
+the existing single-stream pool contract; this change does not add
+cross-stream support. The tested candidate uses the same production flags.
+Raw logs, build commands, patch and CPU check are under
+`/home/lucas/agentchattr-workspace/outputs/gufo-prefill-20261019`.
+
+The integrated production release build also passed after retaining the compact schedule.
