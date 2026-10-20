@@ -58,6 +58,14 @@ struct ModelOptions {
   /// NextN weights (~2.8 GB) and a KDA state checkpoint per layer. The
   /// environment variable GUFO_GLM53_MTP=0 turns it off.
   bool mtp{true};
+  /// With MTP, chain a second draft token when the first draft's probability
+  /// under the draft block is at least this. glm53_flash_mtp_depth_bench (6
+  /// prompts, two runs): gate 0.9-0.95 +1.5% to +2.7% over one draft, a
+  /// fixed second draft -2.4% to +0.4%. End to end (gufo prompt, 5 prompts x
+  /// 2 fresh runs) gate 0.95 averaged 16.8 tok/s against 17.1 for one draft,
+  /// within fresh-process noise, so the default stays off. Above 1 keeps one
+  /// draft per step. The environment variable GUFO_GLM53_MTP_GATE overrides it.
+  float mtp_chain_gate{2.0F};
   /// Run a short prefill, a decode step and a draft cycle at the end of
   /// Load, so the first request does not pay the weights' first GPU touch
   /// and each kernel's first launch (about 1-4 s on a loaded MasterServer).
@@ -122,10 +130,13 @@ private:
 /// the last token gets its own one-token pass, as before.
 /// A nonzero `draft_hidden` (the model's hidden size) enables
 /// Draft/Verify/Accept; the executor must have the NextN block and
-/// max_verify_tokens >= 2.
+/// max_verify_tokens >= 1 + max_drafts. DraftChain chains up to
+/// `max_drafts` drafts while the previous draft's probability is at least
+/// `chain_gate`.
 [[nodiscard]] std::unique_ptr<ForwardSession> MakeExecutorSession(
     Executor& executor, std::uint32_t capacity, std::uint32_t vocab,
-    bool fused_last_logits = false, std::uint32_t draft_hidden = 0);
+    bool fused_last_logits = false, std::uint32_t draft_hidden = 0,
+    std::uint32_t max_drafts = 1, float chain_gate = 2.0F);
 #endif
 
 }  // namespace gufo::models::glm53_flash

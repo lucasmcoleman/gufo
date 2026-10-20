@@ -1,6 +1,7 @@
 #include "src/models/glm53_flash/engine.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <optional>
@@ -35,6 +36,17 @@ bool ProductionOps(LayerOps* ops, std::string* error) {
   (void)ops;
   return Fail(error, std::string(kLaneBMissingError));
 #endif
+}
+
+// Softmax probability of the largest entry.
+float TopProb(const std::vector<float>& logits) {
+  if (logits.empty())
+    return 0.0F;
+  const float top = *std::max_element(logits.begin(), logits.end());
+  double sum = 0.0;
+  for (const float v : logits)
+    sum += std::exp(static_cast<double>(v - top));
+  return static_cast<float>(1.0 / sum);
 }
 
 class ExecutorSession final : public ForwardSession {
@@ -131,6 +143,38 @@ public:
     return true;
   }
 
+  bool DraftChain(TokenId anchor, std::vector<TokenId>* drafts,
+                  std::string* error) override {
+    if (drafts == nullptr)
+      return Fail(error, "GLM-5.3-Flash draft chain needs an output");
+    drafts->assign(1, 0);
+    if (!Draft(anchor, drafts->data(), error))
+      return false;
+    // Each further draft runs the draft block on the previous one with that
+    // row's draft-block h, while the previous draft's probability is at
+    // least chain_gate_. The block is then rewound to the anchor, so Accept
+    // catches it up on the kept tokens with trunk h as after one Draft.
+    const std::uint32_t anchor_end = executor_.NextnPosition();
+    while (drafts->size() < max_drafts_ &&
+           executor_.Position() + drafts->size() + 2 <= capacity_ &&
+           TopProb(draft_result_.logits) >= chain_gate_) {
+      const std::int32_t id[1] = {static_cast<std::int32_t>(drafts->back())};
+      const std::vector<float> h(draft_result_.hidden.end() - hidden_,
+                                 draft_result_.hidden.end());
+      if (!executor_.ForwardNextn(id, h, true, &draft_result_, error))
+        return false;
+      if (draft_result_.logits.size() != vocab_)
+        return Fail(error, "GLM-5.3-Flash draft returned no logits");
+      drafts->push_back(static_cast<TokenId>(
+          std::max_element(draft_result_.logits.begin(),
+                           draft_result_.logits.end()) -
+          draft_result_.logits.begin()));
+    }
+    if (drafts->size() > 1 && !executor_.RewindNextn(anchor_end))
+      return Fail(error, "GLM-5.3-Flash draft rewind failed");
+    return true;
+  }
+
   bool Verify(std::span<const TokenId> tokens, std::vector<float>* logits,
               std::string* error) override {
     if (!draft_ || logits == nullptr || tokens.empty())
@@ -167,10 +211,14 @@ public:
     return true;
   }
 
-  /// Enables Draft/Verify/Accept; the executor must have the NextN block.
-  void EnableDraft(std::uint32_t hidden) {
+  /// Enables Draft/Verify/Accept; the executor must have the NextN block
+  /// and verify 1 + max_drafts tokens.
+  void EnableDraft(std::uint32_t hidden, std::uint32_t max_drafts,
+                   float chain_gate) {
     draft_ = true;
     hidden_ = hidden;
+    max_drafts_ = std::max<std::uint32_t>(max_drafts, 1);
+    chain_gate_ = chain_gate;
     h_last_.assign(hidden_, 0.0F);
   }
 
@@ -232,6 +280,8 @@ private:
   bool draft_{false};
   bool drafted_{false};  ///< Draft ran; the draft block holds the anchor.
   std::uint32_t hidden_{0};
+  std::uint32_t max_drafts_{1};
+  float chain_gate_{2.0F};  ///< Above 1: never chain.
   std::vector<float> h_last_;
   std::vector<std::int32_t> ids_;
   std::vector<std::int32_t> verify_ids_;
@@ -293,11 +343,13 @@ std::unique_ptr<ForwardSession> MakeExecutorSession(Executor& executor,
                                                     std::uint32_t capacity,
                                                     std::uint32_t vocab,
                                                     bool fused_last_logits,
-                                                    std::uint32_t draft_hidden) {
+                                                    std::uint32_t draft_hidden,
+                                                    std::uint32_t max_drafts,
+                                                    float chain_gate) {
   auto session = std::make_unique<ExecutorSession>(executor, capacity, vocab,
                                                    fused_last_logits);
   if (draft_hidden != 0)
-    session->EnableDraft(draft_hidden);
+    session->EnableDraft(draft_hidden, max_drafts, chain_gate);
   return session;
 }
 #endif
@@ -309,6 +361,8 @@ struct Model::Impl {
   std::unique_ptr<Executor> executor;
   bool fused_last_logits{true};
   bool mtp{false};  ///< The executor has the NextN block.
+  std::uint32_t max_drafts{1};
+  float chain_gate{2.0F};
 #endif
 };
 
@@ -333,6 +387,10 @@ public:
   bool CanDraft() const noexcept override { return inner_->CanDraft(); }
   bool Draft(TokenId anchor, TokenId* draft, std::string* error) override {
     return inner_->Draft(anchor, draft, error);
+  }
+  bool DraftChain(TokenId anchor, std::vector<TokenId>* drafts,
+                  std::string* error) override {
+    return inner_->DraftChain(anchor, drafts, error);
   }
   bool Verify(std::span<const TokenId> tokens, std::vector<float>* logits,
               std::string* error) override {
@@ -430,8 +488,15 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   executor_options.capacity = max_context;
   executor_options.shards = reader->GetMappedRegions();
   executor_options.nextn = want_mtp;
-  executor_options.max_verify_tokens = want_mtp ? 2 : 1;
+  float chain_gate = options.mtp_chain_gate;
+  if (const char* gate_env = std::getenv("GUFO_GLM53_MTP_GATE");
+      gate_env != nullptr && *gate_env != '\0')
+    chain_gate = std::strtof(gate_env, nullptr);
+  const bool chain = want_mtp && chain_gate <= 1.0F;
+  executor_options.max_verify_tokens = want_mtp ? (chain ? 3 : 2) : 1;
   model->impl_->mtp = want_mtp;
+  model->impl_->max_drafts = chain ? 2 : 1;
+  model->impl_->chain_gate = chain_gate;
   model->impl_->executor = Executor::Create(
       *model->impl_->weights, executor_options, std::move(ops), &detail);
   if (model->impl_->executor == nullptr) {
@@ -473,7 +538,8 @@ std::unique_ptr<ForwardSession> Model::CreateSession(std::string* error) {
       shared_from_this(),
       MakeExecutorSession(*impl_->executor, max_context_, VocabSize(),
                           impl_->fused_last_logits,
-                          impl_->mtp ? config().hidden_size : 0));
+                          impl_->mtp ? config().hidden_size : 0,
+                          impl_->max_drafts, impl_->chain_gate));
 #else
   Fail(error, std::string(kLaneBMissingError));
   return nullptr;

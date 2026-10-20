@@ -203,13 +203,15 @@ bool Generator::Generate(std::span<const TokenId> prompt,
     }
     return true;
   };
-  // Speculative decoding (ForwardSession::Draft): the draft's guess for the
-  // token after `token` is forwarded with it; the next token is then sampled
-  // from the verified row as usual and the draft kept only if it matches
-  // (sample-and-match: the output follows the sampler exactly). On a
-  // mismatch, that sample is the next step's token.
+  // Speculative decoding (ForwardSession::DraftChain): the draft's guesses
+  // for the tokens after `token` are forwarded with it; each next token is
+  // then sampled from the verified row before it as usual, and drafts are
+  // kept while they match (sample-and-match: the output follows the sampler
+  // exactly). The first mismatching sample is the next step's token.
   std::optional<TokenId> deferred;
   std::vector<float> rows;
+  std::vector<TokenId> drafts;
+  std::vector<TokenId> verify;
   for (std::size_t n = 0; n < options.max_tokens; ++n) {
     TokenId token = 0;
     if (deferred) {
@@ -242,43 +244,60 @@ bool Generator::Generate(std::span<const TokenId> prompt,
         return false;
       continue;
     }
-    TokenId draft = 0;
-    if (!session_.Draft(token, &draft, error)) {
+    if (!session_.DraftChain(token, &drafts, error)) {
       Invalidate();
       return false;
     }
-    const TokenId verify[2] = {token, draft};
+    if (drafts.empty()) {
+      Invalidate();
+      return Fail(error, "GLM-5.3-Flash drafted nothing");
+    }
+    verify.assign(1, token);
+    verify.insert(verify.end(), drafts.begin(), drafts.end());
     logits_valid_ = false;
     if (!session_.Verify(verify, &rows, error)) {
       Invalidate();
       return false;
     }
-    const std::size_t vocab = rows.size() / 2;
-    const std::span<const float> row0(rows.data(), vocab);
-    const TokenId next = sampler.Sample(row0);
-    // Keep the draft when it is the sampled token, unless it ends the turn
-    // (a stop is never forwarded; the next step reports it).
-    const bool keep_draft =
-        next == draft && !(options.stop_at_eos && IsStop(next));
-    if (!session_.Accept(keep_draft ? 2 : 1, error)) {
+    const std::size_t vocab = rows.size() / verify.size();
+    const auto row = [&](std::size_t i) {
+      return std::span<const float>(rows.data() + (i * vocab), vocab);
+    };
+    // Keep each draft that is the sampled token, unless it ends the turn (a
+    // stop is never forwarded; the next step reports it), and no more than
+    // the token budget allows.
+    const std::size_t limit =
+        std::min(drafts.size(), options.max_tokens - n - 1);
+    std::size_t kept = 0;
+    std::optional<TokenId> mismatch;
+    while (kept < limit) {
+      const TokenId next = sampler.Sample(row(kept));
+      if (next != drafts[kept] || (options.stop_at_eos && IsStop(next))) {
+        mismatch = next;
+        break;
+      }
+      sampler.Accept(next);
+      ++kept;
+    }
+    if (!session_.Accept(kept + 1, error)) {
       Invalidate();
       return false;
     }
     tokens_.push_back(token);
-    if (!keep_draft) {
-      logits_.assign(row0.begin(), row0.end());
-      logits_valid_ = true;
-      deferred = next;
+    tokens_.insert(tokens_.end(), drafts.begin(),
+                   drafts.begin() + static_cast<std::ptrdiff_t>(kept));
+    const auto frontier = row(kept);
+    logits_.assign(frontier.begin(), frontier.end());
+    logits_valid_ = true;
+    for (std::size_t i = 0; i < kept; ++i) {
+      ++n;
+      if (!emit(drafts[i]))
+        return true;
+    }
+    if (mismatch) {
+      deferred = mismatch;
       continue;
     }
-    tokens_.push_back(draft);
-    logits_.assign(rows.begin() + static_cast<std::ptrdiff_t>(vocab),
-                   rows.end());
-    logits_valid_ = true;
-    ++n;
-    sampler.Accept(draft);
-    if (!emit(draft))
-      return true;
     if (n + 1 == options.max_tokens)
       break;
   }
