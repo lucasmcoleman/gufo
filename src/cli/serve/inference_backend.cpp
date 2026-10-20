@@ -3400,6 +3400,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
         models::glm53_flash::ModelOptions{
             .max_context = max_context,
             .prefill_chunk = models::glm53_flash::ModelOptions{}.prefill_chunk,
+            // A server loads once, so the first request should not pay the
+            // weights' first touch (first prefill 5.2 s -> 1.4 s on
+            // MasterServer).
+            .warm_up = true,
         },
         &load_error);
     if (model == nullptr) {
