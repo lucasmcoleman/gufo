@@ -6,16 +6,19 @@
 //     block (draft i + 1 = argmax(ForwardNextn(draft i, h_nextn of draft i)),
 //     verify [anchor, drafts...], keep the matching prefix, rewind the draft
 //     block to the anchor and catch it up on the kept rows with trunk h.
+//   - gated depth 2 for each threshold in GATES: the second draft is chained
+//     only when the first draft's softmax probability is at least the gate.
 // Prints tok/s, acceptance per draft slot and where each stream first differs
 // from plain greedy.
 //
 // usage: glm53_flash_mtp_depth_bench MODEL.gguf PROMPTS.txt [tokens=256]
-//                                     [max_depth=3]
+//                                     [max_depth=3] [gates=0.5,0.7,0.8,0.9]
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -39,6 +42,14 @@ std::int32_t ArgMax(const float* v, std::size_t n) {
   return static_cast<std::int32_t>(std::max_element(v, v + n) - v);
 }
 
+// Softmax probability of the argmax entry.
+float TopProb(const float* v, std::size_t n) {
+  const float top = *std::max_element(v, v + n);
+  double sum = 0;
+  for (std::size_t i = 0; i < n; ++i) sum += std::exp(double(v[i]) - top);
+  return static_cast<float>(1.0 / sum);
+}
+
 double Since(Clock::time_point t) {
   return std::chrono::duration<double>(Clock::now() - t).count();
 }
@@ -48,11 +59,27 @@ double Since(Clock::time_point t) {
 int main(int argc, char** argv) {
   if (argc < 3) {
     std::cerr << "usage: glm53_flash_mtp_depth_bench MODEL.gguf PROMPTS.txt "
-                 "[tokens=256] [max_depth=3]\n";
+                 "[tokens=256] [max_depth=3] [gates=0.5,0.7,0.8,0.9]\n";
     return 2;
   }
   const std::uint32_t want = argc > 3 ? std::atoi(argv[3]) : 256;
-  const std::uint32_t max_depth = argc > 4 ? std::atoi(argv[4]) : 3;
+  const std::uint32_t max_depth =
+      std::max<std::uint32_t>(argc > 4 ? std::atoi(argv[4]) : 3, 2);
+  // Runs: fixed depth 1..max_depth (gate < 0), then gated depth 2.
+  struct Run {
+    std::uint32_t depth;
+    float gate;
+  };
+  std::vector<Run> runs;
+  for (std::uint32_t d = 1; d <= max_depth; ++d) runs.push_back({d, -1.0F});
+  {
+    std::string list = argc > 5 ? argv[5] : "0.5,0.7,0.8,0.9";
+    for (std::size_t at = 0; at < list.size();) {
+      const std::size_t end = std::min(list.find(',', at), list.size());
+      runs.push_back({2, std::stof(list.substr(at, end - at))});
+      at = end + 1;
+    }
+  }
   std::vector<std::string> prompts;
   {
     std::ifstream in(argv[2]);
@@ -140,7 +167,8 @@ int main(int argc, char** argv) {
     }
     std::cout << "\n";
 
-    for (std::uint32_t depth = 1; depth <= max_depth; ++depth) {
+    for (const Run& run : runs) {
+      const std::uint32_t depth = run.depth;
       std::vector<std::int32_t> mtp;
       if (!exec->Reset() ||
           !exec->Forward(prompt, true, &out, nullptr, &error))
@@ -165,14 +193,17 @@ int main(int argc, char** argv) {
         const std::uint32_t anchor_end = exec->NextnPosition();
         std::vector<std::int32_t> verify = {anchor};
         verify.push_back(ArgMax(nx.logits.data(), V));
-        for (std::uint32_t d = 1; d < depth; ++d) {
+        const bool chain =
+            run.gate < 0 || TopProb(nx.logits.data(), V) >= run.gate;
+        for (std::uint32_t d = 1; chain && d < depth; ++d) {
           const std::int32_t prev[1] = {verify.back()};
           const std::vector<float> h(nx.hidden.end() - H, nx.hidden.end());
           if (!exec->ForwardNextn(prev, h, true, &nx, &error))
             return fail("nextn chain");
           verify.push_back(ArgMax(nx.logits.data(), V));
         }
-        if (depth > 1 && !exec->RewindNextn(anchor_end))
+        const auto drafts = static_cast<std::uint32_t>(verify.size() - 1);
+        if (drafts > 1 && !exec->RewindNextn(anchor_end))
           return fail("nextn rewind");
         nextn_s += Since(tc);
         tc = Clock::now();
@@ -181,7 +212,7 @@ int main(int argc, char** argv) {
         verify_s += Since(tc);
         ++cycles;
         std::uint32_t m = 0;  // accepted drafts
-        while (m < depth) {
+        while (m < drafts) {
           ++slot_tried[m];
           if (ArgMax(out.logits.data() + (m * V), V) != verify[m + 1]) break;
           ++slot_ok[m];
@@ -198,7 +229,11 @@ int main(int argc, char** argv) {
       mtp.resize(want);
       std::size_t diff = 0;
       while (diff < want && plain[diff] == mtp[diff]) ++diff;
-      std::cout << "depth " << depth << "      " << want / mtp_s << " tok/s, "
+      if (run.gate < 0)
+        std::cout << "depth " << depth << "      ";
+      else
+        std::cout << "gate " << run.gate << "  ";
+      std::cout << want / mtp_s << " tok/s, "
                 << cycles << " cycles, " << static_cast<double>(want) / cycles
                 << " tok/cycle, accept";
       for (std::uint32_t d = 0; d < depth; ++d)

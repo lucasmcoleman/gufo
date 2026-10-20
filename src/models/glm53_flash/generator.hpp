@@ -45,7 +45,8 @@ public:
   [[nodiscard]] virtual std::uint32_t Capacity() const noexcept = 0;
 
   // Speculative decoding with a draft model (GLM-5.3-Flash's NextN block).
-  // One cycle: Draft(anchor), Verify({anchor, draft}), Accept(1 or 2).
+  // One cycle: Draft(anchor), Verify({anchor, draft}), Accept(1 or 2), or
+  // DraftChain(anchor), Verify({anchor, drafts...}), Accept(1..1 + drafts).
   /// True when Draft / Verify / Accept are available.
   [[nodiscard]] virtual bool CanDraft() const noexcept { return false; }
   /// The draft model's greedy guess for the token after `anchor`, the token
@@ -57,6 +58,14 @@ public:
     if (error != nullptr)
       *error = "this session has no draft model";
     return false;
+  }
+  /// Like Draft, then more drafts chained on the previous one while the
+  /// session's own gate allows (at least one; `drafts` receives them).
+  [[nodiscard]] virtual bool DraftChain(TokenId anchor,
+                                        std::vector<TokenId>* drafts,
+                                        std::string* error) {
+    drafts->assign(1, 0);
+    return Draft(anchor, drafts->data(), error);
   }
   /// Forwards `tokens` (the anchor, then drafts) like Forward, returning
   /// every row's logits ([tokens][vocab]); Accept must follow.

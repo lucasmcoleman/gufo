@@ -281,11 +281,12 @@ private:
 /// Logits are a fixed function of the whole history (so any two ways of
 /// reaching the same tokens agree), spread enough for sampling to vary.
 /// With `drafting`, Draft guesses the greedy next token, deliberately wrong
-/// at every third position, and Verify/Accept keep a prefix.
+/// at every third position, and Verify/Accept keep a prefix. DraftChain
+/// chains up to `chain` such guesses.
 class HistorySession final : public glm::ForwardSession {
 public:
-  HistorySession(std::uint32_t vocab, bool drafting)
-      : vocab_(vocab), drafting_(drafting) {}
+  HistorySession(std::uint32_t vocab, bool drafting, std::size_t chain = 1)
+      : vocab_(vocab), drafting_(drafting), chain_(chain) {}
 
   bool Forward(std::span<const TokenId> tokens, std::vector<float>* logits,
                std::string*) override {
@@ -311,6 +312,26 @@ public:
         std::max_element(l.begin(), l.end()) - l.begin());
     *draft = h.size() % 3 == 0 ? (best + 1) % vocab_ : best;
     ++drafts;
+    return true;
+  }
+  bool DraftChain(TokenId anchor, std::vector<TokenId>* out,
+                  std::string* error) override {
+    out->clear();
+    auto h = fed;
+    TokenId prev = anchor;
+    while (out->size() < chain_) {
+      // Draft guesses from the history it is given, so chain on a copy.
+      const auto saved = fed;
+      fed = h;
+      TokenId d = 0;
+      const bool ok = Draft(prev, &d, error);
+      fed = saved;
+      if (!ok)
+        return false;
+      out->push_back(d);
+      h.push_back(prev);
+      prev = d;
+    }
     return true;
   }
   bool Verify(std::span<const TokenId> tokens, std::vector<float>* logits,
@@ -352,6 +373,7 @@ private:
 
   std::uint32_t vocab_;
   bool drafting_;
+  std::size_t chain_;
   std::size_t base_{0};
 };
 
@@ -359,6 +381,7 @@ private:
 
 void TestDraftMatchesPlain(const Vocab& v) {
   const std::vector<TokenId> prompt = Vocab::Text("draft test");
+  for (const std::size_t chain : {1U, 2U, 3U})
   for (const float temperature : {0.0F, 1.0F})
   for (const bool stop_at_eos : {true, false}) {
     glm::GenerationOptions opts;
@@ -367,7 +390,7 @@ void TestDraftMatchesPlain(const Vocab& v) {
     opts.sampling.temperature = temperature;
     opts.sampling.seed = 42;
     HistorySession plain_session(v.Size(), false);
-    HistorySession draft_session(v.Size(), true);
+    HistorySession draft_session(v.Size(), true, chain);
     glm::Generator plain(plain_session, glm::ResolveStopTokens(*v.tokenizer),
                          v.tokenizer.get());
     glm::Generator spec(draft_session, glm::ResolveStopTokens(*v.tokenizer),
@@ -379,7 +402,7 @@ void TestDraftMatchesPlain(const Vocab& v) {
     Require(spec.Generate(prompt, opts, {}, &b, &error), "draft: " + error);
     const std::string mode =
         std::string(temperature == 0.0F ? "greedy" : "sampled") +
-        (stop_at_eos ? "" : ", no stop");
+        (stop_at_eos ? "" : ", no stop") + ", chain " + std::to_string(chain);
     Require(a.tokens == b.tokens,
             mode + ": drafted output differs from plain decoding");
     Require(a.finish_reason == b.finish_reason, mode + ": finish reason");
