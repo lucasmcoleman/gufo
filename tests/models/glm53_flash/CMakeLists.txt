@@ -168,6 +168,13 @@ if (ENGINE_ENABLE_HIP)
   set_target_properties(glm53_flash_mtp_bench PROPERTIES EXCLUDE_FROM_ALL ON)
 endif()
 
+# MTP draft-depth benchmark (not a test): tools/glm53/mtp_depth_bench.cpp.
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_mtp_depth_bench
+    ${PROJECT_SOURCE_DIR}/tools/glm53/mtp_depth_bench.cpp)
+  target_link_libraries(glm53_flash_mtp_depth_bench PRIVATE gufo_glm53_flash_reference)
+  set_target_properties(glm53_flash_mtp_depth_bench PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
 
 # Speculative verify/rollback probe (not a test): tools/glm53/rollback_probe.cpp.
 if (ENGINE_ENABLE_HIP)
@@ -212,6 +219,13 @@ if (ENGINE_ENABLE_HIP)
     ENVIRONMENT "GUFO_GLM53_EXACT_PREFILL=1")
 endif()
 
+# Short-reply latency probe (not a test): tools/glm53/short_reply_probe.cpp.
+if (ENGINE_ENABLE_HIP)
+  add_executable(glm53_flash_short_reply_probe
+    ${PROJECT_SOURCE_DIR}/tools/glm53/short_reply_probe.cpp)
+  target_link_libraries(glm53_flash_short_reply_probe PRIVATE gufo_glm53_flash_reference)
+  set_target_properties(glm53_flash_short_reply_probe PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
 
 # NextN Q2_K/Q3_K MoE prefill benchmark (not a test): tools/glm53/q2k_moe_bench.cpp.
 if (ENGINE_ENABLE_HIP)
