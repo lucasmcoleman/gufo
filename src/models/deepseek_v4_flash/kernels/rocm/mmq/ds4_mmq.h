@@ -289,6 +289,19 @@ int ds4_mmq_iq3_xxs_moe(
     int             n_expert_used,
     hipStream_t    stream);
 
+// GLM-5.3-Flash NextN routed down experts.
+int ds4_mmq_q3_K_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
 // ds4 (P4 Inc3): same contract as ds4_mmq_q2_K_moe but W_soa is the aligned
 // row-pair-SoA artifact (weight server --repack-q2k-aligned, layout in
 // ds4_mmq_q2_k_aligned_bytes' comment) instead of the raw block stream.  The
@@ -571,6 +584,18 @@ int ds4_mmq_iq2_s_moe_vec(
     hipStream_t    stream);
 
 int ds4_mmq_iq3_xxs_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
+int ds4_mmq_q3_K_moe_vec(
     const void    * W,
     const float   * X_f32,
     const int32_t * ids,
