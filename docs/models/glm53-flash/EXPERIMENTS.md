@@ -19,3 +19,13 @@ Evidence on MasterServer:
 `/home/lucas/agentchattr-workspace/outputs/gufo-kda-graph` contains the rejected
 patch, raw timing logs, binary hashes, build commands and review notes.
 The initial invalid timing log is explicitly named and excluded.
+
+## Shared gate/up input quantization, 2026-10-19
+
+Rejected. Quantizing once for eligible dense/shared gate and up projections
+preserved saved full-model logits bitwise, but pp2048 median increased from
+10.2768 s to 10.3043 s. The prototype and its test were removed; the patch
+remains in `outputs/gufo-prefill-20261019/paired-rejected.patch` on MasterServer.
+The separate Q8_0 tail-read fix remains: partial macro tiles could load whole
+activation tiles past the allocated scratch. Missing tiles now read tile zero
+with a zero scale, as the K-quant implementation already does.
