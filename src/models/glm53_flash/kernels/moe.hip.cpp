@@ -273,10 +273,23 @@ bool Ds4GateUp(const DeviceMatrix& gate, const DeviceMatrix& up,
             t = static_cast<int>(tokens), e = static_cast<int>(gate.experts),
             r = static_cast<int>(routes);
   if (gate.type == GgmlType::kQ2_K) {
-    const auto project = tokens <= kVecTokens ? ds4_mmq_q2_K_moe_vec
-                                              : ds4_mmq_q2_K_moe;
-    return project(gate.data, x, ids, g, m, k, t, e, r, stream) == 0 &&
-           project(up.data, x, ids, u, m, k, t, e, r, stream) == 0;
+    // Q2_K (the NextN experts) runs the vec kernel over 8-token chunks at
+    // every size: ds4_mmq_q2_K_moe is far slower on these shapes.
+    // glm53_flash_q2k_moe_bench (gfx1151): 30 tokens 272 -> 6.4 ms, 256
+    // tokens 561 -> 66 ms, and closer to an fp64 reference (rel L2 3.6e-3
+    // vs 4.1e-3).
+    for (int t0 = 0; t0 < t; t0 += static_cast<int>(kVecTokens)) {
+      const int n = std::min(static_cast<int>(kVecTokens), t - t0);
+      const float* xc = x + (std::size_t(t0) * k);
+      const std::int32_t* ic = ids + (std::size_t(t0) * r);
+      const std::size_t out = std::size_t(t0) * r * m;
+      if (ds4_mmq_q2_K_moe_vec(gate.data, xc, ic, g + out, m, k, n, e, r,
+                               stream) != 0 ||
+          ds4_mmq_q2_K_moe_vec(up.data, xc, ic, u + out, m, k, n, e, r,
+                               stream) != 0)
+        return false;
+    }
+    return true;
   }
   if (tokens <= kVecTokens)
     return ds4_mmq_iq2_xxs_moe_vec(gate.data, x, ids, g, m, k, t, e, r,
