@@ -236,7 +236,7 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   float* d_y = nullptr;
   float* d_y2 = nullptr;
   const std::size_t q8_bytes =
-      gufo::hip::QuantizedActivationBytes(batch, k) + 4096;
+      gufo::hip::QuantizedActivationBytes(batch, k);
   HIP_CHECK(hipMalloc(&d_w, h_w.size() * sizeof(HostQ8_0Block)));
   HIP_CHECK(hipMalloc(&d_w2, h_w2.size() * sizeof(HostQ8_0Block)));
   HIP_CHECK(hipMalloc(&d_x_bf16, h_x_bf16.size() * sizeof(std::uint16_t)));
@@ -581,6 +581,9 @@ int main() {
   RunCase(128, 256, 256, false);
   // Short-prompt 64-token configuration.
   RunCase(64, 256, 256, false);
+  // Whole missing activation tiles must not read beyond exact scratch.
+  RunCase(65, 256, 256, false);
+  RunCase(129, 256, 256, false);
   // Row count and batch that are not multiples of the macro tile.
   RunCase(100, 200, 160, false);
   // Rows below one macro tile.
