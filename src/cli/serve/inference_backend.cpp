@@ -81,11 +81,16 @@ void SetError(std::string* error, std::string message) {
 /// sessions 87.9/95.8/94.8/90.2, three 105.7/103.0/98.9/98.2, four
 /// 117.1/113.4/109.6/110.1, against 79.0/95.7/106.0 without drafting. Dense
 /// targets share their weights across the rows and keep the full draft: the
-/// cap cost Qwen3.8-27B 6% at two sessions and 26% at four.
-std::uint32_t ConcurrentDraftCap(std::size_t active, bool moe_target) {
+/// cap cost Qwen3.8-27B 6% at two sessions and 26% at four. MTP stops drafting
+/// at three sessions: on the 35B one MTP draft token gave 99.4/107.2 total
+/// tok/s at three/four greedy sessions, against 99.1/111.0 with none.
+std::uint32_t ConcurrentDraftCap(std::size_t active, bool moe_target,
+                                 bool mtp_draft) {
   if (active <= 1 || !moe_target)
     return std::numeric_limits<std::uint32_t>::max();
-  return active == 2 ? 2 : 1;
+  if (active == 2)
+    return 2;
+  return mtp_draft ? 0 : 1;
 }
 
 struct QwenImageContext final : TextPromptContext {
@@ -1206,12 +1211,12 @@ public:
                 .final_token_advance_required = !speculative_enabled,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = speculative_enabled,
-                // Only DFlash2 shares a batched draft forward across sessions;
-                // MTP decodes serially, so it must not claim batching.
+                // Speculative sessions never take the single-token advance
+                // path, so concurrent MTP sessions verify in a batch too.
                 .batched_multi_token_decode =
-                    dflash_model_ != nullptr && MaximumDecodeBatchWidth() > 1,
+                    speculative_enabled && MaximumDecodeBatchWidth() > 1,
                 .batched_multi_token_decode_max_width =
-                    dflash_model_ != nullptr ? MaximumDecodeBatchWidth() : 0,
+                    speculative_enabled ? MaximumDecodeBatchWidth() : 0,
                 .prefix_reuse = true,
                 .partial_prefill_retention = true,
                 .prefill_rollback = true,
@@ -1466,7 +1471,7 @@ public:
     auto& qwen = RequireQwenState(state);
     if (qwen.speculative()) {
       throw std::logic_error(
-          "Qwen DFlash decoding requires a multi-token decode step");
+          "Qwen speculative decoding requires a multi-token decode step");
     }
     if (!qwen.frontier().has_value()) {
       throw std::logic_error("Qwen decode state has no retained frontier");
@@ -1494,7 +1499,7 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
-    if (dflash_model_ == nullptr || decodes.size() < 2 ||
+    if (DraftKind() == QwenDraftKind::kNone || decodes.size() < 2 ||
         decodes.size() > MaximumDecodeBatchWidth()) {
       return TextModelRunner::DecodeBatch(decodes);
     }
@@ -1520,7 +1525,8 @@ public:
       }
     }
     const auto draft_cap =
-        ConcurrentDraftCap(requests.size(), model_->GetConfig().IsMoE());
+        ConcurrentDraftCap(requests.size(), model_->GetConfig().IsMoE(),
+                           DraftKind() == QwenDraftKind::kMtp);
     for (auto& request : requests)
       request.max_draft_tokens = draft_cap;
     auto verified = speculative::SpeculativeVerifier::VerifyBatch(requests);
@@ -1536,9 +1542,9 @@ public:
 
   void AdvanceBatch(
       std::span<const TextRunnerAdvance> advances) const override {
-    if (dflash_model_ != nullptr) {
+    if (DraftKind() != QwenDraftKind::kNone) {
       throw std::logic_error(
-          "Qwen DFlash sessions do not support batch advance");
+          "Qwen speculative sessions do not support batch advance");
     }
     if (advances.size() < 2 || advances.size() > 8) {
       throw std::invalid_argument(
@@ -1590,7 +1596,8 @@ private:
   }
 
   [[nodiscard]] std::size_t MaximumDecodeBatchWidth() const noexcept {
-    const std::size_t rows_per_session = dflash_model_ != nullptr ? 8 : 1;
+    const std::size_t rows_per_session =
+        DraftKind() != QwenDraftKind::kNone ? 8 : 1;
     return std::clamp<std::size_t>(max_context_ / rows_per_session, 1, 8);
   }
 
