@@ -240,6 +240,36 @@ private:
 };
 #endif
 
+// ModelOptions::warm_up: a short prefill, one decode step and (with MTP) one
+// draft/verify cycle on a throwaway session, so the first request does not
+// pay the first GPU touch of the weights or each kernel's first launch.
+[[maybe_unused]] bool WarmUp(Model& model, std::string* error) {
+  auto session = model.CreateSession(error);
+  if (session == nullptr)
+    return false;
+  const std::vector<TokenId> prompt = model.tokenizer().Encode(
+      "Warm up every GLM-5.3-Flash kernel once before the first request.",
+      false);
+  std::vector<float> logits;
+  const auto argmax = [&] {
+    return static_cast<TokenId>(
+        std::max_element(logits.begin(), logits.end()) - logits.begin());
+  };
+  if (prompt.empty() || !session->Forward(prompt, &logits, error))
+    return false;
+  const TokenId next[1] = {argmax()};
+  if (!session->Forward(next, &logits, error))
+    return false;
+  if (session->CanDraft()) {
+    TokenId verify[2] = {argmax(), 0};
+    if (!session->Draft(verify[0], &verify[1], error) ||
+        !session->Verify(verify, &logits, error) ||
+        !session->Accept(1, error))
+      return false;
+  }
+  return session->Reset(error);
+}
+
 }  // namespace
 
 bool IsGlm53Flash(const core::GgufReader& reader) {
@@ -417,6 +447,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   model->max_context_ = max_context;
   model->name_ = std::string(
       reader->GetMetadataString("general.name").value_or(kArchitecture));
+  if (options.warm_up && !WarmUp(*model, &detail)) {
+    Fail(error, "GLM-5.3-Flash warm-up: " + detail);
+    return nullptr;
+  }
   return model;
 #else
   (void)options;
