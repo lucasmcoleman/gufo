@@ -123,8 +123,7 @@ int main(int argc, char** argv) {
     if (!exec->ForwardNextn(nx_tokens, nx_h, true, &nx, &error))
       return fail("nextn");
     nextn_s += Since(tc);
-    const std::int32_t draft =
-        ArgMax(nx.logits.data() + ((nx_tokens.size() - 1) * V), V);
+    const std::int32_t draft = ArgMax(nx.logits.data(), V);
     const std::int32_t verify[2] = {anchor, draft};
     tc = Clock::now();
     if (!exec->ForwardVerify(verify, true, &out, &error)) return fail("verify");

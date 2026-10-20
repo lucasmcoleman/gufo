@@ -356,10 +356,12 @@ public:
   /// NextnPosition() + t paired with h[t] [hidden], the trunk's
   /// final_norm.out (ForwardResult::hidden) of the previous position. Fills
   /// `out->hidden` (h_nextn, the next draft step's h) and, with
-  /// `want_logits`, `out->logits`. Advances NextnPosition(). Synchronous.
+  /// `want_logits`, `out->logits`: the last token's row (a draft), or every
+  /// row with `all_rows`. Advances NextnPosition(). Synchronous.
   [[nodiscard]] bool ForwardNextn(std::span<const std::int32_t> tokens,
                                   std::span<const float> h, bool want_logits,
-                                  ForwardResult* out, std::string* error);
+                                  ForwardResult* out, std::string* error,
+                                  bool all_rows = false);
   [[nodiscard]] std::uint32_t NextnPosition() const noexcept {
     return nextn_position_;
   }

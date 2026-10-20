@@ -19,6 +19,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -276,6 +277,126 @@ private:
   std::size_t cursor_{0};
   std::uint32_t position_{0};
 };
+
+/// Logits are a fixed function of the whole history (so any two ways of
+/// reaching the same tokens agree), spread enough for sampling to vary.
+/// With `drafting`, Draft guesses the greedy next token, deliberately wrong
+/// at every third position, and Verify/Accept keep a prefix.
+class HistorySession final : public glm::ForwardSession {
+public:
+  HistorySession(std::uint32_t vocab, bool drafting)
+      : vocab_(vocab), drafting_(drafting) {}
+
+  bool Forward(std::span<const TokenId> tokens, std::vector<float>* logits,
+               std::string*) override {
+    fed.insert(fed.end(), tokens.begin(), tokens.end());
+    if (logits != nullptr)
+      *logits = LogitsAfter(fed);
+    return true;
+  }
+  bool Reset(std::string*) override {
+    fed.clear();
+    return true;
+  }
+  std::uint32_t Position() const noexcept override {
+    return static_cast<std::uint32_t>(fed.size());
+  }
+  std::uint32_t Capacity() const noexcept override { return 4096; }
+  bool CanDraft() const noexcept override { return drafting_; }
+  bool Draft(TokenId anchor, TokenId* draft, std::string*) override {
+    auto h = fed;
+    h.push_back(anchor);
+    const auto l = LogitsAfter(h);
+    const auto best = static_cast<TokenId>(
+        std::max_element(l.begin(), l.end()) - l.begin());
+    *draft = h.size() % 3 == 0 ? (best + 1) % vocab_ : best;
+    ++drafts;
+    return true;
+  }
+  bool Verify(std::span<const TokenId> tokens, std::vector<float>* logits,
+              std::string*) override {
+    base_ = fed.size();
+    logits->clear();
+    for (const TokenId t : tokens) {
+      fed.push_back(t);
+      const auto l = LogitsAfter(fed);
+      logits->insert(logits->end(), l.begin(), l.end());
+    }
+    return true;
+  }
+  bool Accept(std::size_t keep, std::string*) override {
+    accepted += keep - 1;
+    fed.resize(base_ + keep);
+    return true;
+  }
+
+  std::vector<TokenId> fed;
+  int drafts{0};
+  std::size_t accepted{0};
+
+private:
+  [[nodiscard]] std::vector<float> LogitsAfter(
+      const std::vector<TokenId>& history) const {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const TokenId t : history)
+      h = (h ^ t) * 1099511628211ULL;
+    std::vector<float> l(vocab_);
+    for (std::uint32_t i = 0; i < vocab_; ++i) {
+      const std::uint64_t x = (h + (i * 0x9E3779B97F4A7C15ULL)) >> 40;
+      l[i] = static_cast<float>(x % 1000) / 250.0F;
+    }
+    // One likely token, so a sampled step often matches the greedy draft.
+    l[(h >> 17) % vocab_] += 6.0F;
+    return l;
+  }
+
+  std::uint32_t vocab_;
+  bool drafting_;
+  std::size_t base_{0};
+};
+
+// ---- Speculative decoding ----
+
+void TestDraftMatchesPlain(const Vocab& v) {
+  const std::vector<TokenId> prompt = Vocab::Text("draft test");
+  for (const float temperature : {0.0F, 1.0F})
+  for (const bool stop_at_eos : {true, false}) {
+    glm::GenerationOptions opts;
+    opts.max_tokens = 41;
+    opts.stop_at_eos = stop_at_eos;
+    opts.sampling.temperature = temperature;
+    opts.sampling.seed = 42;
+    HistorySession plain_session(v.Size(), false);
+    HistorySession draft_session(v.Size(), true);
+    glm::Generator plain(plain_session, glm::ResolveStopTokens(*v.tokenizer),
+                         v.tokenizer.get());
+    glm::Generator spec(draft_session, glm::ResolveStopTokens(*v.tokenizer),
+                        v.tokenizer.get());
+    glm::GenerationResult a;
+    glm::GenerationResult b;
+    std::string error;
+    Require(plain.Generate(prompt, opts, {}, &a, &error), "plain: " + error);
+    Require(spec.Generate(prompt, opts, {}, &b, &error), "draft: " + error);
+    const std::string mode =
+        std::string(temperature == 0.0F ? "greedy" : "sampled") +
+        (stop_at_eos ? "" : ", no stop");
+    Require(a.tokens == b.tokens,
+            mode + ": drafted output differs from plain decoding");
+    Require(a.finish_reason == b.finish_reason, mode + ": finish reason");
+    // A short run (an early stop) may keep none.
+    Require(draft_session.drafts > 0 &&
+                (b.tokens.size() < 20 || draft_session.accepted > 0),
+            mode + ": no draft was kept (" + std::to_string(b.tokens.size()) +
+                " tokens, " + std::to_string(draft_session.drafts) +
+                " drafts, vocab " + std::to_string(v.Size()) + ")");
+    // The session holds exactly the generator's tokens.
+    Require(std::ranges::equal(spec.tokens(), draft_session.fed),
+            mode + ": session and generator disagree on the held tokens");
+    std::cout << "ok   " << mode << " drafted decode identical to plain ("
+              << b.tokens.size() << " tokens, " << draft_session.drafts
+              << " drafts, " << draft_session.accepted << " kept)\n";
+  }
+}
 
 // ---- Stop tokens ----
 
@@ -718,6 +839,7 @@ int main() {
     TestStreamingToolCall(v);
     TestUnfinishedCallAtLength(v);
     TestLoadRefusal();
+    TestDraftMatchesPlain(v);
   } catch (const std::exception& e) {
     std::cerr << "FAIL " << e.what() << "\n";
     return 1;
