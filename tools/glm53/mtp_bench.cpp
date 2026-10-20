@@ -113,17 +113,22 @@ int main(int argc, char** argv) {
   if (!exec->ForwardNextn(prompt, h_prev, false, &nx, &error))
     return fail("nextn prompt");
   std::uint32_t cycles = 0, accepted = 0;
+  double nextn_s = 0, verify_s = 0;
   t = Clock::now();
   // Each cycle: the draft block sees `anchor` paired with h_last.
   std::vector<std::int32_t> nx_tokens = {anchor};
   std::vector<float> nx_h = h_last;
   while (mtp.size() < want) {
+    auto tc = Clock::now();
     if (!exec->ForwardNextn(nx_tokens, nx_h, true, &nx, &error))
       return fail("nextn");
+    nextn_s += Since(tc);
     const std::int32_t draft =
         ArgMax(nx.logits.data() + ((nx_tokens.size() - 1) * V), V);
     const std::int32_t verify[2] = {anchor, draft};
+    tc = Clock::now();
     if (!exec->ForwardVerify(verify, true, &out, &error)) return fail("verify");
+    verify_s += Since(tc);
     ++cycles;
     const std::int32_t first = ArgMax(out.logits.data(), V);
     mtp.push_back(anchor);
@@ -152,6 +157,9 @@ int main(int argc, char** argv) {
   std::cout << "MTP greedy   " << want << " tokens: " << want / mtp_s
             << " tok/s, " << cycles << " cycles, draft accepted " << accepted
             << "/" << cycles << " (" << 100.0 * accepted / cycles << "%)\n";
+  std::cout << "per cycle: NextN " << 1e3 * nextn_s / cycles << " ms, verify "
+            << 1e3 * verify_s / cycles << " ms, plain decode "
+            << 1e3 * plain_s / want << " ms/token\n";
   std::cout << "streams identical for the first " << diff << " of " << want
             << " tokens\n";
   return 0;
