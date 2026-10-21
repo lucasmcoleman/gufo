@@ -114,6 +114,59 @@ std::optional<std::uint64_t> MeminfoAvailableBytes(std::string_view meminfo) {
          1024;
 }
 
+std::uint64_t CgroupAvailableBytes(const std::filesystem::path& root,
+                                   std::string_view membership_text,
+                                   std::uint64_t host_available) {
+  std::uint64_t available = host_available;
+  // A cgroup limit can be much smaller than the host's available memory.
+  // Walk parents too: a child may say "max" beneath a limited ancestor.
+  std::istringstream membership{std::string(membership_text)};
+  for (std::string line; std::getline(membership, line);) {
+    if (!line.starts_with("0::/"))
+      continue;
+    const auto relative = std::filesystem::path(line.substr(4));
+    if (std::ranges::any_of(relative,
+                            [](const auto& part) { return part == ".."; }))
+      continue;
+    for (auto path = root / relative;; path = path.parent_path()) {
+      std::ifstream limit_file(path / "memory.max");
+      std::ifstream used_file(path / "memory.current");
+      std::uint64_t limit = 0, used = 0;
+      if ((limit_file >> limit) && (used_file >> used)) {
+        // memory.current includes page cache the kernel reclaims under
+        // pressure. Count inactive file pages as free; the active ones may
+        // still be in use, so they stay charged. Dirty and writeback pages
+        // cannot be dropped until written, so they stay charged too. A
+        // malformed memory.stat is ignored.
+        std::ifstream stat_file(path / "memory.stat");
+        std::uint64_t inactive_file = 0, unreclaimable = 0;
+        bool found = false, valid = true;
+        for (std::string key; stat_file >> key;) {
+          std::uint64_t value = 0;
+          if (!(stat_file >> value)) {
+            valid = false;
+            break;
+          }
+          if (key == "inactive_file") {
+            inactive_file = value;
+            found = true;
+          } else if (key == "file_dirty" || key == "file_writeback") {
+            unreclaimable += value;
+          }
+        }
+        if (found && valid)
+          used -= std::min(
+              used, inactive_file - std::min(inactive_file, unreclaimable));
+        available = std::min(available, limit > used ? limit - used : 0);
+      }
+      if (path == root)
+        break;
+    }
+    break;
+  }
+  return available;
+}
+
 namespace {
 
 /// Host RAM still available, after cgroup limits. Unified-memory device
@@ -129,29 +182,11 @@ std::uint64_t HostAvailableBytes() {
   meminfo_text << meminfo.rdbuf();
   if (const auto parsed = MeminfoAvailableBytes(meminfo_text.str()))
     available = *parsed;
-  // A cgroup limit can be much smaller than the host's available memory.
-  // Walk parents too: a child may say "max" beneath a limited ancestor.
   std::ifstream membership("/proc/self/cgroup");
-  for (std::string line; std::getline(membership, line);) {
-    if (!line.starts_with("0::/"))
-      continue;
-    const auto relative = std::filesystem::path(line.substr(4));
-    if (std::ranges::any_of(relative,
-                            [](const auto& part) { return part == ".."; }))
-      continue;
-    const std::filesystem::path root("/sys/fs/cgroup");
-    for (auto path = root / relative;; path = path.parent_path()) {
-      std::ifstream limit_file(path / "memory.max");
-      std::ifstream used_file(path / "memory.current");
-      std::uint64_t limit = 0, used = 0;
-      if ((limit_file >> limit) && (used_file >> used))
-        available = std::min(available, limit > used ? limit - used : 0);
-      if (path == root)
-        break;
-    }
-    break;
-  }
-  return available;
+  std::ostringstream membership_text;
+  membership_text << membership.rdbuf();
+  return CgroupAvailableBytes("/sys/fs/cgroup", membership_text.str(),
+                              available);
 }
 
 std::size_t ClampToSize(std::uint64_t bytes) {
@@ -700,6 +735,8 @@ TextModelRunner::BindConstraint(
       return binding;
   if (!constraint_vocabulary_)
     constraint_vocabulary_ = BuildConstraintVocabulary();
+  if (!constraint_vocabulary_)
+    throw std::invalid_argument("model does not support structured output");
   auto binding = std::make_shared<sampling::TokenConstraint>();
   binding->grammar = std::move(grammar);
   binding->vocabulary = constraint_vocabulary_;
@@ -707,6 +744,62 @@ TextModelRunner::BindConstraint(
     constraints_.erase(constraints_.begin());
   constraints_.push_back(binding);
   return binding;
+}
+
+std::size_t TextModelRunner::PrepareConstraintVocabulary() const {
+  const std::lock_guard lock(constraint_mutex_);
+  if (!constraint_vocabulary_)
+    constraint_vocabulary_ = BuildConstraintVocabulary();
+  return constraint_vocabulary_ ? constraint_vocabulary_->size() : 0;
+}
+
+std::shared_ptr<const sampling::ReasoningBudget>
+TextModelRunner::BuildReasoningBudget(
+    std::size_t tokens, std::span<const TextRunnerToken> prompt) const {
+  const auto tags = ReasoningBudgetTags();
+  const auto start = TokenizeControl(tags.start);
+  auto forced = TokenizeControl(tags.forced_end);
+  if (start.size() != 1 || forced.empty())
+    return nullptr;
+  auto budget = std::make_shared<sampling::ReasoningBudget>();
+  budget->tokens = tokens;
+  budget->forced.assign(forced.begin(), forced.end());
+  for (const auto end : tags.ends) {
+    const auto token = TokenizeControl(end);
+    if (token.size() != 1)
+      return nullptr;
+    budget->ends.push_back(token.front());
+  }
+  // llama.cpp counts the generation prompt after the start tag, such as the
+  // newline after Qwen's <think>.
+  const auto opened =
+      std::ranges::find(prompt.rbegin(), prompt.rend(), start.front());
+  if (opened != prompt.rend())
+    budget->prompt.assign(opened.base(), prompt.end());
+  const std::lock_guard lock(constraint_mutex_);
+  if (!partial_utf8_ && VocabularySize() != 0) {
+    auto partial = std::make_shared<std::vector<bool>>(VocabularySize());
+    for (TextRunnerToken token = 0; token < partial->size(); ++token) {
+      // As llama.cpp common_utf8_is_complete: the last lead byte within the
+      // final four bytes must have all of its continuation bytes.
+      const auto text = Decode(std::span(&token, 1));
+      bool complete = text.empty();
+      for (std::size_t i = 1; i <= std::min<std::size_t>(4, text.size()); ++i) {
+        const auto byte = static_cast<unsigned char>(text[text.size() - i]);
+        if ((byte & 0xC0U) != 0x80U) {
+          complete = i >= (byte >= 0xF0U   ? 4U
+                           : byte >= 0xE0U ? 3U
+                           : byte >= 0xC0U ? 2U
+                                           : 1U);
+          break;
+        }
+      }
+      (*partial)[token] = !complete;
+    }
+    partial_utf8_ = std::move(partial);
+  }
+  budget->partial_utf8 = partial_utf8_;
+  return budget;
 }
 
 void TextModelRunner::StreamPersistentSnapshot(
@@ -784,6 +877,7 @@ struct TextRunnerPool::Request::Impl {
           state,
           std::span<const TextRunnerToken>(prompt).first(prefill_offset));
     }
+    ngram_baseline = runner->NgramRows(state);
     const auto capabilities = runner->Descriptor().capabilities;
     // Component adapters supply their own pass boundaries below. Building the
     // generic plan first only repeats prefix lookups before discarding it.
@@ -1143,6 +1237,8 @@ struct TextRunnerPool::Request::Impl {
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
   bool decode_ready{false};
+  /// The leased state's cumulative n-gram rows before this request ran.
+  TextRunnerNgramRows ngram_baseline;
   // A throwing model call may have partially mutated device state. Never
   // publish that state as a live continuation, even if its position is stale.
   bool state_reusable{true};
@@ -1237,6 +1333,16 @@ std::size_t TextRunnerPool::Request::cache_restore_bytes() const noexcept {
 
 double TextRunnerPool::Request::cache_restore_ms() const noexcept {
   return impl_ != nullptr ? impl_->lease.restore_ms() : 0.0;
+}
+
+TextRunnerNgramRows TextRunnerPool::Request::ngram_rows() const {
+  if (impl_ == nullptr)
+    return {};
+  const auto now = impl_->runner->NgramRows(
+      dynamic_cast<const TextRunnerState&>(impl_->lease.state()));
+  const auto& base = impl_->ngram_baseline;
+  return {now.rows - base.rows, now.dedup_rows - base.dedup_rows,
+          now.cache_hits - base.cache_hits, now.disk_reads - base.disk_reads};
 }
 
 bool TextRunnerPool::Request::cache_disk_hit() const noexcept {
@@ -1343,11 +1449,6 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
         "text runner prefill budget must be at least one token");
   }
 
-  // Start pinning before prefill, while at least 512 tokens of GPU work
-  // remain. Cached decode and short final tails must not start registration.
-  if (impl_->prompt.size() - impl_->prefill_offset >= 512)
-    impl_->lease.PreparePrefill();
-
   // Stop exactly on the next shared-prefix boundary so it can be persisted.
   // Direct callers join any capture before mutating its borrowed state.
   impl_->CapturePromptSnapshot();
@@ -1431,6 +1532,26 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   } rearm{finish_step ? &state : nullptr, &impl_->cancelled};
   if (finish_step)
     state.SetCancellationCheck({});
+  // Fallback captures and admission must finish before pinning starts. The
+  // chunk's GPU work can overlap preparation; cached decode never calls it.
+  impl_->lease.PreparePrefill(std::min(remaining, max_input_tokens));
+  // The following step starts at this frontier and stops at the next one, so
+  // a runner may read its inputs during this step.
+  auto lookahead_end = impl_->prompt.size();
+  for (const auto point : impl_->checkpoints)
+    if (point > frontier)
+      lookahead_end = std::min(lookahead_end, point);
+  for (const auto point : impl_->boundaries)
+    if (point > frontier)
+      lookahead_end = std::min(lookahead_end, point);
+  if (snapshot_position > frontier)
+    lookahead_end = std::min(lookahead_end, snapshot_position);
+  struct ClearLookahead {
+    TextRunnerState& state;
+    ~ClearLookahead() { state.SetPrefillLookahead({}); }
+  } clear_lookahead{state};
+  state.SetPrefillLookahead(std::span<const TextRunnerToken>(impl_->prompt)
+                                .subspan(frontier, lookahead_end - frontier));
   auto step =
       in_pass ? impl_->runner->PrefillThrough(
                     state, model_prompt, impl_->prefill_offset,
@@ -2097,11 +2218,12 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   return Acquire(std::move(prompt), sampling::SamplingConfig{}, is_cancelled);
 }
 
-bool TextRunnerPool::PublicationPending(
-    std::span<const TextRunnerToken> prompt,
-    const TextPromptContext* context) const {
-  return impl_->component_cache &&
-         impl_->component_cache->PublicationPending(prompt, context);
+std::optional<TextPendingPublication> TextRunnerPool::PendingPublication(
+    std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
+    std::uint64_t checkpoint_id) const {
+  return impl_->component_cache ? impl_->component_cache->PendingPublication(
+                                      prompt, context, checkpoint_id)
+                                : std::nullopt;
 }
 
 std::size_t TextRunnerPool::CachedPrefixTokens(
