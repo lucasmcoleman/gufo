@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "qfn_mmq.h"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
@@ -442,6 +443,7 @@ void QwenMtpGpuExecutor::Free() noexcept {
   free_buffer(d_prime_k_);
   free_buffer(d_prime_v_);
   if (stream_ != nullptr) {
+    qfn_mmq_release_stream(stream_);
     (void)hipStreamDestroy(stream_);
     stream_ = nullptr;
   }
