@@ -339,7 +339,9 @@ struct ComponentTextCache::Impl {
             if (!success) {
               Logger::Info(
                   "cache",
-                  "schema=component-cache-v1 event=persistence_incomplete");
+                  "schema=component-cache-v1 event=persistence_incomplete "
+                  "checkpoint_id=" +
+                      std::to_string(id.value));
               return;
             }
             catalog->Track(id);
@@ -379,6 +381,17 @@ struct ComponentTextCache::Impl {
             const auto bytes = PayloadBytes(manifest);
             if (bytes > disk_capacity)
               return false;
+            // Startup orphan reclamation holds the store lock asynchronously
+            // and eviction only tries that lock, so a write racing it would
+            // be dropped. Only this worker joins it once the queue exists.
+            try {
+              disk->WaitForReclamation();
+            } catch (const std::exception& error) {
+              Logger::Warn("cache", std::string("schema=component-cache-v1 "
+                                                "event=disk_reclamation_failed "
+                                                "reason=") +
+                                        error.what());
+            }
             const std::lock_guard lock(mutex);
             return catalog->EvictOne();
           });
@@ -892,24 +905,32 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       const auto uncovered = [&](const Impl::Entry& e) {
         if (!e.live || e.live_tokens.size() <= kUncoveredTokens)
           return false;
-        const auto covering = impl_->index.Lookup(
+        return !impl_->index.HasCheckpoint(
             {impl_->identity, e.live_tokens,
-             cache::InputIdentity(e.live_tokens.size(), e.live_input)});
-        std::size_t deepest = 0;
-        for (const auto& candidate : covering.candidates)
-          if (!candidate.live)
-            deepest =
-                std::max(deepest, static_cast<std::size_t>(candidate.boundary));
-        return e.live_tokens.size() - deepest > kUncoveredTokens;
+             cache::InputIdentity(e.live_tokens.size(), e.live_input)},
+            e.live_tokens.size() - kUncoveredTokens);
       };
+      using Rank = std::tuple<bool, bool, bool, bool, std::uint64_t>;
       const auto rank = [&](const Impl::Entry& e) {
-        return std::tuple{uncovered(e), !e.slot->PreservationComplete(),
-                          bool(e.live),
-                          e.live_tokens.size() >= kUncoveredTokens, e.used};
+        return Rank{uncovered(e), !e.slot->PreservationComplete(), bool(e.live),
+                    e.live_tokens.size() >= kUncoveredTokens, e.used};
       };
-      for (auto& candidate : impl_->entries)
-        if (!candidate->busy && (!entry || rank(*candidate) < rank(*entry)))
+      std::optional<Rank> selected_rank;
+      for (auto& candidate : impl_->entries) {
+        if (candidate->busy)
+          continue;
+        if (!entry) {
           entry = candidate.get();
+          continue;
+        }
+        if (!selected_rank)
+          selected_rank = rank(*entry);
+        const auto candidate_rank = rank(*candidate);
+        if (candidate_rank < *selected_rank) {
+          entry = candidate.get();
+          selected_rank = candidate_rank;
+        }
+      }
     }
     if (!entry)
       throw cache::SlotBusy();
@@ -935,6 +956,9 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     request.state->SetStopAtEos(stop_at_eos);
     impl_->runner->SetPromptContext(*request.state, context);
     const auto started = Clock::now();
+    // Cold Acquire has already reset the slot. Only an attempted restore (or
+    // an unusable live frontier) can require another reset before cold use.
+    bool clean = !live;
     bool restored = bool(live);
     if (live)
       request.cached = found.selected->boundary;
@@ -949,6 +973,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           std::vector<cache::ComponentPosition> positions;
           for (const auto& c : checkpoint.Components())
             positions.push_back(c.position);
+          clean = false;
           impl_->resources->adapter->BeginRestore(request.slot.Execution(),
                                                   positions);
           // Every pin outlives all submitted loads, including failure drain.
@@ -1056,6 +1081,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           }
           restored = true;
         } else if (candidate.durable && impl_->streaming) {
+          clean = false;
           cache::TransferTiming timing;
           const auto id = candidate.durable->Manifest().checkpoint;
           restored = impl_->streaming->Restore(
@@ -1098,11 +1124,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       } catch (...) {
         if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
           throw;
+        clean = true;
         request.restored = 0;
       }
     }
     if (!restored) {
-      if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
+      if (!clean &&
+          !impl_->resources->adapter->Invalidate(request.slot.Execution()))
         throw std::runtime_error("component cold initialization failed");
       entry->history = std::make_unique<cache::ExecutionHistory>(
           cache::ExecutionHistory::Cold(impl_->ledger,
@@ -1159,29 +1187,38 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   }
 }
 
-bool ComponentTextCache::PublicationPending(
-    std::span<const ContinuationToken> prompt,
-    const TextPromptContext* context) const {
-  // A disk job still writing a much deeper prefix of this prompt usually
-  // finishes sooner than prefilling the difference again (#562, step E2):
-  // a conversation larger than the RAM budget has no RAM copy.
-  constexpr std::size_t kWaitGainTokens = 4096;
+std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
+    std::span<const ContinuationToken> prompt, const TextPromptContext* context,
+    std::uint64_t checkpoint_id) const {
   if (!impl_->queue)
-    return false;
+    return std::nullopt;
   const auto input = Inputs(prompt.size(), context);
   const std::lock_guard lock(impl_->mutex);
   const auto found =
       impl_->index.Lookup({impl_->identity, prompt, input, 0, true});
   const std::size_t best = found.selected ? found.selected->boundary : 0;
-  return std::ranges::any_of(impl_->pending_durable, [&](const auto& capture) {
+  std::optional<TextPendingPublication> selected;
+  for (const auto& capture : impl_->pending_durable) {
     if (!capture)
-      return false;
+      continue;
+    const auto id = capture->manifest.checkpoint.value;
+    if (checkpoint_id && id != checkpoint_id)
+      continue;
     const auto& tokens = capture->manifest.tokens;
-    return tokens.size() > best + kWaitGainTokens &&
-           tokens.size() <= prompt.size() &&
-           capture->manifest.input == At(input, tokens.size()) &&
-           std::equal(tokens.begin(), tokens.end(), prompt.begin());
-  });
+    if (tokens.size() > prompt.size() ||
+        capture->manifest.input != At(input, tokens.size()) ||
+        !std::equal(tokens.begin(), tokens.end(), prompt.begin()))
+      continue;
+    TextPendingPublication candidate{id, best, tokens.size()};
+    if (!checkpoint_id &&
+        candidate.Gain() <= TextPendingPublication::kMinimumGainTokens)
+      continue;
+    if (!selected || candidate.pending_tokens > selected->pending_tokens ||
+        (candidate.pending_tokens == selected->pending_tokens &&
+         id < selected->checkpoint_id))
+      selected = candidate;
+  }
+  return selected;
 }
 
 std::size_t ComponentTextCache::CachedPrefixTokens(
@@ -1223,12 +1260,10 @@ ContinuationLookup ComponentTextCache::Lease::lookup() const noexcept {
 bool ComponentTextCache::Lease::HasSnapshotFor(
     std::span<const ContinuationToken> tokens) const {
   const std::lock_guard lock(impl_->cache->mutex);
-  auto found = impl_->cache->index.Lookup(
+  return impl_->cache->index.HasCheckpoint(
       {impl_->cache->identity, tokens,
-       cache::InputIdentity(tokens.size(), At(impl_->input, tokens.size()))});
-  return std::any_of(
-      found.candidates.begin(), found.candidates.end(),
-      [&](const auto& c) { return !c.live && c.boundary == tokens.size(); });
+       cache::InputIdentity(tokens.size(), At(impl_->input, tokens.size()))},
+      tokens.size());
 }
 bool ComponentTextCache::Lease::TryReserveSnapshot(
     std::size_t bytes, std::size_t boundary, bool preserve,
@@ -1257,9 +1292,9 @@ void ComponentTextCache::Lease::SkipSnapshot(SnapshotEventReason reason,
   } catch (...) {
   }
 }
-void ComponentTextCache::Lease::PreparePrefill() {
+void ComponentTextCache::Lease::PreparePrefill(std::size_t tokens) {
   if (impl_->cache->resources->prepare_prefill)
-    impl_->cache->resources->prepare_prefill();
+    impl_->cache->resources->prepare_prefill(tokens);
 }
 
 std::size_t ComponentTextCache::Lease::CaptureBytes() const {
@@ -1622,9 +1657,9 @@ void ServingCacheLease::AdoptRestoredPrefix(std::size_t tokens,
     throw std::logic_error("component restore is owned by the component cache");
   legacy_.AdoptRestoredPrefix(tokens, bytes, ms);
 }
-void ServingCacheLease::PreparePrefill() {
+void ServingCacheLease::PreparePrefill(std::size_t tokens) {
   if (component_)
-    component_->PreparePrefill();
+    component_->PreparePrefill(tokens);
 }
 
 std::size_t ServingCacheLease::CaptureBytes() const {
