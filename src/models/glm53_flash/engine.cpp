@@ -425,6 +425,14 @@ std::size_t Model::DeviceBytes() const noexcept {
 #endif
 }
 
+bool Model::Mtp() const noexcept {
+#if defined(GLM53_ROCM_BUILD)
+  return impl_->mtp;
+#else
+  return false;
+#endif
+}
+
 std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                    const ModelOptions& options,
                                    std::string* error) {

@@ -203,26 +203,14 @@ bool Generator::Generate(std::span<const TokenId> prompt,
     }
     return true;
   };
-  // Speculative decoding (ForwardSession::DraftChain): the draft's guesses
-  // for the tokens after `token` are forwarded with it; each next token is
-  // then sampled from the verified row before it as usual, and drafts are
-  // kept while they match (sample-and-match: the output follows the sampler
-  // exactly). The first mismatching sample is the next step's token.
-  std::optional<TokenId> deferred;
-  std::vector<float> rows;
-  std::vector<TokenId> drafts;
-  std::vector<TokenId> verify;
+  // ExtendDrafted defers a mismatching draft's sample in `sampler`, so the
+  // next Sample returns it.
+  std::vector<TokenId> kept;
   for (std::size_t n = 0; n < options.max_tokens; ++n) {
-    TokenId token = 0;
-    if (deferred) {
-      token = *deferred;
-      deferred.reset();
-    } else {
-      const auto frontier = logits();
-      if (frontier.empty())
-        return Fail(error, "GLM-5.3-Flash has no logits to sample");
-      token = sampler.Sample(frontier);
-    }
+    const auto frontier = logits();
+    if (frontier.empty())
+      return Fail(error, "GLM-5.3-Flash has no logits to sample");
+    const TokenId token = sampler.Sample(frontier);
     if (options.stop_at_eos && IsStop(token)) {
       result->finish_reason = FinishReason::kStop;
       result->stop_token = token;
@@ -237,70 +225,73 @@ bool Generator::Generate(std::span<const TokenId> prompt,
       result->finish_reason = FinishReason::kContext;
       return true;
     }
-    if (!session_.CanDraft() || tokens_.size() + 2 > session_.Capacity() ||
-        needs_reset_ || session_.Position() != tokens_.size()) {
-      if (!Extend(std::span<const TokenId>(&token, 1), /*want_logits=*/true,
-                  error))
-        return false;
-      continue;
-    }
-    if (!session_.DraftChain(token, &drafts, error)) {
-      Invalidate();
+    std::size_t drafted = 0;
+    if (!ExtendDrafted(token, sampler, options.max_tokens - n - 1,
+                       options.stop_at_eos, &kept, &drafted, error))
       return false;
-    }
-    if (drafts.empty()) {
-      Invalidate();
-      return Fail(error, "GLM-5.3-Flash drafted nothing");
-    }
-    verify.assign(1, token);
-    verify.insert(verify.end(), drafts.begin(), drafts.end());
-    logits_valid_ = false;
-    if (!session_.Verify(verify, &rows, error)) {
-      Invalidate();
-      return false;
-    }
-    const std::size_t vocab = rows.size() / verify.size();
-    const auto row = [&](std::size_t i) {
-      return std::span<const float>(rows.data() + (i * vocab), vocab);
-    };
-    // Keep each draft that is the sampled token, unless it ends the turn (a
-    // stop is never forwarded; the next step reports it), and no more than
-    // the token budget allows.
-    const std::size_t limit =
-        std::min(drafts.size(), options.max_tokens - n - 1);
-    std::size_t kept = 0;
-    std::optional<TokenId> mismatch;
-    while (kept < limit) {
-      const TokenId next = sampler.Sample(row(kept));
-      if (next != drafts[kept] || (options.stop_at_eos && IsStop(next))) {
-        mismatch = next;
-        break;
-      }
-      sampler.Accept(next);
-      ++kept;
-    }
-    if (!session_.Accept(kept + 1, error)) {
-      Invalidate();
-      return false;
-    }
-    tokens_.push_back(token);
-    tokens_.insert(tokens_.end(), drafts.begin(),
-                   drafts.begin() + static_cast<std::ptrdiff_t>(kept));
-    const auto frontier = row(kept);
-    logits_.assign(frontier.begin(), frontier.end());
-    logits_valid_ = true;
-    for (std::size_t i = 0; i < kept; ++i) {
+    for (const TokenId draft : kept) {
       ++n;
-      if (!emit(drafts[i]))
+      if (!emit(draft))
         return true;
     }
-    if (mismatch) {
-      deferred = mismatch;
-      continue;
-    }
-    if (n + 1 == options.max_tokens)
-      break;
   }
+  return true;
+}
+
+bool Generator::ExtendDrafted(TokenId token, sampling::SamplerState& sampler,
+                              std::size_t max_drafts, bool stop_at_eos,
+                              std::vector<TokenId>* kept, std::size_t* drafted,
+                              std::string* error) {
+  kept->clear();
+  *drafted = 0;
+  if (max_drafts == 0 || !session_.CanDraft() ||
+      tokens_.size() + 2 > session_.Capacity() || needs_reset_ ||
+      session_.Position() != tokens_.size())
+    return Extend(std::span<const TokenId>(&token, 1), /*want_logits=*/true,
+                  error);
+  if (!session_.DraftChain(token, &drafts_, error)) {
+    Invalidate();
+    return false;
+  }
+  if (drafts_.empty()) {
+    Invalidate();
+    return Fail(error, "GLM-5.3-Flash drafted nothing");
+  }
+  *drafted = drafts_.size();
+  verify_.assign(1, token);
+  verify_.insert(verify_.end(), drafts_.begin(), drafts_.end());
+  logits_valid_ = false;
+  if (!session_.Verify(verify_, &rows_, error)) {
+    Invalidate();
+    return false;
+  }
+  const std::size_t vocab = rows_.size() / verify_.size();
+  const auto row = [&](std::size_t i) {
+    return std::span<const float>(rows_.data() + (i * vocab), vocab);
+  };
+  // A stop is never forwarded; the next Sample reports it.
+  const std::size_t limit = std::min(drafts_.size(), max_drafts);
+  std::size_t count = 0;
+  while (count < limit) {
+    const TokenId next = sampler.Sample(row(count));
+    if (next != drafts_[count] || (stop_at_eos && IsStop(next))) {
+      sampler.DeferSample(next);
+      break;
+    }
+    sampler.Accept(next);
+    ++count;
+  }
+  if (!session_.Accept(count + 1, error)) {
+    Invalidate();
+    return false;
+  }
+  tokens_.push_back(token);
+  kept->assign(drafts_.begin(),
+               drafts_.begin() + static_cast<std::ptrdiff_t>(count));
+  tokens_.insert(tokens_.end(), kept->begin(), kept->end());
+  const auto frontier = row(count);
+  logits_.assign(frontier.begin(), frontier.end());
+  logits_valid_ = true;
   return true;
 }
 

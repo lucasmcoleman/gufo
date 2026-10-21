@@ -212,6 +212,19 @@ public:
   /// token). Logits are computed only with `want_logits`.
   [[nodiscard]] bool Extend(std::span<const TokenId> tokens, bool want_logits,
                             std::string* error);
+  /// Appends `token`, already Accepted by `sampler`, and its logits. When the
+  /// session drafts (ForwardSession::DraftChain), the drafts for the tokens
+  /// after it are forwarded with it and kept while `sampler` samples each from
+  /// the verified row before it (sample-and-match), at most `max_drafts` and
+  /// never a stop when `stop_at_eos`. Kept drafts are Accepted and appended to
+  /// `kept`; the first mismatching sample is deferred in `sampler`
+  /// (SamplerState::DeferSample), so the next Sample of logits() returns it.
+  /// `*drafted` counts the drafts forwarded.
+  [[nodiscard]] bool ExtendDrafted(TokenId token,
+                                   sampling::SamplerState& sampler,
+                                   std::size_t max_drafts, bool stop_at_eos,
+                                   std::vector<TokenId>* kept,
+                                   std::size_t* drafted, std::string* error);
   /// Empties the session.
   [[nodiscard]] bool Reset(std::string* error);
   /// Forgets the held tokens; the next Prefill or Extend from an empty
@@ -261,6 +274,9 @@ private:
   const Tokenizer* tokenizer_;
   std::vector<TokenId> tokens_;
   std::vector<float> logits_;
+  std::vector<float> rows_;       ///< ExtendDrafted's verified rows.
+  std::vector<TokenId> drafts_;   ///< ExtendDrafted's drafts.
+  std::vector<TokenId> verify_;   ///< ExtendDrafted's forwarded tokens.
   bool logits_valid_{false};
   bool needs_reset_{false};  ///< After a failure or Invalidate.
 };
