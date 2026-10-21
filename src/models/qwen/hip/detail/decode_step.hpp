@@ -17,10 +17,17 @@ namespace gufo::hip {
 class QwenGpuArena;
 struct QwenExecutionPolicy;
 
-/// Routed expert formats that decode sends to the vendored llama.cpp vector
-/// kernels (qfn_mmq_moe_gated_vec and qfn_mmq_moe_vec).
+/// Routed expert gate/up formats that decode sends to the vendored llama.cpp
+/// gated vector kernel (qfn_mmq_moe_gated_vec).
 [[nodiscard]] constexpr bool IsMmqRoutedFormat(core::GgmlType type) noexcept {
   return type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ4_K;
+}
+
+/// Routed expert down formats that decode sends to the vendored llama.cpp
+/// vector kernel (qfn_mmq_moe_vec).
+[[nodiscard]] constexpr bool IsMmqRoutedDownFormat(
+    core::GgmlType type) noexcept {
+  return IsMmqRoutedFormat(type) || type == core::GgmlType::kQ6_K;
 }
 
 /// Emits pure decode route decisions before entering graph capture. This must

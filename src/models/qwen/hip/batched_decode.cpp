@@ -177,7 +177,7 @@ void LaunchMoeFfn(const models::QwenLayerWeights& layer,
         view.up_exps.type, scratch.decode.normed.data(), moe.ids.data(),
         moe.gate_e.data(), expert_ff, hidden, slots, n_used, stream);
   }
-  if (IsMmqRoutedFormat(view.down_exps.type)) {
+  if (IsMmqRoutedDownFormat(view.down_exps.type)) {
     if (qfn_mmq_moe_vec(static_cast<int>(view.down_exps.type),
                         view.down_exps.data, moe.gate_e.data(), moe.ids.data(),
                         moe.down_e.data(), static_cast<int>(hidden),
