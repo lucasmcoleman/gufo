@@ -24,6 +24,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/glm53_flash/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
@@ -1119,7 +1120,10 @@ int RunQwen38FlashNextBenchmark(
           std::cerr << "Qwen3.8-Flash-Next tg depth=" << depth
                     << " cycles=" << stats.cycles
                     << " drafted=" << stats.drafted
-                    << " accepted=" << stats.accepted << " output_sha256="
+                    << " accepted=" << stats.accepted
+                    << " lookup_proposed=" << stats.lookup
+                    << " lookup_accepted=" << stats.lookup_accepted
+                    << " output_sha256="
                     << crypto::Sha256Hex(
                            std::span(reinterpret_cast<const std::uint8_t*>(
                                          generated.data()),
@@ -1259,6 +1263,16 @@ int RunBench(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (models::glm53_flash::IsGlm53Flash(*reader)) {
+    std::string why;
+    std::cerr << "Error: "
+              << (models::glm53_flash::RuntimeAvailable(&why)
+                      ? "gufo bench does not support GLM-5.3-Flash yet"
+                      : why)
+              << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {

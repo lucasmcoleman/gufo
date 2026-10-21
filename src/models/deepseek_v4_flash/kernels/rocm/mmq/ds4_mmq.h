@@ -55,6 +55,15 @@ void ds4_mmq_set_routed_max_expert_rows(int rows);
 // order, so results are unchanged.
 void ds4_mmq_set_routed_tile_cols(int cols);
 
+// Launch bounds for ds4_mmq_moe_impl (the *_moe entries, e.g. a routed down
+// projection called with one row per token-route). tile_cols requests a
+// column-tile width as ds4_mmq_set_routed_tile_cols does for gate/up;
+// max_expert_rows bounds the rows any one expert can receive (for routed rows
+// whose tokens pick distinct experts: the token count), which shrinks the grid
+// by empty blocks only. 0 restores the default for either. Global and
+// persistent until changed; callers that do not set it are unaffected.
+void ds4_mmq_set_moe_down_bounds(int tile_cols, int max_expert_rows);
+
 // The width the model above picks for one per-expert assignment-count array.
 // Returns 0 when the counts are unusable, which the setter treats as "default".
 int ds4_mmq_routed_tile_cols_for_counts(const unsigned int *counts,
@@ -205,6 +214,14 @@ int ds4_mmq_mxfp4_dense(
 //   out_f32: caller-allocated, M * n_tokens * n_expert_used floats.
 //            Column-major: out[col*M + row].
 //
+// The input is broadcast across a token's routing slots. For a down projection
+// with distinct input per route, flatten assignments = tokens * routes and pass
+// n_tokens = assignments, n_expert_used = 1. X_f32 is then [assignments, K],
+// ids is [assignments, 1], and out_f32 is [assignments, M]. The caller supplies
+// one input row per assignment. This convention also applies to *_moe_vec.
+// IQ2/IQ3 inputs are quantized to Q8_1; these are not exact-F32 dot products.
+// Raw entries retain the existing nonfinite-output sanitization.
+//
 // K must be a multiple of 256.  n_expert_used must be one of the values
 // the vendored mm_ids_helper template specialises on: 2, 4, 6, 8, 16, 32
 // (or any other value, which falls back to the generic path).  For V4
@@ -237,6 +254,43 @@ int ds4_mmq_q2_K_moe(
     hipStream_t    stream);
 
 int ds4_mmq_iq2_xxs_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
+int ds4_mmq_iq2_s_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
+int ds4_mmq_iq3_xxs_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
+// GLM-5.3-Flash NextN routed down experts.
+int ds4_mmq_q3_K_moe(
     const void    * W,
     const float   * X_f32,
     const int32_t * ids,
@@ -470,10 +524,8 @@ int ds4_mmq_mxfp4_moe_pair(
 // approach wastes work on empty columns.
 //
 // Constraints:
-//   - n_tokens * something must fit under mmvq's per-arch batch cap
-//     (MMVQ_MAX_BATCH_SIZE = 8 on Blackwell). Specifically, ncols_dst as
-//     computed by the wrapper must be <= 8. The wrapper rejects with -1
-//     if the request is too large.
+//   - The wrapper splits n_tokens into launches capped by the compiled
+//     architecture/type's MMVQ batch limit; callers need not split batches.
 //   - K must be a multiple of 256 (same as the mmq path).
 //
 // Unlike the mmq path, mmvq consumes a CANONICAL block_q8_1 buffer (not
@@ -508,6 +560,42 @@ int ds4_mmq_q2_K_moe_vec(
     hipStream_t    stream);
 
 int ds4_mmq_iq2_xxs_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
+int ds4_mmq_iq2_s_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
+int ds4_mmq_iq3_xxs_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
+int ds4_mmq_q3_K_moe_vec(
     const void    * W,
     const float   * X_f32,
     const int32_t * ids,

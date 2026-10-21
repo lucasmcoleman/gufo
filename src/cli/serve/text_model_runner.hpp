@@ -82,6 +82,13 @@ struct TextRunnerDiskCacheOptions {
 /// Nullopt when MemAvailable is missing.
 [[nodiscard]] std::optional<std::uint64_t> MeminfoAvailableBytes(
     std::string_view meminfo);
+/// `host_available` bounded by every cgroup v2 memory limit from the process's
+/// cgroup (named in `membership_text`, the /proc/self/cgroup contents) up to
+/// `root`. Inactive file pages in memory.stat are reclaimable page cache and
+/// are not counted as used; without that line, memory.current is used as is.
+[[nodiscard]] std::uint64_t CgroupAvailableBytes(
+    const std::filesystem::path& root, std::string_view membership_text,
+    std::uint64_t host_available);
 /// Automatic snapshot budget: half the host RAM available after loading
 /// (excluding free CMA pages), after cgroup limits.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();
@@ -173,6 +180,15 @@ struct TextPrefillStep {
   double checkpoint_ms{0};
 };
 
+/// Hashed n-gram embedding rows a request gathered. Each row was copied from
+/// a duplicate in the same gather, served by the row cache or read from disk.
+struct TextRunnerNgramRows {
+  std::uint64_t rows{0};
+  std::uint64_t dedup_rows{0};
+  std::uint64_t cache_hits{0};
+  std::uint64_t disk_reads{0};
+};
+
 struct TextDecodeSelection {
   bool stop{false};
   TextRunnerToken token{0};
@@ -185,6 +201,9 @@ struct TextDecodeStep {
   std::size_t draft_rounds{0};
   std::size_t draft_tokens{0};
   std::size_t draft_accepted_tokens{0};
+  /// Of draft_tokens: proposals copied from the context (prompt lookup).
+  std::size_t lookup_tokens{0};
+  std::size_t lookup_accepted_tokens{0};
   bool stop{false};
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.
@@ -200,6 +219,17 @@ public:
   void SetStopAtEos(bool value) noexcept { stop_at_eos_ = value; }
   [[nodiscard]] bool stop_at_eos() const noexcept { return stop_at_eos_; }
 
+  /// Prompt tokens past the next Prefill's frontier, up to the frontier
+  /// planned after it. A runner may read their inputs ahead during that call
+  /// but never consumes them. Empty outside a prefill step.
+  void SetPrefillLookahead(std::span<const TextRunnerToken> tokens) noexcept {
+    prefill_lookahead_ = tokens;
+  }
+  [[nodiscard]] std::span<const TextRunnerToken> prefill_lookahead()
+      const noexcept {
+    return prefill_lookahead_;
+  }
+
   /// Installs a request-scoped cancellation check for model calls that can
   /// yield internally. Implementations that only yield between work units may
   /// keep the default no-op behavior.
@@ -213,6 +243,7 @@ public:
 
 private:
   bool stop_at_eos_{true};
+  std::span<const TextRunnerToken> prefill_lookahead_;
 };
 
 /// Immutable model-owned continuation payload.
@@ -262,10 +293,11 @@ public:
   [[nodiscard]] virtual std::vector<TextExecutionPlan> SupportedPlans()
       const = 0;
 
-  /// Lazily built only for constrained requests; normal text loads pay nothing.
+  /// Prepared before serving and shared by all constrained requests.
+  /// A null vocabulary means the runner does not support structured output.
   [[nodiscard]] virtual std::shared_ptr<const sampling::ConstraintVocabulary>
   BuildConstraintVocabulary() const {
-    throw std::invalid_argument("model does not support structured output");
+    return nullptr;
   }
   [[nodiscard]] virtual sampling::JsonConstraint::ToolFormat ToolFormat()
       const {
@@ -274,9 +306,38 @@ public:
   /// Reuse a compiled grammar bound to this runner's vocabulary.
   [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
       std::shared_ptr<const sampling::JsonConstraint> grammar) const;
+  /// Builds the vocabulary BindConstraint uses now rather than in the first
+  /// constrained request; later calls reuse it. Returns its token count.
+  /// Returns zero when the runner has no structured output. Build failures
+  /// propagate to the caller.
+  std::size_t PrepareConstraintVocabulary() const;
+
+  /// Reasoning tags for a token budget, as llama.cpp's chat format for the
+  /// model defines them: `forced_end` is emitted once the budget is spent and
+  /// any of `ends` closes reasoning early.
+  struct ReasoningTags {
+    std::string_view start;
+    std::string_view forced_end;
+    std::vector<std::string_view> ends;
+  };
+  [[nodiscard]] virtual ReasoningTags ReasoningBudgetTags() const {
+    return {"<think>", "</think>", {"</think>"}};
+  }
+  /// Zero when the vocabulary cannot be enumerated.
+  [[nodiscard]] virtual std::uint32_t VocabularySize() const { return 0; }
+  /// A budget for a prompt that opens reasoning, or null when the tags are not
+  /// single tokens in this vocabulary.
+  [[nodiscard]] std::shared_ptr<const sampling::ReasoningBudget>
+  BuildReasoningBudget(std::size_t tokens,
+                       std::span<const TextRunnerToken> prompt) const;
 
   [[nodiscard]] virtual std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const = 0;
+  /// Tokenizes control text such as `</think>` as the template renders it.
+  [[nodiscard]] virtual std::vector<TextRunnerToken> TokenizeControl(
+      std::string_view text) const {
+    return Tokenize(text);
+  }
   [[nodiscard]] virtual std::optional<std::vector<TextRunnerToken>>
   RenderAndTokenize(const ChatRequest& request) const = 0;
   [[nodiscard]] virtual std::optional<TextPreparedPrompt> PreparePrompt(
@@ -341,6 +402,13 @@ public:
       TextRunnerState& state, std::span<const TextRunnerToken> prefix) const {
     (void)state;
     (void)prefix;
+  }
+  /// Cumulative n-gram rows gathered through this state; models without an
+  /// n-gram table report none.
+  [[nodiscard]] virtual TextRunnerNgramRows NgramRows(
+      const TextRunnerState& state) const {
+    (void)state;
+    return {};
   }
   /// Tells a request state that its next execution will use a multi-request
   /// batch. Runners with request-local speculative state may discard work that
@@ -446,6 +514,7 @@ private:
       constraint_vocabulary_;
   mutable std::vector<std::shared_ptr<const sampling::TokenConstraint>>
       constraints_;
+  mutable std::shared_ptr<const std::vector<bool>> partial_utf8_;
 };
 
 /// Bounded pool of opaque runner states with exact-prefix continuation reuse.
@@ -483,6 +552,8 @@ public:
     [[nodiscard]] std::size_t cache_restore_bytes() const noexcept;
     [[nodiscard]] double cache_restore_ms() const noexcept;
     [[nodiscard]] bool cache_disk_hit() const noexcept;
+    /// N-gram rows gathered since this request leased its state.
+    [[nodiscard]] TextRunnerNgramRows ngram_rows() const;
     [[nodiscard]] std::optional<ComponentCacheMetrics> component_cache_metrics()
         const;
     [[nodiscard]] std::size_t prompt_tokens() const noexcept;

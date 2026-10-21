@@ -970,9 +970,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
     }
 
     const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
-    sumi = sumi * ls / 8;           // (sumi * scale + sumi / 2) / 4
+    // As for IQ2_S/IQ3_XXS: keep the half-scale fraction until the float
+    // scaling. Upstream's integer / 8 truncates it (~3e-5 rel per output).
+    sumi *= ls;
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    return (0.125f * d) * sumi;
 }
 
 #define VDR_IQ2_XS_Q8_1_MMVQ 2
@@ -1058,10 +1060,12 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
             sumi1 = ds4_ggml_hip_dp4a(grid_h, u1, sumi1);
         }
     }
-    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+    // Keep the half-scale contribution in an integer numerator. Dividing the
+    // integer dot by 2 and 4 here truncates valid fractional contributions.
+    const int sumi = sumi0*(2*ls0 + 1) + sumi1*(2*ls1 + 1);
 
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    return (0.125f * d) * sumi;
 }
 
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
@@ -1097,9 +1101,10 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     }
 
     const int ls = aux32 >> 28;
-    sumi = (ls*sumi + sumi/2)/2;
+    // Preserve the half-scale fraction until floating-point scaling.
+    sumi *= 2*ls + 1;
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    return (0.25f * d) * sumi;
 }
 
 #define VDR_IQ3_S_Q8_1_MMVQ 2

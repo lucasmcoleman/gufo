@@ -22,10 +22,16 @@ namespace gufo::sampling {
 // verification.
 class JsonConstraint {
 public:
-  enum class ToolFormat { kJson, kQwen, kDeepSeek };
+  /// kGlm (GLM-5.3 <arg_key>/<arg_value> calls) has no native grammar: its
+  /// tools are parsed after generation, never constrained, and the tool
+  /// grammar builders reject it.
+  enum class ToolFormat { kJson, kQwen, kDeepSeek, kGlm };
   struct Stack {
     std::vector<std::uint32_t> symbols;
     std::string lexeme;
+    // Wide native argument sets retain only the subset chosen by this request.
+    // Sampler copies and speculative rollback copy this state with the stack.
+    std::vector<std::uint64_t> used_parameters;
     auto operator<=>(const Stack&) const = default;
   };
   using State = std::vector<Stack>;
@@ -77,6 +83,13 @@ private:
   std::vector<Rule> rules_;
   std::vector<std::bitset<256>> classes_;
   std::vector<std::shared_ptr<const JsonSchemaLexeme>> lexemes_;
+  // Only outer native parameter lists use these sets; their values remain
+  // ordinary JSON/string rules, so sets never nest within a request stack.
+  struct ArgumentSet {
+    Sequence members;
+    std::vector<std::uint64_t> required;
+  };
+  std::vector<ArgumentSet> argument_sets_;
   std::uint32_t root_{0};
   std::string prompt_;
   bool stop_only_when_complete_{true};

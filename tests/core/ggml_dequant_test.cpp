@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <numeric>
@@ -447,6 +448,166 @@ void TestModelRows(const std::filesystem::path& model_path) {
                5120, kQ6Samples, 0.5780322588980198);
 }
 
+// ---------------------------------------------------------------------------
+// IQ2_XXS / IQ3_XXS / IQ2_S: block bytes come from a fixed LCG (seed 12345+t,
+// fp16 scales 1.0 / 0.1 / -0.2) and the expected floats from llama.cpp commit
+// 23f7aab dequantize_row_iq2_xxs / _iq3_xxs / _iq2_s run on those same bytes.
+// Bit patterns of the first 16 outputs are checked directly; all 3*256 outputs
+// are checked via a per-block FNV-1a 64 over the little-endian bit patterns.
+// ---------------------------------------------------------------------------
+
+void Expect(bool condition, std::string_view message) {
+  if (!condition) {
+    std::cerr << "Assertion failed: " << message << '\n';
+    std::exit(1);
+  }
+}
+
+std::uint32_t FloatBits(float value) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+std::uint64_t Fnv1a(const float* values, std::size_t count) {
+  std::uint64_t hash = 0xcbf29ce484222325ULL;
+  for (std::size_t i = 0; i < count; ++i) {
+    const std::uint32_t bits = FloatBits(values[i]);
+    for (int byte = 0; byte < 4; ++byte) {
+      hash ^= (bits >> (8 * byte)) & 0xFFU;
+      hash *= 0x100000001b3ULL;
+    }
+  }
+  return hash;
+}
+
+void CheckLlamaOracle(gufo::core::GgmlType type, std::size_t block_bytes,
+                      std::span<const std::uint8_t> bytes,
+                      std::span<const std::uint32_t> first_bits,
+                      std::span<const std::uint64_t> block_hashes,
+                      void (*dequant)(const void*, float*, std::size_t)) {
+  Expect(!gufo::core::ToString(type).empty(), "type has a name");
+  Expect(gufo::quant::QuantizedBlockElements(type) == kBlockElements,
+         "block elements");
+  Expect(gufo::quant::EncodedSizeBytes(type, kBlockElements) == block_bytes,
+         "one block encoded size");
+  Expect(gufo::quant::EncodedSizeBytes(type, 4096) == 16 * block_bytes,
+         "4096 elements encoded size");
+  Expect(gufo::quant::EncodedSizeBytes(type, 100) == 0, "ragged row rejected");
+  const std::size_t blocks = bytes.size() / block_bytes;
+  Expect(blocks == block_hashes.size(), "block count");
+  std::vector<float> out(blocks * kBlockElements, -777.0F);
+  dequant(bytes.data(), out.data(), out.size());
+  for (std::size_t i = 0; i < first_bits.size(); ++i) {
+    if (FloatBits(out[i]) != first_bits[i]) {
+      std::cerr << "Assertion failed: bit mismatch at " << i << " actual=0x"
+                << std::hex << FloatBits(out[i]) << " expected=0x"
+                << first_bits[i] << std::dec << '\n';
+      std::exit(1);
+    }
+  }
+  for (std::size_t b = 0; b < blocks; ++b) {
+    if (Fnv1a(out.data() + (b * kBlockElements), kBlockElements) !=
+        block_hashes[b]) {
+      std::cerr << "Assertion failed: block hash mismatch, block " << b << '\n';
+      std::exit(1);
+    }
+  }
+}
+
+void TestIq2Xxs() {
+  static constexpr std::uint8_t kBytes[198] = {
+      0,   60,  139, 162, 232, 28,  126, 140, 152, 200, 10,  190, 247, 18,  179,
+      117, 101, 245, 103, 243, 254, 169, 108, 127, 73,  108, 172, 39,  22,  218,
+      79,  1,   118, 74,  146, 246, 3,   199, 77,  82,  244, 139, 170, 168, 159,
+      41,  237, 196, 117, 185, 84,  182, 147, 194, 113, 52,  116, 171, 133, 223,
+      100, 236, 190, 36,  175, 89,  102, 46,  203, 45,  30,  103, 223, 185, 137,
+      63,  100, 222, 208, 95,  213, 177, 135, 229, 161, 235, 98,  200, 211, 24,
+      158, 156, 28,  148, 227, 23,  70,  199, 187, 96,  46,  72,  225, 100, 198,
+      183, 23,  188, 215, 143, 54,  231, 102, 52,  173, 210, 255, 0,   168, 5,
+      90,  27,  130, 233, 252, 77,  86,  238, 231, 47,  185, 154, 102, 178, 250,
+      197, 167, 115, 122, 125, 95,  90,  241, 98,  29,  160, 171, 114, 217, 36,
+      33,  154, 147, 163, 115, 117, 147, 92,  162, 31,  79,  47,  148, 0,   25,
+      223, 63,  234, 23,  90,  141, 1,   54,  37,  197, 56,  3,   84,  151, 97,
+      173, 185, 30,  24,  155, 32,  100, 19,  69,  197, 68,  134, 81,  105, 187,
+      190, 32,  165,
+  };
+  static constexpr std::uint32_t kFirstBits[16] = {
+      0x41c80000U, 0xc3066000U, 0xc1c80000U, 0xc29c4000U,
+      0xc1c80000U, 0xc1c80000U, 0xc1c80000U, 0x429c4000U,
+      0x41c80000U, 0x41c80000U, 0x41c80000U, 0xc1c80000U,
+      0xc3066000U, 0x429c4000U, 0x41c80000U, 0x429c4000U};
+  static constexpr std::uint64_t kHashes[3] = {
+      0xae423ba7e3674d19ULL, 0x1fbdb10cd750f1dbULL, 0xcf07e1de1b299838ULL};
+  CheckLlamaOracle(gufo::core::GgmlType::kIQ2_XXS, 66, kBytes, kFirstBits,
+                   kHashes, &gufo::quant::DequantizeIQ2_XXS);
+}
+
+void TestIq3Xxs() {
+  static constexpr std::uint8_t kBytes[294] = {
+      0,   60,  58,  172, 147, 220, 237, 118, 26,  215, 126, 109, 241, 6,   237,
+      237, 140, 249, 180, 214, 175, 57,  23,  146, 103, 221, 70,  236, 230, 120,
+      230, 41,  109, 229, 248, 226, 223, 154, 51,  119, 175, 111, 58,  54,  58,
+      41,  83,  130, 193, 20,  134, 146, 160, 139, 60,  157, 108, 60,  211, 132,
+      9,   123, 189, 76,  2,   2,   21,  5,   145, 216, 203, 235, 58,  99,  205,
+      208, 219, 185, 210, 51,  152, 197, 167, 134, 5,   220, 36,  133, 110, 197,
+      48,  167, 47,  95,  113, 9,   103, 93,  102, 46,  142, 204, 74,  160, 164,
+      85,  105, 251, 16,  113, 192, 154, 101, 4,   155, 143, 147, 12,  9,   80,
+      76,  101, 82,  240, 164, 198, 57,  119, 35,  122, 248, 213, 219, 125, 12,
+      88,  62,  251, 70,  173, 186, 93,  186, 200, 98,  92,  106, 65,  34,  205,
+      231, 251, 70,  29,  49,  45,  91,  168, 148, 30,  160, 110, 76,  38,  164,
+      200, 45,  202, 186, 33,  158, 14,  91,  223, 158, 64,  169, 237, 159, 224,
+      175, 165, 124, 119, 3,   0,   202, 98,  232, 79,  65,  252, 43,  226, 30,
+      170, 102, 178, 144, 161, 49,  165, 176, 124, 27,  171, 142, 249, 61,  107,
+      74,  104, 92,  238, 78,  168, 138, 57,  28,  197, 134, 91,  71,  131, 247,
+      20,  126, 119, 6,   189, 219, 123, 29,  121, 189, 135, 199, 204, 243, 94,
+      0,   30,  254, 132, 108, 214, 165, 103, 74,  3,   46,  193, 20,  191, 237,
+      151, 27,  214, 3,   84,  169, 69,  119, 233, 93,  165, 13,  244, 206, 157,
+      118, 79,  187, 224, 210, 152, 73,  96,  139, 127, 20,  175, 6,   245, 17,
+      194, 194, 146, 144, 141, 198, 189, 219, 30,
+  };
+  static constexpr std::uint32_t kFirstBits[16] = {
+      0xc2a20000U, 0x41d80000U, 0xc1d80000U, 0x42a20000U,
+      0xc33d0000U, 0x433d0000U, 0x43d14000U, 0xc33d0000U,
+      0x43070000U, 0xc3d14000U, 0x41d80000U, 0xc33d0000U,
+      0x43730000U, 0x43730000U, 0x41d80000U, 0x43af8000U};
+  static constexpr std::uint64_t kHashes[3] = {
+      0xcede3e7211f68c28ULL, 0xd006d9a89330198cULL, 0x1ec73a29156fe7feULL};
+  CheckLlamaOracle(gufo::core::GgmlType::kIQ3_XXS, 98, kBytes, kFirstBits,
+                   kHashes, &gufo::quant::DequantizeIQ3_XXS);
+}
+
+void TestIq2S() {
+  static constexpr std::uint8_t kBytes[246] = {
+      0,   60,  233, 181, 62,  155, 91,  97,  157, 229, 242, 29,  235, 250, 40,
+      100, 179, 253, 0,   185, 96,  202, 195, 164, 133, 78,  223, 176, 181, 22,
+      124, 81,  99,  129, 94,  206, 186, 108, 25,  157, 107, 83,  201, 197, 212,
+      40,  185, 64,  13,  111, 183, 110, 173, 83,  7,   7,   99,  205, 33,  41,
+      175, 11,  189, 116, 85,  170, 207, 64,  87,  132, 119, 111, 148, 13,  16,
+      97,  82,  148, 212, 7,   91,  217, 102, 46,  105, 205, 231, 65,  9,   114,
+      195, 178, 66,  43,  255, 252, 137, 244, 108, 82,  238, 81,  179, 219, 130,
+      242, 188, 58,  74,  83,  75,  78,  101, 211, 137, 77,  38,  24,  107, 154,
+      62,  175, 34,  247, 76,  63,  29,  0,   96,  198, 55,  17,  75,  163, 29,
+      235, 212, 132, 19,  221, 20,  96,  131, 47,  166, 24,  41,  16,  106, 119,
+      172, 92,  250, 151, 239, 229, 34,  244, 134, 29,  240, 173, 4,   75,  102,
+      178, 26,  171, 93,  232, 175, 27,  127, 153, 118, 72,  80,  134, 168, 96,
+      177, 145, 219, 213, 106, 225, 48,  177, 139, 218, 63,  114, 4,   90,  128,
+      151, 76,  18,  35,  42,  36,  231, 130, 10,  204, 192, 178, 185, 70,  33,
+      216, 245, 104, 113, 56,  89,  239, 234, 61,  208, 194, 100, 222, 162, 25,
+      163, 40,  75,  77,  197, 195, 127, 100, 241, 205, 1,   177, 124, 89,  42,
+      31,  14,  99,  71,  242, 136,
+  };
+  static constexpr std::uint32_t kFirstBits[16] = {
+      0x40ac0000U, 0xc0ac0000U, 0xbf800000U, 0xc0ac0000U,
+      0xc0ac0000U, 0x3f800000U, 0xc0ac0000U, 0x40ac0000U,
+      0x40ac0000U, 0xc0480000U, 0xc0ac0000U, 0xc0ac0000U,
+      0x40ac0000U, 0x3f800000U, 0xc0480000U, 0xc0ac0000U};
+  static constexpr std::uint64_t kHashes[3] = {
+      0x9bccd9053fa72ea8ULL, 0xa0712b4af725c46bULL, 0x4653281decfd1648ULL};
+  CheckLlamaOracle(gufo::core::GgmlType::kIQ2_S, 82, kBytes, kFirstBits,
+                   kHashes, &gufo::quant::DequantizeIQ2_S);
+}
+
 }  // namespace
 
 int main() {
@@ -456,6 +617,9 @@ int main() {
   TestQ8();
   TestQ8_0();
   TestQ5_K();
+  TestIq2Xxs();
+  TestIq3Xxs();
+  TestIq2S();
   if (const char* model = std::getenv("GUFO_MTP_MODEL");
       model != nullptr && std::string_view(model).size() > 0) {
     TestModelRows(model);

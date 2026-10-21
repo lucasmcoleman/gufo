@@ -31,6 +31,7 @@
 #include "src/core/utf8.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/tool_calls.hpp"
+#include "src/models/glm53_flash/chat_template.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::server {
@@ -95,6 +96,15 @@ constexpr std::array<std::string_view, 7> kToolMarkers{
 };
 using ToolMarkerSet = std::span<const std::string_view>;
 
+// GLM-5.3 opens a call with the same bytes as Qwen; this array's identity, not
+// its text, selects the GLM dialect (IsGlmMarkers).
+constexpr std::array<std::string_view, 1> kGlmToolMarkers{
+    models::glm53_flash::ToolSyntax::kCallOpen};
+
+bool IsGlmMarkers(ToolMarkerSet markers) noexcept {
+  return markers.data() == kGlmToolMarkers.data();
+}
+
 ToolMarkerSet ToolMarkers(
     std::optional<sampling::JsonConstraint::ToolFormat> format) {
   using Format = sampling::JsonConstraint::ToolFormat;
@@ -111,6 +121,8 @@ ToolMarkerSet ToolMarkers(
   // their native call syntax; keep recognizing every opener there.
   if (!format || *format == Format::kJson)
     return kToolMarkers;
+  if (*format == Format::kGlm)
+    return kGlmToolMarkers;
   // Match the canonical opener selected by JsonConstraint::WithTools. Other
   // dialects are ordinary prose under that grammar, not additional calls.
   return *format == Format::kDeepSeek ? ToolMarkerSet(deepseek)
@@ -120,6 +132,9 @@ ToolMarkerSet ToolMarkers(
 // A native function header, rather than a bare marker mentioned in prose,
 // permits the implicit reasoning boundary used by llama.cpp's native parsers.
 ToolMarkerSet ReasoningToolMarkers(ToolMarkerSet markers) {
+  // GLM reasoning ends only at </think>, as in its ParseResponse.
+  if (IsGlmMarkers(markers))
+    return {};
   static constexpr std::array<std::string_view, 1> qwen{
       tokenization::QwenToolSyntax::kNativeCallOpen};
   static constexpr std::array<std::string_view, 2> deepseek{
@@ -170,7 +185,8 @@ ToolCloserSet ToolClosers(
   // As in llama.cpp, DeepSeek content is everything outside its native call
   // block, which ends the output: there is no echo to strip, and client
   // envelope syntax the model writes stays visible text.
-  if (*format == Format::kDeepSeek)
+  // GLM's scanner consumes each call through </tool_call> in the same way.
+  if (*format == Format::kDeepSeek || *format == Format::kGlm)
     return {};
   // Mirror ToolMarkers: stripping follows the dialect the request admitted,
   // and another dialect's closing tags are ordinary prose like its openers —
@@ -739,6 +755,31 @@ bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
   return true;
 }
 
+// Match llama.cpp's canonical field and its older compatibility spelling.
+// An explicit canonical value takes precedence; -1 keeps the server default.
+std::optional<HttpResponse> ParseReasoningBudget(const json::Value& body,
+                                                 ReasoningOptions* options) {
+  const char* field = "reasoning_budget_tokens";
+  const auto* budget = body.find(field);
+  if (budget == nullptr || budget->is_null()) {
+    field = "thinking_budget_tokens";
+    budget = body.find(field);
+  }
+  if (budget == nullptr || budget->is_null())
+    return {};
+  const double value = budget->is_number() ? budget->as_double() : -2.0;
+  if (!std::isfinite(value) || value < -1.0 ||
+      value > std::numeric_limits<std::int32_t>::max() ||
+      std::floor(value) != value)
+    return Error(400, "Bad Request",
+                 "'" + std::string(field) +
+                     "' must be an integer between -1 and 2147483647",
+                 "invalid_reasoning");
+  if (value >= 0.0)
+    options->budget_tokens = static_cast<std::size_t>(value);
+  return {};
+}
+
 std::optional<HttpResponse> ParseToolControls(const json::Value& body,
                                               ParsedChatRequest* output,
                                               bool nullable_parallel = false,
@@ -771,47 +812,6 @@ std::optional<HttpResponse> ParseToolControls(const json::Value& body,
       output->chat.tool_choice != ChatRequest::ToolChoice::kNone;
 
   return {};
-}
-
-json::Value NormalizeToolSchema(const json::Value& schema,
-                                std::size_t depth = 0) {
-  if (!schema.is_object() || depth > 16 || (depth && schema.empty()))
-    throw std::invalid_argument("tool schema cannot be made strict");
-  auto out = schema;
-  for (const auto* key : {"properties", "$defs", "definitions"}) {
-    if (const auto* fields = schema.find(key); fields && fields->is_object()) {
-      auto normalized = json::Value::object();
-      for (const auto& [name, field] : fields->members())
-        normalized.append_member(name, NormalizeToolSchema(field, depth + 1));
-      out[key] = std::move(normalized);
-    }
-  }
-  if (const auto* items = schema.find("items"))
-    out["items"] = NormalizeToolSchema(*items, depth + 1);
-  for (const auto* key : {"anyOf", "allOf", "oneOf"}) {
-    if (const auto* choices = schema.find(key);
-        choices && choices->is_array()) {
-      auto normalized = json::Value::array();
-      for (const auto& choice : choices->items())
-        normalized.push_back(NormalizeToolSchema(choice, depth + 1));
-      out[key] = std::move(normalized);
-    }
-  }
-  if (schema.empty() || schema.member_str("type") == "object" ||
-      schema.contains("properties")) {
-    if (!out.contains("type"))
-      out["type"] = "object";
-    if (!out.contains("properties"))
-      out["properties"] = json::Value::object();
-    if (!out.contains("additionalProperties"))
-      out["additionalProperties"] = false;
-    out["required"] = json::Value::array();
-    for (const auto& [name, value] : out.find("properties")->members()) {
-      (void)value;
-      out["required"].push_back(name);
-    }
-  }
-  return out;
 }
 
 std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
@@ -896,6 +896,8 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(400, "Bad Request", std::move(parse_error),
                  "invalid_reasoning");
   }
+  if (auto error = ParseReasoningBudget(body, &output->chat.reasoning))
+    return error;
   if (const auto* kwargs = body.find("chat_template_kwargs")) {
     if (const auto* vision_id = kwargs->find("add_vision_id")) {
       if (!vision_id->is_bool())
@@ -914,6 +916,9 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   }
   if (!output->chat.reasoning.preserve_thinking.has_value()) {
     output->chat.reasoning.preserve_thinking = defaults.preserve_thinking;
+  }
+  if (!output->chat.reasoning.budget_tokens.has_value()) {
+    output->chat.reasoning.budget_tokens = defaults.budget_tokens;
   }
 
   if (const json::Value* stream = body.find("stream");
@@ -1267,6 +1272,10 @@ std::string_view ContentBefore(std::string_view full, std::size_t begin,
       begin = cursor;
   }
   const auto slice = full.substr(begin, stop - begin);
+  // The newline a model writes between or after its calls is layout, not a
+  // reply: a turn of parallel calls would otherwise carry content "\n" (#673).
+  if (after_call && Trim(slice).empty())
+    return {};
   const bool adjacent_envelope =
       after_call && Trim(slice).starts_with(kEnvelopeHeads.front());
   if (const auto block = EnvelopeBlockStart(full, stop, begin, closers, tools,
@@ -1755,13 +1764,107 @@ void ParseDsmlCalls(
     break;
   }
 }
+
+// GLM-5.3 calls, <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>
+// ...</tool_call>, scanned and typed by the model package as its
+// ParseResponse does. `text` begins at the first marker; spans are relative
+// to it. A stream reports an unfinished call with its finished arguments, and
+// a string-only argument as it grows.
+//
+// `quotes` has scanned the whole response and `origin` is where `text` begins
+// in it. Every candidate opener is asked, not only the first: a call the model
+// writes inside a backtick span or fence after a real call is documentation.
+// Arguments of an accepted call are skipped whole, so markup nested in a value
+// never opens a second call.
+//
+// Without `parallel`, scanning stops after the first accepted call and
+// `*stop` is set to the end of its closing tag. This is how a Qwen grammar
+// ends generation after one call: nothing the model writes later exists, so
+// later calls are dropped, not exposed as content.
+void ParseGlmCalls(std::string_view text,
+                   std::span<const tokenization::ChatTool> tools,
+                   std::vector<ParsedToolCall>* calls,
+                   std::vector<std::pair<std::size_t, std::size_t>>* spans,
+                   bool partial, const QuoteTracker& quotes, std::size_t origin,
+                   bool parallel, std::size_t* stop) {
+  namespace glm = models::glm53_flash;
+  std::vector<glm::ChatTool> glm_tools;
+  glm_tools.reserve(tools.size());
+  for (const auto& tool : tools)
+    glm_tools.push_back({.name = tool.name,
+                         .description = tool.description,
+                         .parameters_json = tool.parameters_json,
+                         .definition_json = {}});
+  const auto convert = [](const glm::ParsedToolCall& typed) {
+    ParsedToolCall call;
+    call.id = RandomId("call_");
+    call.name = typed.name;
+    for (const auto& argument : typed.arguments)
+      call.arguments.push_back({.name = argument.name,
+                                .value = argument.value,
+                                .is_string = argument.is_string});
+    return call;
+  };
+  // After an accepted call, prose quote state restarts at its end: argument
+  // bytes belong to the call, so an unmatched backtick in one value must not
+  // quote the next call (as ParseCalls does for Qwen).
+  QuoteTracker after_call;
+  const QuoteTracker* active = &quotes;
+  std::size_t cursor = 0;
+  while ((cursor = text.find(glm::ToolSyntax::kCallOpen, cursor)) !=
+         std::string_view::npos) {
+    if (active->QuotedAt(origin + cursor)) {
+      cursor += glm::ToolSyntax::kCallOpen.size();
+      continue;
+    }
+    if (partial && active->UnclosedAt(origin + cursor))
+      break;  // A closing delimiter may still quote it.
+    const auto scan = glm::ScanToolCall(text.substr(cursor));
+    if (scan.call && scan.call->complete) {
+      calls->push_back(convert(glm::InterpretToolCall(*scan.call, glm_tools)));
+      if (spans)
+        spans->emplace_back(cursor, cursor + scan.end);
+      cursor += scan.end;
+      after_call.Reset(text, cursor);
+      active = &after_call;
+      origin = 0;
+      const bool declared = std::ranges::any_of(tools, [&](const auto& tool) {
+        return tool.name == calls->back().name;
+      });
+      if (!parallel && declared) {
+        *stop = cursor;
+        break;
+      }
+      continue;
+    }
+    if (!scan.call || scan.malformed) {
+      if (!partial || scan.malformed) {
+        cursor += glm::ToolSyntax::kCallOpen.size();
+        continue;
+      }
+      break;  // The name is still arriving.
+    }
+    if (partial && !scan.call->name.empty()) {
+      auto call = convert(glm::InterpretToolCall(*scan.call, glm_tools));
+      const auto& unfinished = scan.call->unfinished;
+      if (unfinished && !unfinished->name.empty() &&
+          glm::IsStringArgument(glm_tools, call.name, unfinished->name))
+        PartialStringArgument(call, unfinished->name, unfinished->value);
+      if (!call.partial_arguments)
+        call.partial_arguments = ArgumentsPrefix(call);
+      calls->push_back(std::move(call));
+    }
+    break;
+  }
+}
+
 ParsedGeneration ParseGeneration(
     std::string_view raw,
     TextGenerationBackend::InitialOutputState initial_output_state,
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
-    bool partial = false) {
+    bool partial = false, bool parallel_calls = true) {
   quotes.Reset(raw);
   ParsedGeneration parsed;
   std::string_view content = raw;
@@ -1862,10 +1965,25 @@ ParsedGeneration ParseGeneration(
     // The outer envelope selects the format, as in llama.cpp's model parsers.
     // Scanning both dialects would turn a literal call inside an argument into
     // an additional API invocation.
-    if (text_from_tools.starts_with(tokenization::QwenToolSyntax::kCallOpen))
-      ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, nullptr,
+    std::size_t glm_stop = std::string_view::npos;
+    if (IsGlmMarkers(markers)) {
+      ParseGlmCalls(
+          text_from_tools, tools, &parsed.tool_calls, &spans,
+          partial && !unfinished_reasoning_quote && !quotes.UnclosedAt(marker),
+          quotes, marker, parallel_calls, &glm_stop);
+      if (glm_stop != std::string_view::npos)
+        parsed.text.resize(marker + glm_stop);
+    } else if (text_from_tools.starts_with(
+                   tokenization::QwenToolSyntax::kCallOpen)) {
+      ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, &spans,
                      unfinished_reasoning_quote, partial);
-    else
+      // Qwen scans the full response; the shared content assembly below uses
+      // offsets relative to the first tool marker, like the other dialects.
+      for (auto& [begin, end] : spans) {
+        begin -= marker;
+        end -= marker;
+      }
+    } else
       ParseDsmlCalls(
           text_from_tools, markers, tools, &parsed.tool_calls, &spans,
           partial && !unfinished_reasoning_quote && !quotes.UnclosedAt(marker));
@@ -1882,7 +2000,8 @@ ParsedGeneration ParseGeneration(
         parsed = ParseGeneration(
             reasoning_call_context.substr(end + kThinkEnd.size()),
             TextGenerationBackend::InitialOutputState::kContent, tools, choice,
-            enforce_required, markers, closers, quotes, partial);
+            enforce_required, markers, closers, quotes, partial,
+            parallel_calls);
       } else {
         parsed.text.clear();
       }
@@ -1899,12 +2018,23 @@ ParsedGeneration ParseGeneration(
     if (!parsed.tool_calls.empty() || !enforce_required) {
       // Text outside complete envelopes is content. Framing echoed directly
       // after a call is removed, as for Qwen calls (#383).
+      std::vector<std::string_view> reasoning_closers;
+      ToolCloserSet post_call_closers = closers;
+      if (!reasoning_call_context.empty() && !IsGlmMarkers(markers) &&
+          text_from_tools.starts_with(
+              tokenization::QwenToolSyntax::kCallOpen)) {
+        // A recovered call already ended reasoning implicitly. Its delayed
+        // reasoning closer is framing, but prose after that closer is content.
+        reasoning_closers.assign(closers.begin(), closers.end());
+        reasoning_closers.push_back(kThinkEnd);
+        post_call_closers = reasoning_closers;
+      }
       const std::string full = std::move(parsed.text);
       std::string text(ContentBefore(full, 0, marker, closers, quotes, tools));
       std::size_t cursor = marker;
       for (const auto& [begin, end] : spans) {
-        text += ContentBefore(full, cursor, marker + begin, closers, quotes,
-                              tools, cursor > marker);
+        text += ContentBefore(full, cursor, marker + begin, post_call_closers,
+                              quotes, tools, cursor > marker);
         cursor = marker + end;
       }
       if (!spans.empty()) {
@@ -1914,8 +2044,8 @@ ParsedGeneration ParseGeneration(
           if (const auto held =
                   HeldMarkerPrefix(full, full.size(), markers, quotes))
             unfinished = full.size() - held;
-        text += ContentBefore(full, cursor, unfinished, closers, quotes, tools,
-                              true);
+        text += ContentBefore(full, cursor, unfinished, post_call_closers,
+                              quotes, tools, true);
       }
       parsed.text = std::move(text);
       parsed.hide_tool_markup = true;
@@ -1939,7 +2069,12 @@ ParsedGeneration ParseStructuredGeneration(
     std::span<const tokenization::ChatTool> tools,
     ChatRequest::ToolChoice choice, bool enforce_required, bool tool_only,
     ToolMarkerSet markers, ToolCloserSet closers, QuoteTracker& quotes,
-    bool partial = false) {
+    bool partial = false, bool parallel_calls = true) {
+  // No grammar shapes GLM output (ConstrainChatRequest): parse it natively.
+  if (IsGlmMarkers(markers) && !tools.empty() &&
+      choice != ChatRequest::ToolChoice::kNone)
+    return ParseGeneration(raw, initial, tools, choice, enforce_required,
+                           markers, closers, quotes, partial, parallel_calls);
   ParsedGeneration parsed;
   if (initial == TextGenerationBackend::InitialOutputState::kAuto) {
     const auto leading = raw.find_first_not_of(" \t\r\n");
@@ -2246,6 +2381,9 @@ public:
       }
       if (kThinkStart.starts_with(view)) {
         if (view == kThinkStart) {
+          if (!raw_content_ &&
+              !Emit(pending_.substr(0, pending_.size() - view.size()), false))
+            return false;
           state_ = State::kThinking;
           pending_.clear();
         }
@@ -2254,6 +2392,9 @@ public:
       if (view.starts_with(kThinkStart)) {
         // A buffered result arrives as one piece: the opening tag together
         // with the reasoning after it.
+        if (!raw_content_ &&
+            !Emit(pending_.substr(0, pending_.size() - view.size()), false))
+          return false;
         state_ = State::kThinking;
         pending_.erase(0, pending_.size() - view.size() + kThinkStart.size());
       } else {
@@ -2374,10 +2515,11 @@ public:
     if (tool_mode_ && state_ == State::kThinking) {
       const auto tail = reasoning.substr(
           std::min(emitted_reasoning_bytes_, reasoning.size()));
+      content.remove_prefix(std::min(emitted_content_bytes_, content.size()));
       return (tail.empty() || Emit(tail, true)) &&
              (content.empty() || Emit(content, false));
     }
-    if (tool_only_ && tool_mode_ && hide_tool_markup) {
+    if (tool_mode_ && hide_tool_markup) {
       // The prefix was streamed before the first call. Preserve prose between
       // or after complete calls without exposing their markup or partial calls.
       const auto offset = std::min(emitted_content_bytes_, content.size());
@@ -2427,6 +2569,8 @@ private:
       return false;
     if (reasoning)
       emitted_reasoning_bytes_ += piece.size();
+    else
+      emitted_content_bytes_ += piece.size();
     return true;
   }
 
@@ -2442,7 +2586,6 @@ private:
         if (!prose.empty() && !Emit(prose, false)) {
           return false;
         }
-        emitted_content_bytes_ += prose.size();
         hidden_ = pending_.substr(start);
         pending_.clear();
         tool_mode_ = true;
@@ -2460,7 +2603,6 @@ private:
         if (!text.empty() && !Emit(text, false)) {
           return false;
         }
-        emitted_content_bytes_ += text.size();
       }
       pending_.erase(0, ready);
       return true;
@@ -2592,10 +2734,11 @@ ParsedGeneration StreamingGeneration(
                    filter.raw(), initial, chat.tools, chat.tool_choice,
                    enforce_required,
                    chat.constrained_tools && !chat.response_format, markers,
-                   closers, quotes, partial)
+                   closers, quotes, partial, chat.parallel_tool_calls)
              : ParseGeneration(filter.raw(), initial, chat.tools,
                                chat.tool_choice, enforce_required, markers,
-                               closers, quotes, partial);
+                               closers, quotes, partial,
+                               chat.parallel_tool_calls);
 }
 
 // Responses uses semantic SSE events, rather than Chat Completions chunks.
@@ -2858,6 +3001,16 @@ private:
   bool unfinished_tool_{false};
 };
 
+// A dialect without a grammar (GLM) was not constrained, so its output is
+// parsed as unconstrained text even though the request declared tools.
+ChatRequest NativeToolParsing(
+    ChatRequest chat,
+    std::optional<sampling::JsonConstraint::ToolFormat> format) {
+  if (format == sampling::JsonConstraint::ToolFormat::kGlm)
+    chat.constrained_tools = false;
+  return chat;
+}
+
 HttpResponse NonStreamingResponse(
     const ParsedChatRequest& request, TextGenerationBackend& backend,
     const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
@@ -2877,12 +3030,14 @@ HttpResponse NonStreamingResponse(
                 result.finish_reason ==
                     TextGenerationBackend::FinishReason::kStop,
                 request.chat.constrained_tools && !request.chat.response_format,
-                markers, closers, quotes)
+                markers, closers, quotes, false,
+                request.chat.parallel_tool_calls)
           : ParseGeneration(decoded, initial_output_state, request.chat.tools,
                             request.chat.tool_choice,
                             result.finish_reason ==
                                 TextGenerationBackend::FinishReason::kStop,
-                            markers, closers, quotes);
+                            markers, closers, quotes, false,
+                            request.chat.parallel_tool_calls);
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
@@ -3216,27 +3371,10 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
           parsed.chat.tool_namespaces[tool.member_str("name")] = name;
     }
   }
-  // Responses attempts strict normalization when strict is omitted; Chat
-  // Completions keeps its best-effort default. Explicit true/false wins.
-  for (auto& tool : parsed.chat.tools) {
-    auto definition = json::parse(tool.definition_json);
-    auto& function = definition["function"];
-    const auto* strict = function.find("strict");
-    if (strict && !strict->is_null())
-      continue;
-    try {
-      auto schema = NormalizeToolSchema(json::parse(tool.parameters_json));
-      sampling::JsonConstraint::Compile(schema, true);
-      function["parameters"] = std::move(schema);
-      function["strict"] = true;
-      tool.parameters_json = function.find("parameters")->dump();
-      parsed.chat.constrained_tools |=
-          parsed.chat.tool_choice != ChatRequest::ToolChoice::kNone;
-    } catch (const std::invalid_argument&) {
-      function["strict"] = false;
-    }
-    tool.definition_json = definition.dump();
-  }
+  // Like llama.cpp, retain the supplied parameter schema when strict is
+  // omitted or null. Promoting optional fields to required ones forces agents
+  // to invent values. ParseToolControls still validates explicit strict:true
+  // and enables tool constraints regardless of strictness.
   *chat = std::move(parsed.chat);
 
   if (const auto* progress = body.find("return_progress");
@@ -3280,6 +3418,8 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
         chat->reasoning.effort = options.effort;
     }
   }
+  if (auto error = ParseReasoningBudget(body, &chat->reasoning))
+    return error;
   if (const auto* text = body.find("text"); text && !text->is_null()) {
     if (!text->is_object())
       return Error(400, "Bad Request", "'text' must be an object",
@@ -3758,8 +3898,8 @@ HttpResponse CreateCompatibilityResponse(
   const auto closers = ToolClosers(format);
   auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   auto timing = std::make_shared<std::string>();
-  const auto run = [generation, initial, chat, markers, closers,
-                    model = backend.model_id(), stream_log,
+  const auto run = [generation, initial, chat = NativeToolParsing(chat, format),
+                    markers, closers, model = backend.model_id(), stream_log,
                     timing](const HttpResponse::BodyWriter& writer) {
     Output output(model, writer, chat);
     bool started = false;
@@ -3925,6 +4065,8 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     auto generation =
         backend.start_chat(parsed.chat, parsed.max_tokens, parsed.sampling,
                            request.is_cancelled, parsed.stream);
+    parsed.chat =
+        NativeToolParsing(std::move(parsed.chat), generation->ToolFormat());
     if (parsed.stream) {
       return StreamingResponse(parsed, backend, std::move(generation),
                                initial_output_state);

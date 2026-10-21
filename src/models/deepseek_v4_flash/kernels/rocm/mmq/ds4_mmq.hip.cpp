@@ -32,6 +32,9 @@ static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
 static int    g_routed_max_expert_rows = 0;
 static int    g_routed_tile_cols = 0;
+/* ds4_mmq_moe_impl only (set by ds4_mmq_set_moe_down_bounds; 0 = default). */
+static int    g_moe_down_tile_cols = 0;
+static int    g_moe_down_max_expert_rows = 0;
 
 struct ds4_hip_persistent_scratch {
     void *ptr = nullptr;
@@ -88,6 +91,11 @@ extern "C" void ds4_mmq_set_routed_max_expert_rows(int rows) {
 
 extern "C" void ds4_mmq_set_routed_tile_cols(int cols) {
     g_routed_tile_cols = cols > 0 ? cols : 0;
+}
+
+extern "C" void ds4_mmq_set_moe_down_bounds(int tile_cols, int max_expert_rows) {
+    g_moe_down_tile_cols = tile_cols > 0 ? tile_cols : 0;
+    g_moe_down_max_expert_rows = max_expert_rows > 0 ? max_expert_rows : 0;
 }
 
 extern "C" int ds4_mmq_routed_tile_cols_for_counts(
@@ -929,7 +937,7 @@ int ds4_mmq_moe_impl(
         }
     }
 
-    const mmq_args args = {
+    mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
         /*y=*/(const int *)src1_q8_1.get(),
@@ -953,10 +961,14 @@ int ds4_mmq_moe_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
-        /*ncols_max=*/ne_get_rows,
+        /*ncols_max=*/(g_moe_down_max_expert_rows > 0 &&
+                       (int64_t)g_moe_down_max_expert_rows < ne_get_rows)
+                          ? (int64_t)g_moe_down_max_expert_rows
+                          : ne_get_rows,
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
     };
+    args.mmq_x_request = g_moe_down_tile_cols;
 
     mul_mat_q_case<type>(*ctx, args, stream);
 
@@ -1620,6 +1632,30 @@ extern "C" int ds4_mmq_iq2_xxs_moe(
         hipStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe", W, X, ids, out, M, K,
                                                n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq2_s_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_IQ2_S>("ds4_mmq_iq2_s_moe", W, X, ids, out, M, K,
+                                               n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq3_xxs_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_IQ3_XXS>("ds4_mmq_iq3_xxs_moe", W, X, ids, out, M, K,
+                                               n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q3_K_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q3_K>("ds4_mmq_q3_K_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
 }
 
 /* ds4 (P4 Inc3): mmq MoE over the aligned row-pair-SoA Q2_K artifact
@@ -3391,6 +3427,33 @@ extern "C" int ds4_mmq_iq2_xxs_moe_vec(
         n_tokens, n_experts, n_expert_used, stream);
 }
 
+extern "C" int ds4_mmq_iq2_s_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_IQ2_S>(
+        "ds4_mmq_iq2_s_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq3_xxs_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_IQ3_XXS>(
+        "ds4_mmq_iq3_xxs_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q3_K_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q3_K>(
+        "ds4_mmq_q3_K_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
 extern "C" int ds4_mmq_q4_K_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
@@ -4258,6 +4321,12 @@ template void mul_mat_q_case<GGML_TYPE_Q8_0>(
 template void mul_mat_q_case<GGML_TYPE_Q2_K>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ2_S>(
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ3_XXS>(
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q3_K>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);

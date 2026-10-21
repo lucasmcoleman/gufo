@@ -73,6 +73,9 @@ endif()
 # Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
 
+# GLM-5.3-Flash (glm5-next) — model package under construction.
+add_subdirectory(src/models/glm53_flash)
+
 # Qwen3-TTS — CPU reference + HIP kernels (CustomVoice 12Hz).
 add_subdirectory(src/models/qwen3_tts)
 
@@ -97,11 +100,14 @@ endif()
 add_subdirectory(src/cache)
 
 if (ENGINE_ENABLE_HIP)
+  add_library(gufo_hip_host STATIC src/core/hip/host_allocations.cpp)
+  target_link_libraries(gufo_hip_host PUBLIC hip::host)
+  target_include_directories(gufo_hip_host PUBLIC ${PROJECT_SOURCE_DIR})
   add_library(gufo_cache_hip STATIC
     src/core/hip/committed_backing.cpp
     src/core/hip/staging.cpp
     src/core/hip/transfer_pool.cpp)
-  target_link_libraries(gufo_cache_hip PUBLIC gufo_cache hip::host)
+  target_link_libraries(gufo_cache_hip PUBLIC gufo_cache gufo_hip_host hip::host)
   if (BUILD_TESTING)
     target_compile_options(gufo_cache_hip PRIVATE -UNDEBUG)
   endif()
@@ -208,14 +214,14 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(gufo_core SYSTEM PRIVATE
     ${HIPCUB_INCLUDE_DIR}
     ${ROCPRIM_INCLUDE_DIR})
-  target_link_libraries(gufo_core PUBLIC hip::host roc::hipblas
+  target_link_libraries(gufo_core PUBLIC gufo_hip_host hip::host roc::hipblas
     roc::hipblaslt roc::rocblas)
 endif()
 
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp)
-target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
+target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_glm53_flash)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
     gufo_qwen38_flash_next)
@@ -249,7 +255,8 @@ add_library(gufo_http STATIC
   # the engine library, so no translation unit is linked twice.
   src/models/deepseek_v4_flash/tool_calls.cpp
 )
-target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21)
+target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts gufo_qwen3_asr gufo_qwen_image_21
+  gufo_glm53_flash)
 
 add_executable(gufo
   src/cli/main.cpp
@@ -264,6 +271,7 @@ add_executable(gufo
   src/cli/serve/text_model_runner.cpp
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
+  src/cli/serve/glm53_text_runner.cpp
   src/eval/http_client.cpp
 )
 target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
@@ -419,6 +427,11 @@ if (BUILD_TESTING)
   add_test(NAME heap_placement_test COMMAND heap_placement_test)
   set_tests_properties(heap_placement_test PROPERTIES LABELS "cpu;hip;core")
 
+  add_executable(sampling_test tests/core/sampling_test.cpp)
+  target_link_libraries(sampling_test PRIVATE gufo_core)
+  add_test(NAME sampling_test COMMAND sampling_test)
+  set_tests_properties(sampling_test PROPERTIES LABELS "cpu;sampling")
+
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
     src/cli/serve/logging.cpp
@@ -426,7 +439,7 @@ if (BUILD_TESTING)
     src/models/deepseek_v4_flash/chat_template.cpp
     src/models/deepseek_v4_flash/tool_calls.cpp
   )
-  target_link_libraries(openai_chat_test PRIVATE gufo_core)
+  target_link_libraries(openai_chat_test PRIVATE gufo_core gufo_glm53_flash)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
@@ -489,6 +502,7 @@ if (BUILD_TESTING)
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
+  add_subdirectory(tests/models/glm53_flash)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test
@@ -1013,6 +1027,20 @@ if (BUILD_TESTING)
     set_tests_properties(minimax_h3_audio_vae_real PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;audio;vae;quality;external-model;very-slow"
       SKIP_RETURN_CODE 77)
+
+    add_executable(hip_memory_visibility_test
+      tests/core/hip_memory_visibility_test.hip)
+    target_link_libraries(hip_memory_visibility_test PRIVATE gufo_core hip::host)
+    add_test(NAME hip_memory_visibility_test COMMAND hip_memory_visibility_test)
+    add_test(NAME hip_memory_visibility_restricted_test
+      COMMAND hip_memory_visibility_test --deny-long-term-pins)
+    add_test(NAME hip_memory_visibility_driver_test COMMAND hip_memory_visibility_test)
+    set_tests_properties(hip_memory_visibility_test hip_memory_visibility_restricted_test PROPERTIES
+      LABELS "gpu;hip;gfx1151"
+      ENVIRONMENT "HSA_USERPTR_FOR_PAGED_MEM=1")
+    set_tests_properties(hip_memory_visibility_driver_test PROPERTIES
+      LABELS "gpu;hip;gfx1151"
+      ENVIRONMENT "HSA_USERPTR_FOR_PAGED_MEM=0")
 
     add_executable(hip_weight_upload_test tests/core/hip_weight_upload_test.cpp)
     target_link_libraries(hip_weight_upload_test PRIVATE gufo_core)

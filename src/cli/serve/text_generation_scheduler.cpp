@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <deque>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -459,6 +460,39 @@ void WriteGenerationTrace(GenerationTrace trace,
   Trace::Write(record);
 }
 
+std::size_t ResidentKiB() {
+  std::ifstream status("/proc/self/status");
+  for (std::string line; std::getline(status, line);) {
+    if (line.starts_with("VmRSS:")) {
+      std::istringstream value(line.substr(6));
+      std::size_t kib = 0;
+      if (value >> kib)
+        return kib;
+    }
+  }
+  return 0;
+}
+
+// The first constrained request would otherwise build the vocabulary inside
+// its queue time (about 30 ms for Flash-Next's 248,320 tokens).
+void PrepareStructuredOutput(const TextModelRunner& runner) {
+  const auto resident = ResidentKiB();
+  const auto started = std::chrono::steady_clock::now();
+  const auto tokens = runner.PrepareConstraintVocabulary();
+  if (tokens == 0)
+    return;
+  const std::chrono::duration<double, std::milli> elapsed =
+      std::chrono::steady_clock::now() - started;
+  std::ostringstream line;
+  line << "event=structured_output_prepared vocabulary_tokens=" << tokens
+       << " prepare_ms=" << std::fixed << std::setprecision(1)
+       << elapsed.count() << " rss_delta_kib="
+       << static_cast<long long>(ResidentKiB()) -
+              static_cast<long long>(resident)
+       << ' ' << Logger::MemoryStatus();
+  Logger::Info("loader", line.str());
+}
+
 }  // namespace
 
 struct TextGenerationScheduler::Request::Impl {
@@ -519,6 +553,7 @@ struct TextGenerationScheduler::Impl {
             .Descriptor()
             .capabilities.batched_multi_token_decode_max_width;
     device_lost_requests.reserve(runner_pool->capacity());
+    PrepareStructuredOutput(runner_pool->runner());
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
     if (scheduler_policy.stall_timeout.count() > 0) {
@@ -918,6 +953,12 @@ struct TextGenerationScheduler::Impl {
     // A stop may land on a preview, an unadvanced AR token, or inside an
     // accepted speculative block. Retain only correctly labelled executed
     // state, using the same cache reconciliation as an interrupted request.
+    // Read before the commit returns the leased state.
+    const auto ngram = request->runner_request.ngram_rows();
+    request->result.ngram_rows = ngram.rows;
+    request->result.ngram_dedup_rows = ngram.dedup_rows;
+    request->result.ngram_cache_hits = ngram.cache_hits;
+    request->result.ngram_disk_reads = ngram.disk_reads;
     const auto cache_commit =
         finish_reason == TextGenerationBackend::FinishReason::kStopSequence
             ? request->runner_request.Cancel()
@@ -1454,6 +1495,8 @@ struct TextGenerationScheduler::Impl {
       request->result.draft_rounds += step.draft_rounds;
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      request->result.lookup_tokens += step.lookup_tokens;
+      request->result.lookup_accepted_tokens += step.lookup_accepted_tokens;
 
       CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
@@ -1758,6 +1801,9 @@ struct TextGenerationScheduler::Impl {
       item.request->result.draft_rounds += step.draft_rounds;
       item.request->result.draft_tokens += step.draft_tokens;
       item.request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      item.request->result.lookup_tokens += step.lookup_tokens;
+      item.request->result.lookup_accepted_tokens +=
+          step.lookup_accepted_tokens;
 
       bool published = true;
       try {

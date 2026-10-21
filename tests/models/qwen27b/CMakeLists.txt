@@ -40,9 +40,11 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/glm53_text_runner.cpp)
   target_link_libraries(qwen_serving_test_support PUBLIC gufo_logging
-    gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next gufo_cache_hip hip::host)
+    gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next gufo_glm53_flash
+    gufo_cache_hip hip::host)
   add_executable(inference_backend_gpu_test serving_test.cpp)
   target_link_libraries(inference_backend_gpu_test PRIVATE qwen_serving_test_support)
   add_executable(qwen_vision_serving_test ../qwen/vision_serving_test.cpp)
@@ -54,6 +56,7 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_vision_prepare_test ../qwen/vision_prepare_test.cpp
     "qwen38-flash-next;gpu;hip;vision;external-model")
   target_link_libraries(qwen_vision_prepare_test PRIVATE hip::host)
+  target_link_options(qwen_vision_prepare_test PRIVATE -Wl,--wrap=hipMemcpyAsync)
   add_test(NAME inference_backend_gpu_test COMMAND inference_backend_gpu_test)
   set_tests_properties(inference_backend_gpu_test PROPERTIES
     LABELS "qwen27b;hip;gpu;server;correctness;external-model"

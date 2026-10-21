@@ -1,0 +1,120 @@
+{
+  "baseline": {
+    "rows": [
+      {
+        "prompt": 32.0,
+        "rep": 0.0,
+        "prefill_s": 0.46053,
+        "decode_s": 7.43375,
+        "tok_s": 17.2188
+      },
+      {
+        "prompt": 32.0,
+        "rep": 1.0,
+        "prefill_s": 0.396171,
+        "decode_s": 7.37854,
+        "tok_s": 17.3476
+      },
+      {
+        "prompt": 32.0,
+        "rep": 2.0,
+        "prefill_s": 0.39789,
+        "decode_s": 7.39569,
+        "tok_s": 17.3074
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 0.0,
+        "prefill_s": 11.202,
+        "decode_s": 10.0376,
+        "tok_s": 12.752
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 1.0,
+        "prefill_s": 10.2728,
+        "decode_s": 10.0486,
+        "tok_s": 12.7381
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 2.0,
+        "prefill_s": 10.2768,
+        "decode_s": 10.0537,
+        "tok_s": 12.7317
+      }
+    ],
+    "medians": {
+      "32": {
+        "prefill_s": 0.39789,
+        "decode_s": 7.39569,
+        "tok_s": 17.3074
+      },
+      "2048": {
+        "prefill_s": 10.2768,
+        "decode_s": 10.0486,
+        "tok_s": 12.7381
+      }
+    }
+  },
+  "candidate": {
+    "rows": [
+      {
+        "prompt": 32.0,
+        "rep": 0.0,
+        "prefill_s": 0.450188,
+        "decode_s": 7.43641,
+        "tok_s": 17.2126
+      },
+      {
+        "prompt": 32.0,
+        "rep": 1.0,
+        "prefill_s": 0.398434,
+        "decode_s": 7.41818,
+        "tok_s": 17.2549
+      },
+      {
+        "prompt": 32.0,
+        "rep": 2.0,
+        "prefill_s": 0.398897,
+        "decode_s": 7.41249,
+        "tok_s": 17.2681
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 0.0,
+        "prefill_s": 12.0817,
+        "decode_s": 10.0715,
+        "tok_s": 12.7091
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 1.0,
+        "prefill_s": 10.2636,
+        "decode_s": 10.12,
+        "tok_s": 12.6482
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 2.0,
+        "prefill_s": 10.3043,
+        "decode_s": 10.0709,
+        "tok_s": 12.7099
+      }
+    ],
+    "medians": {
+      "32": {
+        "prefill_s": 0.398897,
+        "decode_s": 7.41818,
+        "tok_s": 17.2549
+      },
+      "2048": {
+        "prefill_s": 10.3043,
+        "decode_s": 10.0715,
+        "tok_s": 12.7091
+      }
+    }
+  },
+  "decision": "Reject paired quantization: no measured full-model benefit. Retain separate Q8 tail safety fix.",
+  "logits": "cmp exit0, SHA256 62a6a5f65753dce0b21d4dd3a04c86441419ea88880718eac8730faaf95a9070; prefill plus first127 decode outputs per run, final output not saved."
+}

@@ -1,0 +1,69 @@
+{
+  "baseline": {
+    "runs": [
+      {
+        "prompt": 2048.0,
+        "rep": 0.0,
+        "prefill_s": 11.0933,
+        "decode_s": 10.1026,
+        "tok_s": 12.67
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 1.0,
+        "prefill_s": 10.279,
+        "decode_s": 10.0867,
+        "tok_s": 12.6899
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 2.0,
+        "prefill_s": 10.2846,
+        "decode_s": 10.0746,
+        "tok_s": 12.7052
+      }
+    ],
+    "median": {
+      "prefill_s": 10.2846,
+      "decode_s": 10.0867,
+      "tok_s": 12.6899
+    },
+    "logit_bytes": 239754240,
+    "sha256": "4885a4945d48c7763e275eb4d2eedbe767b0ac34c2eedaf1dbf7dc907a01e035"
+  },
+  "candidate": {
+    "runs": [
+      {
+        "prompt": 2048.0,
+        "rep": 0.0,
+        "prefill_s": 10.5974,
+        "decode_s": 10.1006,
+        "tok_s": 12.6725
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 1.0,
+        "prefill_s": 9.9025,
+        "decode_s": 10.0896,
+        "tok_s": 12.6864
+      },
+      {
+        "prompt": 2048.0,
+        "rep": 2.0,
+        "prefill_s": 9.93388,
+        "decode_s": 10.08,
+        "tok_s": 12.6984
+      }
+    ],
+    "median": {
+      "prefill_s": 9.93388,
+      "decode_s": 10.0896,
+      "tok_s": 12.6864
+    },
+    "logit_bytes": 239754240,
+    "sha256": "4885a4945d48c7763e275eb4d2eedbe767b0ac34c2eedaf1dbf7dc907a01e035"
+  },
+  "prefill_speedup_percent": 3.5305439566412966,
+  "bitwise_equal": true,
+  "scope": "pp2048/tg128, three resets each, baseline then candidate. Load/reset/argmax/output writes excluded. All129 output vectors per reset saved and checked finite; same production flags, Q8 safety fix and baseline GLM code."
+}

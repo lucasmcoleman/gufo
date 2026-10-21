@@ -872,10 +872,15 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
   ngram_snapshots_.resize(depth);
 }
 
-void Session::Reset() {
+void Session::Reset(bool reuse_mtp) {
   // Reset leaves append-only rows intact. Preserve them at the first write
   // that would overwrite them, allowing cancellation to resume by rewind.
-  TrimRollback(0);
+  // Scratch is overwritten by the next verification. Retaining its stable
+  // addresses also retains the graphs; freeing it at every cache reassignment
+  // makes later MTP requests allocate and record those shapes again. Its full
+  // bound is already included in speculative SessionBytes and AllocatedBytes.
+  if (!reuse_mtp || !mtp_enabled_)
+    TrimRollback(0);
   snapshot_lineage_.reset();
   position_ = 0;
   spec_tokens_ = 0;
@@ -914,22 +919,10 @@ Executor::~Executor() {
   }
   (void)hipFree(batch_logits_);
   (void)hipFree(verification_penalties_);
-  (void)hipHostFree(batch_gdn_host_);
-  (void)hipHostFree(batch_controls_);
-  (void)hipHostFree(batch_candidates_host_);
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
-  for (void* p :
-       {static_cast<void*>(host_emb_), static_cast<void*>(control_host_),
-        static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
-        static_cast<void*>(mtp_token_host_), static_cast<void*>(counts_host_),
-        static_cast<void*>(mtp_candidates_host_),
-        static_cast<void*>(tiles_host_)}) {
-    if (p != nullptr) {
-      (void)hipHostFree(p);
-    }
-  }
+  host_allocations_.Reset();
   if (blas_ != nullptr) {
     (void)hipblasDestroy(blas_);
   }
@@ -957,6 +950,13 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     AssignError(error_msg, "quantized GEMM tier initialization failed");
     return nullptr;
   }
+  if (!Check(PrepareW8A8GemmWave64(), "wide Q8 GEMM preparation", error_msg))
+    return nullptr;
+  // The first greedy verification otherwise resolves the shared argmax
+  // module on the decode path. Preparation launches no trial kernels.
+  if (e->has_mtp() && !Check(gufo::hip::PrepareBatchedGPUArgmax(),
+                             "MTP argmax preparation", error_msg))
+    return nullptr;
   if (!Check(hipStreamCreate(&e->stream_), "hipStreamCreate", error_msg)) {
     return nullptr;
   }
@@ -974,6 +974,24 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
   if (e->blaslt_ == nullptr) {
     return nullptr;
+  }
+  if (MatrixRows(T)) {
+    // The first indexer heuristic query also loads the library's code object.
+    // Do that before readiness instead of leaving a ~100 ms GPU idle gap in
+    // the first prefill. Exact geometry still determines every plan; no trial
+    // GEMM runs and no model activations or session state are touched.
+    for (const auto& layer : model.layers()) {
+      for (const auto* tensor : {&layer.indexer_k, &layer.indexer_q}) {
+        if (!tensor->empty() &&
+            (tensor->type == GgmlType::kBF16 ||
+             tensor->type == GgmlType::kF16) &&
+            !e->blaslt_->Prepare(
+                tensor->type == GgmlType::kBF16 ? HIP_R_16BF : HIP_R_16F,
+                tensor->rows, T, tensor->cols, error_msg)) {
+          return nullptr;
+        }
+      }
+    }
   }
   const std::size_t hc_dim = c.HcDim();
   const std::size_t hidden = c.hidden_size;
@@ -1095,8 +1113,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // allocation or upload. Its address stays fixed for graph replay; the
     // next-chunk prefetch uses separate storage until this forward finishes.
     void* pinned = nullptr;
-    if (!Check(hipHostMalloc(&pinned, T * c.PleEmbeddingDim() * sizeof(float),
-                             hipHostMallocMapped | hipHostMallocCoherent),
+    if (!Check(e->host_allocations_.Allocate(
+                   &pinned, T * c.PleEmbeddingDim() * sizeof(float),
+                   hipHostMallocMapped | hipHostMallocCoherent),
                "pinned n-gram buffer", error_msg)) {
       return nullptr;
     }
@@ -1107,6 +1126,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
     e->host_rows_.resize(T * c.ple_heads);
+    if (ngram)
+      ngram->ReserveGather(T * c.ple_heads);
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
@@ -1135,25 +1156,29 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     void* control = nullptr;
     void* tokens = nullptr;
     void* logits = nullptr;
-    if (!Check(hipHostMalloc(&control, sizeof(Session::Control)),
-               "pinned control buffer", error_msg) ||
-        !Check(hipHostMalloc(&tokens, T * sizeof(std::int32_t)),
+    if (!Check(
+            e->host_allocations_.Allocate(&control, sizeof(Session::Control)),
+            "pinned control buffer", error_msg) ||
+        !Check(e->host_allocations_.Allocate(&tokens, T * sizeof(std::int32_t)),
                "pinned token buffer", error_msg) ||
-        !Check(hipHostMalloc(&logits, static_cast<std::size_t>(
-                                          e->options_.max_logit_rows) *
-                                          c.vocab_size * sizeof(float)),
-               "pinned logits buffer", error_msg)) {
+        !Check(
+            e->host_allocations_.Allocate(
+                &logits, static_cast<std::size_t>(e->options_.max_logit_rows) *
+                             c.vocab_size * sizeof(float)),
+            "pinned logits buffer", error_msg)) {
       return nullptr;
     }
     void* counts = nullptr;
-    if (!Check(hipHostMalloc(&counts, c.num_experts * sizeof(std::uint32_t)),
+    if (!Check(e->host_allocations_.Allocate(
+                   &counts, c.num_experts * sizeof(std::uint32_t)),
                "pinned expert counts", error_msg)) {
       return nullptr;
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
-    if (!Check(hipHostMalloc(&tiles, 3 * RoutedTileCapacity(slots, c) *
-                                         sizeof(std::int32_t)),
+    if (!Check(e->host_allocations_.Allocate(
+                   &tiles,
+                   3 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -1187,11 +1212,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Final selection consumes intermediate IDs before writing its scores.
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
-    if (!Check(hipHostMalloc(&e->mtp_token_host_, sizeof(std::int32_t)),
+    if (!Check(e->host_allocations_.Allocate(&e->mtp_token_host_,
+                                             sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
-        !Check(
-            hipHostMalloc(&e->mtp_candidates_host_, sizeof(MtpCandidateLogits)),
-            "pinned draft candidates", error_msg)) {
+        !Check(e->host_allocations_.Allocate(&e->mtp_candidates_host_,
+                                             sizeof(MtpCandidateLogits)),
+               "pinned draft candidates", error_msg)) {
       return nullptr;
     }
     std::construct_at(e->mtp_candidates_host_);
@@ -2124,18 +2150,50 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
   if (ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
-  if ((prefetch_.pending || prefetch_.ready) && !speculative &&
-      session.ngram_ == prefetch_.before &&
-      std::ranges::equal(tokens, prefetch_.tokens)) {
-    // These are this batch's rows: WaitPle collects them.
-    session.ngram_ = prefetch_.after;
-    prefetch_.claimed = true;
-    ple_pending_ = true;
-    return true;
-  }
-  FinishPrefetch();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
+  if ((prefetch_.pending || prefetch_.ready) && !speculative &&
+      session.ngram_ == prefetch_.before) {
+    // A cache checkpoint or another step budget can end this chunk before
+    // or after the hinted one. Rows are per token, so a common prefix still
+    // serves every token both cover.
+    const auto shared = static_cast<std::size_t>(
+        std::ranges::mismatch(tokens, prefetch_.tokens).in1 - tokens.begin());
+    if (shared == tokens.size() || shared == prefetch_.tokens.size()) {
+      prefetch_.claimed = shared;
+      ple_pending_ = true;
+      if (shared == prefetch_.tokens.size()) {
+        session.ngram_ = prefetch_.after;
+      } else {
+        HashNgramRows(
+            c, session.ngram_, tokens,
+            std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
+      }
+      if (shared == tokens.size())
+        return true;
+      // Only one table read runs at a time: finish the prefetch, which had a
+      // whole chunk to complete, then read the rows past it.
+      FinishPrefetch();
+      const auto rest = tokens.subspan(shared);
+      const auto rows = rest.size() * c.ple_heads;
+      HashNgramRows(c, session.ngram_, rest,
+                    std::span<std::uint32_t>(host_rows_.data(), rows));
+      const NgramGatherOwner owner{rows, &session.ngram_counters_};
+      prefetch_.tail = ngram_->StartRead(
+          std::span<const std::uint32_t>(host_rows_.data(), rows),
+          std::span<float>(host_emb_ + shared * c.PleEmbeddingDim(),
+                           rest.size() * c.PleEmbeddingDim()),
+          std::span(&owner, 1));
+      if (!prefetch_.tail) {
+        prefetch_.claimed = 0;
+        prefetch_.ready = false;
+        ple_pending_ = false;
+        AssignError(error_msg, "n-gram table read could not start");
+      }
+      return prefetch_.tail;
+    }
+  }
+  FinishPrefetch();
   // Only proper prefixes need snapshots; the full batch keeps its live state.
   if (speculative) {
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -2150,10 +2208,12 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
     HashNgramRows(c, session.ngram_, tokens,
                   std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
   }
+  const NgramGatherOwner owner{n * c.ple_heads, &session.ngram_counters_};
   ple_pending_ = ngram_->StartRead(
       std::span<const std::uint32_t>(host_rows_.data(), n * c.ple_heads),
       std::span<float>(host_emb_,
-                       static_cast<std::size_t>(n) * c.PleEmbeddingDim()));
+                       static_cast<std::size_t>(n) * c.PleEmbeddingDim()),
+      std::span(&owner, 1));
   if (!ple_pending_) {
     AssignError(error_msg, "n-gram table read could not start");
   }
@@ -2162,16 +2222,18 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
 
 bool Executor::WaitPle(std::string* error_msg) const {
   bool ok = ple_pending_;
-  if (ok && prefetch_.claimed) {
+  if (ok && prefetch_.claimed != 0) {
     FinishPrefetch();
     ok = prefetch_.ready;
     if (ok) {
       std::copy_n(prefetch_.rows.data(),
-                  prefetch_.tokens.size() * config().PleEmbeddingDim(),
-                  host_emb_);
+                  prefetch_.claimed * config().PleEmbeddingDim(), host_emb_);
     }
+    if (prefetch_.tail)
+      ok = ngram_->WaitRead() && ok;
     prefetch_.ready = false;
-    prefetch_.claimed = false;
+    prefetch_.claimed = 0;
+    prefetch_.tail = false;
   } else if (ok) {
     ok = ngram_->WaitRead();
   }
@@ -2202,8 +2264,10 @@ void Executor::PrefetchPle(const Session& session,
   if (prefetch_.rows.size() < count) {
     prefetch_.rows.resize(count);
   }
+  const NgramGatherOwner owner{rows.size(), &session.ngram_counters_};
   prefetch_.pending =
-      ngram_->StartRead(rows, std::span<float>(prefetch_.rows.data(), count));
+      ngram_->StartRead(rows, std::span<float>(prefetch_.rows.data(), count),
+                        std::span(&owner, 1));
 }
 
 void Executor::FinishPrefetch() const {

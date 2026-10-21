@@ -1,10 +1,13 @@
 #include "src/cli/serve/text_model_runner.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -2009,6 +2012,84 @@ void TestMeminfoAvailableExcludesFreeCma() {
          "missing MemAvailable keeps the caller's fallback");
 }
 
+void TestCgroupAvailableCountsReclaimableCache() {
+  namespace fs = std::filesystem;
+  using gufo::server::CgroupAvailableBytes;
+  constexpr std::uint64_t gib = std::uint64_t{1} << 30;
+  const auto root = fs::temp_directory_path() /
+                    ("gufo_cgroup_test_" + std::to_string(::getpid()));
+  fs::remove_all(root);
+  const auto write = [&](const fs::path& dir, const char* name,
+                         const std::string& text) {
+    fs::create_directories(root / dir);
+    std::ofstream(root / dir / name) << text << "\n";
+  };
+  const auto level = [&](const fs::path& dir, const std::string& max,
+                         std::uint64_t current,
+                         std::optional<std::uint64_t> inactive_file) {
+    write(dir, "memory.max", max);
+    write(dir, "memory.current", std::to_string(current));
+    fs::remove(root / dir / "memory.stat");
+    if (inactive_file)
+      write(dir, "memory.stat",
+            "anon 1\ninactive_file " + std::to_string(*inactive_file) +
+                "\nactive_file 5");
+  };
+  const std::string member = "0::/pod/ctr\n";
+  const auto host = 500 * gib;
+
+  level("pod/ctr", std::to_string(80 * gib), 79 * gib, 32 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == 33 * gib,
+         "inactive file pages count as available");
+  Expect(CgroupAvailableBytes(root, member, 10 * gib) == 10 * gib,
+         "host MemAvailable still bounds the result");
+
+  level("pod/ctr", std::to_string(80 * gib), 79 * gib, std::nullopt);
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "missing memory.stat keeps memory.current as used");
+  const auto stat = [&](const std::string& text) {
+    write("pod/ctr", "memory.stat", text);
+  };
+  level("pod/ctr", std::to_string(80 * gib), 79 * gib, 32 * gib);
+  stat("anon 1\nactive_file 5\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "memory.stat without inactive_file keeps memory.current as used");
+  stat("inactive_file " + std::to_string(32 * gib) + "\nfile_dirty lots\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "a malformed memory.stat value is ignored");
+  stat("inactive_file notanumber\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "a malformed inactive_file value is ignored");
+  stat("inactive_file " + std::to_string(32 * gib) + "\nfile_dirty " +
+       std::to_string(3 * gib) + "\nfile_writeback " + std::to_string(1 * gib) +
+       "\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 29 * gib,
+         "dirty and writeback pages stay charged");
+  stat("inactive_file " + std::to_string(2 * gib) + "\nfile_dirty " +
+       std::to_string(5 * gib) + "\n");
+  Expect(CgroupAvailableBytes(root, member, host) == 1 * gib,
+         "dirty pages beyond inactive_file reclaim nothing");
+
+  level("pod/ctr", std::to_string(80 * gib), 10 * gib, 32 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == 80 * gib,
+         "inactive file larger than current saturates");
+
+  level("pod/ctr", std::to_string(80 * gib), 79 * gib, 32 * gib);
+  level("pod", std::to_string(40 * gib), 30 * gib, 5 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == 15 * gib,
+         "a tighter parent limit wins");
+
+  level("pod/ctr", "max", 79 * gib, 32 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == 15 * gib,
+         "an unlimited level defers to its ancestors");
+  fs::remove_all(root / "pod");
+  level("", "max", 79 * gib, 32 * gib);
+  level("pod/ctr", "max", 79 * gib, 32 * gib);
+  Expect(CgroupAvailableBytes(root, member, host) == host,
+         "unlimited cgroups leave host availability unchanged");
+  fs::remove_all(root);
+}
+
 void TestSnapshotStartupReportsSelectedLimits() {
   class ChangingHeadroomRunner final : public SnapshotRunner {
   public:
@@ -2066,6 +2147,72 @@ void TestSnapshotStartupReportsSelectedLimits() {
          "startup limits describe the claim that selected cache capacity");
 }
 
+void TestPreparedConstraintVocabularyKeepsGrammarBehavior() {
+  // Startup preparation changes when the vocabulary is built, not
+  // what it allows: one build, reused by every binding, with the same masks
+  // and accepted states as a runner that builds it for its first request.
+  class VocabularyRunner final : public FakeRunner {
+  public:
+    VocabularyRunner() : FakeRunner(std::make_shared<FakeStats>()) {}
+    std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+    BuildConstraintVocabulary() const override {
+      ++builds;
+      // Single bytes, a few multi-byte pieces and a stop token.
+      static const std::vector<std::string> extra{"{\"", "\":", "\",\"",
+                                                  "ab",  "12",  "\"}"};
+      return std::make_shared<gufo::sampling::ConstraintVocabulary>(
+          128 + extra.size() + 1, [](std::uint32_t id) {
+            if (id < 128)
+              return gufo::sampling::ConstraintVocabulary::Piece{
+                  std::string(1, static_cast<char>(id)), false};
+            if (id < 128 + extra.size())
+              return gufo::sampling::ConstraintVocabulary::Piece{
+                  extra[id - 128], false};
+            return gufo::sampling::ConstraintVocabulary::Piece{"", true};
+          });
+    }
+    mutable std::size_t builds{0};
+  };
+  const VocabularyRunner prepared;
+  const VocabularyRunner lazy;
+  const auto size = prepared.PrepareConstraintVocabulary();
+  Expect(size == 135 && prepared.PrepareConstraintVocabulary() == size &&
+             prepared.builds == 1,
+         "preparation builds the vocabulary once");
+  const auto grammar = gufo::sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{"keyword":{"type":"string"},)"
+          R"("n":{"type":"integer"}},"required":["keyword","n"],)"
+          R"("additionalProperties":false})"),
+      false);
+  const auto other = gufo::sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{},"additionalProperties":false})"),
+      false);
+  const auto binding = prepared.BindConstraint(grammar);
+  Expect(prepared.BindConstraint(other)->vocabulary == binding->vocabulary &&
+             prepared.builds == 1,
+         "constrained requests reuse the prepared vocabulary");
+  const auto reference = lazy.BindConstraint(grammar);
+  Expect(lazy.builds == 1, "without preparation the first binding builds it");
+  // {"keyword":"ab","n":12} in mixed single- and multi-byte pieces.
+  const std::vector<std::uint32_t> tokens{128, 'k', 'e', 'y', 'w', 'o',
+                                          'r', 'd', 129, '"', 131, 130,
+                                          'n', 129, 132, '}'};
+  auto state = grammar->Start();
+  auto expected = grammar->Start();
+  for (const auto token : tokens) {
+    const auto mask = binding->Allowed(state);
+    Expect(*mask == *reference->Allowed(expected) && (*mask)[token],
+           "a prepared vocabulary allows the same tokens");
+    state = binding->vocabulary->Accept(*grammar, state, token);
+    expected = reference->vocabulary->Accept(*grammar, expected, token);
+  }
+  Expect(grammar->Complete(state) && grammar->Complete(expected) &&
+             *binding->Allowed(state) == *reference->Allowed(expected),
+         "both bindings complete the same output");
+}
+
 void TestServerInstructionsAreFraming() {
   using namespace gufo::tokenization;
   class ConstraintRunner final : public FakeRunner {
@@ -2111,6 +2258,42 @@ void TestServerInstructionsAreFraming() {
       Expect(observed == format && constrained.has_value() == json,
              "plain and JSON answers retain the native output dialect");
     }
+  }
+  {
+    // GLM calls have no grammar: tools leave the request unconstrained, and
+    // only a response format binds a constraint.
+    const ConstraintRunner glm_runner(
+        gufo::sampling::JsonConstraint::ToolFormat::kGlm);
+    for (const bool json : {false, true}) {
+      ChatRequest request;
+      request.tool_choice = ChatRequest::ToolChoice::kRequired;
+      request.tools.push_back({.name = "record",
+                               .description = {},
+                               .parameters_json = R"({"type":"object"})",
+                               .definition_json = {}});
+      if (json)
+        request.response_format = gufo::sampling::JsonConstraint::Compile(
+            gufo::json::parse(
+                R"({"type":"object","properties":{},"additionalProperties":false})"),
+            false);
+      gufo::sampling::SamplingConfig sampling;
+      std::optional<gufo::sampling::JsonConstraint::ToolFormat> observed;
+      const auto constrained = gufo::server::ConstrainChatRequest(
+          request, glm_runner, &sampling, &observed);
+      Expect(observed == gufo::sampling::JsonConstraint::ToolFormat::kGlm &&
+                 constrained.has_value() == json &&
+                 (sampling.constraint != nullptr) == json,
+             "GLM tools are parsed, not constrained");
+    }
+    bool rejected = false;
+    try {
+      (void)gufo::sampling::JsonConstraint::ToolParameters(
+          gufo::json::parse(R"({"type":"object"})"), false,
+          gufo::sampling::JsonConstraint::ToolFormat::kGlm);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    Expect(rejected, "the tool grammar builder rejects the GLM format");
   }
   std::vector<std::string> vocab;
   for (int i = 0; i < 256; ++i)
@@ -2310,6 +2493,7 @@ void TestServerInstructionsAreFraming() {
 int main() {
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
+  TestPreparedConstraintVocabularyKeepsGrammarBehavior();
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
   ::setenv("NO_COLOR", "1", 1);
@@ -2355,6 +2539,7 @@ int main() {
 
   TestSnapshotCacheCapacityIsReportedAtStartup();
   TestMeminfoAvailableExcludesFreeCma();
+  TestCgroupAvailableCountsReclaimableCache();
   TestSnapshotStartupReportsSelectedLimits();
   TestPersistentSnapshotRestoresAcrossPools();
   TestSharedPrefixIsLearnedAndRestoredAcrossConversations();

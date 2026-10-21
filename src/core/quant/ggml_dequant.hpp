@@ -41,6 +41,13 @@ struct block_q6_K {
   std::uint16_t d;
 };
 
+struct block_q2_K {
+  std::uint8_t scales[16];  // low nibble scale, high nibble min, per 16
+  std::uint8_t qs[64];      // 2-bit quants
+  std::uint16_t d;
+  std::uint16_t dmin;
+};
+
 struct block_q3_K {
   std::uint8_t hmask[32];
   std::uint8_t qs[64];
@@ -88,6 +95,30 @@ struct block_iq3_s {
   std::uint8_t signs[32];
   std::uint8_t scales[4];
 };
+
+// IQ2_XXS: fp16 scale + 32 uint16 words (64 bytes). Per 32-element sub-block:
+// four grid indices (kIq2xxsGrid, 8 bits each) then a 32-bit word holding four
+// 7-bit sign indices and a 4-bit scale in the top nibble.
+struct block_iq2_xxs {
+  std::uint16_t d;
+  std::uint8_t qs[64];
+};
+
+// IQ3_XXS: fp16 scale + 64 grid-index bytes (kIq3xxsGrid) followed by 32 bytes
+// of per-sub-block {4 x 7-bit sign index, 4-bit scale} words.
+struct block_iq3_xxs {
+  std::uint16_t d;
+  std::uint8_t qs[96];
+};
+
+// IQ2_S: fp16 scale; qs holds 32 low grid-index bytes followed by 32 sign
+// bytes, qh the 2 high index bits per group, scales two 4-bit scales per byte.
+struct block_iq2_s {
+  std::uint16_t d;
+  std::uint8_t qs[64];
+  std::uint8_t qh[8];
+  std::uint8_t scales[8];
+};
 #pragma pack(pop)
 
 static_assert(sizeof(block_q4_K) == 144, "block_q4_K must be 144 bytes");
@@ -99,6 +130,9 @@ static_assert(sizeof(block_q8_0) == 34, "block_q8_0 must be 34 bytes");
 static_assert(sizeof(block_iq4_nl) == 18, "block_iq4_nl must be 18 bytes");
 static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
 static_assert(sizeof(block_iq3_s) == 110, "block_iq3_s must be 110 bytes");
+static_assert(sizeof(block_iq2_xxs) == 66, "block_iq2_xxs must be 66 bytes");
+static_assert(sizeof(block_iq3_xxs) == 98, "block_iq3_xxs must be 98 bytes");
+static_assert(sizeof(block_iq2_s) == 82, "block_iq2_s must be 82 bytes");
 
 /// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS.
 inline constexpr std::int8_t kValuesIq4Nl[16] = {
@@ -119,6 +153,8 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
       return 32;
     case core::GgmlType::kQ2_K:
     case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ2_S:
     case core::GgmlType::kIQ4_XS:
     case core::GgmlType::kIQ3_S:
     case core::GgmlType::kQ3_K:
@@ -154,6 +190,9 @@ void DequantizeQ5_K(const void* src, float* dst, std::size_t k);
 // Dequantize row of Q6_K to float
 void DequantizeQ6_K(const void* src, float* dst, std::size_t k);
 
+// Dequantize row of Q2_K to float
+void DequantizeQ2_K(const void* src, float* dst, std::size_t k);
+
 // Dequantize row of Q3_K to float
 void DequantizeQ3_K(const void* src, float* dst, std::size_t k);
 
@@ -184,6 +223,12 @@ void DequantizeIQ4_XS(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of IQ3_S to float
 void DequantizeIQ3_S(const void* src, float* dst, std::size_t k);
+
+// Dequantize rows of IQ2_XXS / IQ3_XXS / IQ2_S to float (bit-exact with
+// llama.cpp dequantize_row_iq2_xxs / _iq3_xxs / _iq2_s).
+void DequantizeIQ2_XXS(const void* src, float* dst, std::size_t k);
+void DequantizeIQ3_XXS(const void* src, float* dst, std::size_t k);
+void DequantizeIQ2_S(const void* src, float* dst, std::size_t k);
 
 // Compute dot product of IQ4_NL quantized row with FP32 vector
 float DotProductIQ4_NL(const void* row_data, std::span<const float> vec,

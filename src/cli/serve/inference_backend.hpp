@@ -26,6 +26,10 @@ namespace gufo::models::qwen38_flash_next {
 class Model;
 }
 
+namespace gufo::models::glm53_flash {
+class Model;
+}
+
 namespace gufo::tokenization {
 class QwenTokenizer;
 }
@@ -114,6 +118,17 @@ public:
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
             TextRunnerRamCacheOptions ram_cache_config = {});
+
+  /// Installs a previously loaded GLM-5.3-Flash model. It has one sequence
+  /// and no snapshots: one session, no speculative decoding, no disk cache.
+  bool load(std::shared_ptr<models::glm53_flash::Model> model,
+            std::string* error, std::uint32_t max_context = 0,
+            std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
 #endif
 
   /// Stable model identifier used in API responses.
@@ -121,6 +136,8 @@ public:
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] bool device_lost() const override;
   [[nodiscard]] bool supports_images() const override;
+  [[nodiscard]] std::string model_path() const override;
+  [[nodiscard]] std::string build_info() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
   [[nodiscard]] std::uint32_t max_context() const override;
   [[nodiscard]] std::vector<SessionState> session_states() const override;
@@ -128,6 +145,8 @@ public:
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
   void set_model_id(const std::string& model_id);
+  void set_served_artifact(const std::string& model_path,
+                           const std::string& build_info);
   void set_sampling_defaults(std::size_t max_tokens,
                              const sampling::SamplingConfig& sampling,
                              sampling::SamplingOverrides supplied =
