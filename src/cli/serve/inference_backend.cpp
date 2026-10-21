@@ -81,15 +81,17 @@ void SetError(std::string* error, std::string message) {
 /// sessions 87.9/95.8/94.8/90.2, three 105.7/103.0/98.9/98.2, four
 /// 117.1/113.4/109.6/110.1, against 79.0/95.7/106.0 without drafting. Dense
 /// targets share their weights across the rows and keep the full draft: the
-/// cap cost Qwen3.8-27B 6% at two sessions and 26% at four. MTP stops drafting
-/// at three sessions: on the 35B one MTP draft token gave 99.4/107.2 total
-/// tok/s at three/four greedy sessions, against 99.1/111.0 with none.
+/// cap cost Qwen3.8-27B 6% at two sessions and 26% at four. MTP keeps one draft
+/// token at two sessions and stops drafting at three: on the 35B, two greedy
+/// sessions gave 86.9 total tok/s with one MTP draft token against 85.6 with
+/// two, and one token gave 99.4/107.2 at three/four sessions against
+/// 99.1/111.0 with none.
 std::uint32_t ConcurrentDraftCap(std::size_t active, bool moe_target,
                                  bool mtp_draft) {
   if (active <= 1 || !moe_target)
     return std::numeric_limits<std::uint32_t>::max();
   if (active == 2)
-    return 2;
+    return mtp_draft ? 1 : 2;
   return mtp_draft ? 0 : 1;
 }
 
