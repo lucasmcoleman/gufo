@@ -185,16 +185,24 @@ ggml_hip_pool & qfn_pool_for_stream(int device, hipStream_t stream) {
     return *pool;
 }
 
+// The caller must have stopped every host submission and allocation on `stream` first: the
+// lock protects the map, not the pool references handed out by qfn_pool_for_stream.
 extern "C" void qfn_mmq_release_stream(hipStream_t stream) {
     const std::lock_guard<std::mutex> lock(g_stream_pools_mutex);
     for (auto it = g_stream_pools.begin(); it != g_stream_pools.end();) {
-        if (it->first.second == stream) {
-            // The arena may still back queued work on this stream.
-            (void)hipStreamSynchronize(stream);
-            it = g_stream_pools.erase(it);
-        } else {
+        if (it->first.second != stream) {
             ++it;
+            continue;
         }
+        // The arena may still back queued work on this stream. If the wait fails, the work
+        // may still be running, so keep (leak) the arena rather than free memory in use.
+        const hipError_t status = hipStreamSynchronize(stream);
+        if (status != hipSuccess) {
+            fprintf(stderr, "qfn_mmq_release_stream: stream %p not synchronized (%s); keeping its scratch arena\n",
+                    (void *) stream, hipGetErrorString(status));
+            (void) it->second.release();
+        }
+        it = g_stream_pools.erase(it);
     }
 }
 
