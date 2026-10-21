@@ -6,6 +6,7 @@
 #include "src/models/qwen/continuation_layout.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/mtp.hpp"
 
 namespace gufo::models::qwen {
 
@@ -16,9 +17,9 @@ struct ContinuationFrontier {
   std::vector<tokenization::TokenId> pending;
 };
 
-// Slots own the same QwenGpuExecutor used by serving. The caller supplies full
-// model/tokenizer/template identity; the adapter adds state ABI, geometry and
-// policy.
+// Slots own the same QwenGpuExecutor used by serving, and at most one draft:
+// DFlash2 or MTP. The caller supplies full model/tokenizer/template identity;
+// the adapter adds state ABI, geometry and policy.
 class ContinuationAdapter final : public cache::Adapter {
 public:
   ContinuationAdapter(
@@ -26,10 +27,13 @@ public:
       cache::Identity,
       hip::QwenExecutionPolicy = hip::QwenExecutionPolicy::Production(),
       std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model = nullptr,
-      hip::QwenDFlashGpuDraftConfig draft_config = {});
+      hip::QwenDFlashGpuDraftConfig draft_config = {},
+      std::shared_ptr<const hip::QwenMtpGpuModel> mtp_model = nullptr,
+      hip::QwenMtpGpuDraftConfig mtp_config = {});
   ~ContinuationAdapter() override;
   [[nodiscard]] hip::QwenGpuExecutor& GetExecutor(cache::Slot&);
   [[nodiscard]] hip::QwenDFlashGpuDraftBackend* GetDraftBackend(cache::Slot&);
+  [[nodiscard]] hip::QwenMtpGpuDraftBackend* GetMtpBackend(cache::Slot&);
   [[nodiscard]] ContinuationFrontier& GetFrontier(cache::Slot&);
   // A next-token frontier with logits from the last executed position. A
   // partial-prefill restore carries a placeholder token without logits.
@@ -101,6 +105,8 @@ private:
   std::shared_ptr<const hip::QwenGpuModel> model_;
   std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model_;
   hip::QwenDFlashGpuDraftConfig draft_config_;
+  std::shared_ptr<const hip::QwenMtpGpuModel> mtp_model_;
+  hip::QwenMtpGpuDraftConfig mtp_config_;
   hip::QwenExecutionPolicy policy_;
   std::uint32_t context_;
   ContinuationLayout layout_;
