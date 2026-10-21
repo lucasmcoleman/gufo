@@ -5114,8 +5114,8 @@ __launch_bounds__(256) __global__
   // rows' scale, high bits and codes from LDS.
   constexpr int kQ5Bytes = BK * 24;  // one row's blocks per stage
   constexpr int kCodeBytes = kRegPair ? 0
-                             : kQ5 ? BM * kQ5Bytes
-                                   : BM * kChunks * 16;
+                             : kQ5    ? BM * kQ5Bytes
+                                      : BM * kChunks * 16;
   constexpr int kHighBytes = !kRegPair && kQ5K ? BK * BM * 4 : 0;
   constexpr int kScaleBytes = kRegPair || kQ5 ? 0 : BK * BM * 4;
   // One slot of padding per activation quarter plane: the eight chunks of
@@ -5379,16 +5379,15 @@ __launch_bounds__(256) __global__
       } else if constexpr (kQ6) {
         // half2 (d * scale of elements 0-15, d * scale of 16-31); the -32
         // code offset is taken out by the magic constant.
-        const float d =
-            f_live[u] ? __half2float(__builtin_bit_cast(
-                            __half, static_cast<std::uint16_t>(f_dm[u])))
-                      : 0.0F;
+        const float d = f_live[u]
+                            ? __half2float(__builtin_bit_cast(
+                                  __half, static_cast<std::uint16_t>(f_dm[u])))
+                            : 0.0F;
         const auto sc_lo = static_cast<std::int8_t>((f_dm[u] >> 16U) & 0xFFU);
         const auto sc_hi = static_cast<std::int8_t>(f_dm[u] >> 24U);
         scale_bias = __builtin_bit_cast(
-            std::uint32_t,
-            __floats2half2_rn(d * static_cast<float>(sc_lo),
-                              d * static_cast<float>(sc_hi)));
+            std::uint32_t, __floats2half2_rn(d * static_cast<float>(sc_lo),
+                                             d * static_cast<float>(sc_hi)));
       } else {
         const int sb32 = f_sb32[u];
         // The first four scale/min bytes live in y/z. Their remaining
@@ -6428,11 +6427,11 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* rows_in, const std::int32_t* rows_out,
                    const float* swiglu_gate, float* out, __half* out_half,
                    std::size_t m, std::size_t k, hipStream_t stream) {
-  const std::size_t block_elems = (type == WeightType::kQ4_K ||
-                                   type == WeightType::kQ5_K ||
-                                   type == WeightType::kQ6_K)
-                                      ? 256
-                                      : 64;
+  const std::size_t block_elems =
+      (type == WeightType::kQ4_K || type == WeightType::kQ5_K ||
+       type == WeightType::kQ6_K)
+          ? 256
+          : 64;
   if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
       (out_half == nullptr) == (out == nullptr)) {
     return false;
