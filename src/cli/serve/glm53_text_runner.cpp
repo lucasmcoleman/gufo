@@ -89,7 +89,7 @@ public:
                 .fork = false,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = false,
+                .multi_token_decode = model_->Mtp(),
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0,
                 .prefix_reuse = true,
@@ -259,6 +259,50 @@ public:
             std::span<const TextRunnerToken>(&token, 1), /*want_logits=*/true,
             &error))
       throw std::runtime_error("GLM-5.3-Flash decode failed: " + error);
+  }
+
+  // MTP: forwards the sampled token with the session's drafts and returns the
+  // drafts the sampler matched. It samples on a copy (the pool Accepts the
+  // returned tokens) and publishes the RNG and a deferred mismatch.
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    auto& generator = RequireGlm53State(state).generator();
+    if (max_tokens <= 1 || !generator.session().CanDraft())
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    if (generator.tokens().size() >= max_context_)
+      return {.selections = {}, .stop = true};
+    const auto logits = generator.logits();
+    if (logits.empty())
+      throw std::runtime_error("GLM-5.3-Flash has no logits to sample");
+    sampling::SamplerState working = sampler;
+    const auto token = working.Sample(logits);
+    if (state.stop_at_eos() && generator.IsStop(token)) {
+      sampler.CopyDrawStateFrom(working);
+      return {.selections = {}, .stop = true};
+    }
+    working.Accept(token);
+    std::vector<TextRunnerToken> kept;
+    std::size_t drafted = 0;
+    std::string error;
+    if (!generator.ExtendDrafted(token, working, max_tokens - 1,
+                                 state.stop_at_eos(), &kept, &drafted, &error))
+      throw std::runtime_error("GLM-5.3-Flash decode failed: " + error);
+    sampler.CopyDrawStateFrom(working);
+    TextDecodeStep step;
+    step.selections.reserve(kept.size() + 1);
+    const auto select = [&](TextRunnerToken id) {
+      step.selections.push_back({.stop = false,
+                                 .token = id,
+                                 .piece = model_->tokenizer().DecodeToken(id)});
+    };
+    select(token);
+    for (const auto id : kept)
+      select(id);
+    step.draft_rounds = drafted == 0 ? 0 : 1;
+    step.draft_tokens = drafted;
+    step.draft_accepted_tokens = kept.size();
+    return step;
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(

@@ -107,6 +107,8 @@ public:
   /// `general.name`, else kArchitecture.
   [[nodiscard]] std::string ModelName() const { return name_; }
   [[nodiscard]] std::size_t DeviceBytes() const noexcept;
+  /// Sessions draft with the NextN (MTP) block (ModelOptions::mtp).
+  [[nodiscard]] bool Mtp() const noexcept;
 
 private:
   struct Impl;
