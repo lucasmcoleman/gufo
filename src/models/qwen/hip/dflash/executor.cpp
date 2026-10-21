@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "qfn_mmq.h"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
@@ -561,6 +562,7 @@ void QwenDFlashGpuExecutor::Free() noexcept {
     hipblas_handle_ = nullptr;
   }
   if (stream_ != nullptr) {
+    qfn_mmq_release_stream(stream_);
     (void)hipStreamDestroy(stream_);
     stream_ = nullptr;
   }

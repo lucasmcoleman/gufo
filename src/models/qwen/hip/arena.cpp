@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "qfn_mmq.h"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
@@ -1341,8 +1342,10 @@ void QwenGpuArena::FreeAll() noexcept {
   if (hipblas_handle != nullptr)
     LogCleanupError(hipblasDestroy(hipblas_handle));
   hipblaslt_gemm.reset();
-  if (stream != nullptr)
+  if (stream != nullptr) {
+    qfn_mmq_release_stream(stream);
     LogCleanupError(hipStreamDestroy(stream));
+  }
 
   d_hidden = nullptr;
   d_normed = nullptr;
