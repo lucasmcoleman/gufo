@@ -228,12 +228,10 @@ struct QwenGemmResolution {
   }
 
   if (format.quantized) {
-    // The Ornith-1.5-122B linear-attention and attention output projections
-    // (Q4_K, 8192 to 3072) take the vendored llama.cpp vector kernel, which
+    // Q4_K decode projections take the vendored llama.cpp vector kernel, which
     // reads weights at a higher rate than the two-row block GEMV.
     if (request.mode == QwenGemmMode::kHipDecode &&
-        request.type == core::GgmlType::kQ4_K && request.batch_size == 1 &&
-        request.m == 3072 && request.k == 8192) {
+        request.type == core::GgmlType::kQ4_K && request.batch_size == 1) {
       return {.route = QwenGemmRoute::kHipQuantMmvq};
     }
     return {.route = QwenGemmRoute::kHipQuantDirect};

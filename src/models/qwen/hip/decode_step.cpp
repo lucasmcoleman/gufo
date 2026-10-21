@@ -14,6 +14,20 @@
 #include "src/models/qwen/modules/moe.hpp"
 
 namespace gufo::hip {
+namespace {
+
+// Whether a single-token decode projection of this format takes the vendored
+// vector kernel (gemm_route.hpp kHipQuantMmvq).
+[[nodiscard]] bool TakesVectorRoute(core::GgmlType type) {
+  return models::qwen::ResolveQwenGemmRoute(
+             {.type = type,
+              .m = 1,
+              .k = 256,
+              .mode = models::qwen::QwenGemmMode::kHipDecode})
+             .route == models::qwen::QwenGemmRoute::kHipQuantMmvq;
+}
+
+}  // namespace
 
 /// Single-token routed MoE FFN (qwen35moe): router + top-k, routed experts
 /// (MMQ Q8_0 kernels where possible, per-slot GEMV fallback otherwise),
@@ -36,10 +50,24 @@ void ExecuteMoeDecodeStep(hipStream_t stream, const QwenMoeScratch& moe,
   LaunchMoeRouterTopK(moe.router_logits.data(), n_experts, moe.ids.data(),
                       moe.weights.data(), 1, n_experts, n_used, stream);
 
-  // Shared expert: plain dense SwiGLU FFN of width shared_ff.
-  LaunchFusedSwiGLUGEMV(view.shexp_gate.data, view.shexp_gate.type,
-                        view.shexp_up.data, view.shexp_up.type, x,
-                        moe.shexp_act.data(), shared_ff, hidden, stream);
+  // Shared expert: plain dense SwiGLU FFN of width shared_ff. With the vector
+  // kernel it projects gate and up apart, as batched decode does; the routed
+  // gate buffer is free until the routed experts run.
+  if (TakesVectorRoute(view.shexp_gate.type) ||
+      TakesVectorRoute(view.shexp_up.type)) {
+    float* const shexp_gate = moe.gate_e.data();
+    float* const shexp_up = shexp_gate + shared_ff;
+    LaunchGEMV(view.shexp_gate.data, view.shexp_gate.type, x, shexp_gate,
+               shared_ff, hidden, stream);
+    LaunchGEMV(view.shexp_up.data, view.shexp_up.type, x, shexp_up, shared_ff,
+               hidden, stream);
+    LaunchBatchedSwiGLUActivation(shexp_gate, shexp_up, moe.shexp_act.data(),
+                                  nullptr, shared_ff, stream);
+  } else {
+    LaunchFusedSwiGLUGEMV(view.shexp_gate.data, view.shexp_gate.type,
+                          view.shexp_up.data, view.shexp_up.type, x,
+                          moe.shexp_act.data(), shared_ff, hidden, stream);
+  }
   LaunchGEMV(view.shexp_down.data, view.shexp_down.type, moe.shexp_act.data(),
              moe.shexp_out.data(), hidden, shared_ff, stream);
 
@@ -165,12 +193,27 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       const std::size_t total_k = arena.GetAttentionKvPlaneElements();
       const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
 
-      LaunchFusedQKVProjections(
-          layer.attn_q.data, layer.attn_q.type, layer.attn_k.data,
-          layer.attn_k.type, layer.attn_v.data, layer.attn_v.type,
-          decode_scratch.normed.data(), ssm_scratch.qkv.data(),
-          attention_scratch.k.data(), attention_scratch.v.data(),
-          q_projection_size, kv_size, hidden_size, arena.stream);
+      if (TakesVectorRoute(layer.attn_q.type) ||
+          TakesVectorRoute(layer.attn_k.type) ||
+          TakesVectorRoute(layer.attn_v.type)) {
+        // As for the SSM inputs: match batched decode's one-at-a-time form.
+        LaunchGEMV(layer.attn_q.data, layer.attn_q.type,
+                   decode_scratch.normed.data(), ssm_scratch.qkv.data(),
+                   q_projection_size, hidden_size, arena.stream);
+        LaunchGEMV(layer.attn_k.data, layer.attn_k.type,
+                   decode_scratch.normed.data(), attention_scratch.k.data(),
+                   kv_size, hidden_size, arena.stream);
+        LaunchGEMV(layer.attn_v.data, layer.attn_v.type,
+                   decode_scratch.normed.data(), attention_scratch.v.data(),
+                   kv_size, hidden_size, arena.stream);
+      } else {
+        LaunchFusedQKVProjections(
+            layer.attn_q.data, layer.attn_q.type, layer.attn_k.data,
+            layer.attn_k.type, layer.attn_v.data, layer.attn_v.type,
+            decode_scratch.normed.data(), ssm_scratch.qkv.data(),
+            attention_scratch.k.data(), attention_scratch.v.data(),
+            q_projection_size, kv_size, hidden_size, arena.stream);
+      }
       // De-interleave Q and Gate from attn_q projection
       LaunchUnpackQG(ssm_scratch.qkv.data(), attention_scratch.q.data(),
                      ssm_scratch.gate.data(), config.num_attention_heads,
@@ -256,14 +299,34 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     } else {
       // SSM path
 
-      LaunchFusedSSMInputProjections(
-          layer.attn_qkv.data, layer.attn_qkv.type, layer.attn_gate.data,
-          layer.attn_gate.type, layer.ssm_alpha.data, layer.ssm_alpha.type,
-          layer.ssm_beta.data, layer.ssm_beta.type,
-          decode_scratch.normed.data(), ssm_scratch.qkv.data(),
-          ssm_scratch.gate.data(), ssm_scratch.alpha.data(),
-          ssm_scratch.beta.data(), hidden_size, ssm_qkv_size, ssm_inner_size,
-          time_step_rank, arena.stream);
+      if (TakesVectorRoute(layer.attn_qkv.type) ||
+          TakesVectorRoute(layer.attn_gate.type) ||
+          TakesVectorRoute(layer.ssm_alpha.type) ||
+          TakesVectorRoute(layer.ssm_beta.type)) {
+        // Batched decode projects these one at a time, so plain decode does
+        // too once any of them takes the vector kernel.
+        LaunchGEMV(layer.attn_qkv.data, layer.attn_qkv.type,
+                   decode_scratch.normed.data(), ssm_scratch.qkv.data(),
+                   ssm_qkv_size, hidden_size, arena.stream);
+        LaunchGEMV(layer.attn_gate.data, layer.attn_gate.type,
+                   decode_scratch.normed.data(), ssm_scratch.gate.data(),
+                   ssm_inner_size, hidden_size, arena.stream);
+        LaunchGEMV(layer.ssm_alpha.data, layer.ssm_alpha.type,
+                   decode_scratch.normed.data(), ssm_scratch.alpha.data(),
+                   time_step_rank, hidden_size, arena.stream);
+        LaunchGEMV(layer.ssm_beta.data, layer.ssm_beta.type,
+                   decode_scratch.normed.data(), ssm_scratch.beta.data(),
+                   time_step_rank, hidden_size, arena.stream);
+      } else {
+        LaunchFusedSSMInputProjections(
+            layer.attn_qkv.data, layer.attn_qkv.type, layer.attn_gate.data,
+            layer.attn_gate.type, layer.ssm_alpha.data, layer.ssm_alpha.type,
+            layer.ssm_beta.data, layer.ssm_beta.type,
+            decode_scratch.normed.data(), ssm_scratch.qkv.data(),
+            ssm_scratch.gate.data(), ssm_scratch.alpha.data(),
+            ssm_scratch.beta.data(), hidden_size, ssm_qkv_size, ssm_inner_size,
+            time_step_rank, arena.stream);
+      }
       LaunchSSMConvRecurrence(
           ssm_scratch.qkv.data(),
           static_cast<const float*>(layer.ssm_conv1d.data), recurrent_state,

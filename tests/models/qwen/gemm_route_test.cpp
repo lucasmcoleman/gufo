@@ -279,20 +279,17 @@ void TestRejections() {
   Check(result.rejection == QwenGemmRejection::kMisalignedQuantK,
         "K-quant K=255 rejection");
   Check(Route(GgmlType::kQ4_K, 1, 256, QwenGemmMode::kHipDecode) ==
-            QwenGemmRoute::kHipQuantDirect,
-        "HIP decode Q4_K direct route");
+            QwenGemmRoute::kHipQuantMmvq,
+        "HIP decode Q4_K vector route");
   Check(Route(GgmlType::kQ4_K, 3072, 8192, QwenGemmMode::kHipDecode) ==
             QwenGemmRoute::kHipQuantMmvq,
         "HIP decode Q4_K 8192 to 3072 vector route");
   Check(Route(GgmlType::kQ4_K, 3072, 8192, QwenGemmMode::kHipMtp) ==
             QwenGemmRoute::kHipQuantDirect,
         "MTP Q4_K 8192 to 3072 direct route");
-  Check(Route(GgmlType::kQ4_K, 3072, 4096, QwenGemmMode::kHipDecode) ==
-            QwenGemmRoute::kHipQuantDirect,
-        "HIP decode Q4_K other K direct route");
-  Check(Route(GgmlType::kQ4_K, 5120, 8192, QwenGemmMode::kHipDecode) ==
-            QwenGemmRoute::kHipQuantDirect,
-        "HIP decode Q4_K other M direct route");
+  Check(Route(GgmlType::kQ4_K, 1024, 3072, QwenGemmMode::kHipDecode) ==
+            QwenGemmRoute::kHipQuantMmvq,
+        "HIP decode Q4_K other shape vector route");
   Check(Route(GgmlType::kQ5_K, 3072, 8192, QwenGemmMode::kHipDecode) ==
             QwenGemmRoute::kHipQuantDirect,
         "HIP decode Q5_K 8192 to 3072 direct route");
