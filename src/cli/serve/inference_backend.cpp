@@ -3552,12 +3552,6 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
     }
-    // A server loads once, so warm the request path before the first request
-    // instead of making that request pay for it.
-    Logger::Info("loader",
-                 "event=load_phase phase=warm_up " + Logger::MemoryStatus());
-    (void)complete("Hello", 4, sampling::SamplingConfig{}, {}, {}, "warm-up",
-                   {}, /*cache_prompt=*/false);
     return true;
   } catch (const std::exception& exception) {
     SetError(error, exception.what());
