@@ -1,0 +1,501 @@
+#ifndef GUFO_TESTS_MODELS_LAGUNA_DFLASH_GPU_HPP_
+#define GUFO_TESTS_MODELS_LAGUNA_DFLASH_GPU_HPP_
+
+// Shared pieces of the Laguna DFlash drafter GPU operator tests (phase 6c):
+// tiny random drafters with Q4_K/Q6_K projections and unequal dimensions on a
+// tiny random target (embedding and head), the device context, tap and
+// activation capture, the CPU oracle (reference::DFlashModel) with all of its
+// taps, and the per-operator checks. See dflash_ops_test.cpp.
+
+#include <hip/hip_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <random>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "src/models/laguna/dflash.hpp"
+#include "src/models/laguna/dflash_reference.hpp"
+#include "src/models/laguna/kernels/dflash_ops.hpp"
+#include "tests/models/laguna/attention_gpu.hpp"
+
+namespace gufo::testing::laguna {
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+struct DrafterShape {
+  const char* name;
+  std::uint32_t hidden;
+  std::uint32_t ffn;
+  std::uint32_t heads;
+  std::uint32_t kv_heads;
+  std::uint32_t taps;
+  std::uint32_t window;
+  std::uint32_t layers;
+  std::uint32_t vocab;
+  float theta;
+};
+
+/// The real drafter's head geometry (GQA 9, head 128, window 512, theta
+/// 500000, block 16) at a small hidden size; three taps, three layers.
+inline constexpr DrafterShape kDraftGeom{"geom", 512, 768, 18,   2,
+                                         3,      512, 3,   1000, 500000.0F};
+/// Unequal everything else: hidden 768, GQA 4 over 3 KV heads, FFN smaller
+/// than hidden, two taps, a short window, another theta.
+inline constexpr DrafterShape kDraftOdd{"odd", 768, 512, 12,  3,
+                                        2,     37,  2,   777, 10000.0F};
+
+/// A random drafter (every tensor random; the last layer carries Q6_K attn_v
+/// and ffn_down as layers 2 and 5 of the real file do) plus a tiny target that
+/// supplies token_embd (Q8_0) and the head (Q6_K).
+class TinyDrafter {
+public:
+  TinyDrafter(const DrafterShape& shape, std::uint64_t seed)
+      : rng_(seed), shape_(shape) {
+    ml::DFlashConfig& c = drafter.config;
+    c.num_layers = shape.layers;
+    c.hidden_size = shape.hidden;
+    c.ffn_size = shape.ffn;
+    c.vocab_size = shape.vocab;
+    c.context_length = 1U << 20;
+    c.rms_eps = 1e-6F;
+    c.num_heads = shape.heads;
+    c.num_kv_heads = shape.kv_heads;
+    c.head_dim = 128;
+    c.sliding_window = shape.window;
+    c.rope_theta = shape.theta;
+    c.rotary_dim = 128;
+    c.block_size = 16;
+    c.mask_token_id = 12;
+    for (std::uint32_t k = 0; k < shape.taps; ++k) {
+      c.target_layers.push_back(2 + 7 * k);
+    }
+    const std::size_t H = shape.hidden;
+    const std::size_t taps = shape.taps;
+    const std::size_t qd = std::size_t{shape.heads} * 128;
+    const std::size_t kvd = std::size_t{shape.kv_heads} * 128;
+    aux_ = RandomUniformF32(H * taps, 0.4F, 1.6F, rng_);
+    aux_.cols = H;
+    aux_.rows = taps;
+    fc_ = RandomQuant(GgmlType::kQ4_K, taps * H, H, 1, rng_);
+    enc_norm_ = RandomUniformF32(H, 0.5F, 1.5F, rng_);
+    out_norm_ = RandomUniformF32(H, 0.5F, 1.5F, rng_);
+    drafter.aux_norm = Ref(aux_, "enc.aux_norm.weight");
+    drafter.fc = Ref(fc_, "fc.weight");
+    drafter.enc_output_norm = Ref(enc_norm_, "enc.output_norm.weight");
+    drafter.output_norm = Ref(out_norm_, "output_norm.weight");
+    mats_.resize(shape.layers);
+    for (std::uint32_t il = 0; il < shape.layers; ++il) {
+      const bool q6 = il + 1 == shape.layers;
+      const GgmlType vt = q6 ? GgmlType::kQ6_K : GgmlType::kQ4_K;
+      Mats& m = mats_[il];
+      m.attn_norm = RandomUniformF32(H, 0.5F, 1.5F, rng_);
+      m.q = RandomQuant(GgmlType::kQ4_K, H, qd, 1, rng_);
+      m.k = RandomQuant(GgmlType::kQ4_K, H, kvd, 1, rng_);
+      m.v = RandomQuant(vt, H, kvd, 1, rng_);
+      m.o = RandomQuant(GgmlType::kQ4_K, qd, H, 1, rng_);
+      m.gate = RandomQuant(GgmlType::kQ4_K, H, shape.heads, 1, rng_);
+      m.qn = RandomUniformF32(128, 0.5F, 1.5F, rng_);
+      m.kn = RandomUniformF32(128, 0.5F, 1.5F, rng_);
+      m.ffn_norm = RandomUniformF32(H, 0.5F, 1.5F, rng_);
+      m.fg = RandomQuant(GgmlType::kQ4_K, H, shape.ffn, 1, rng_);
+      m.fu = RandomQuant(GgmlType::kQ4_K, H, shape.ffn, 1, rng_);
+      m.fd = RandomQuant(vt, shape.ffn, H, 1, rng_);
+      for (HostMat* f : {&m.attn_norm, &m.qn, &m.kn, &m.ffn_norm}) {
+        f->rows = 1;
+      }
+      const std::string p = "blk." + std::to_string(il) + ".";
+      ml::DFlashLayerWeights l;
+      l.attn_norm = Ref(m.attn_norm, p + "attn_norm.weight");
+      l.attn_q = Ref(m.q, p + "attn_q.weight");
+      l.attn_k = Ref(m.k, p + "attn_k.weight");
+      l.attn_v = Ref(m.v, p + "attn_v.weight");
+      l.attn_output = Ref(m.o, p + "attn_output.weight");
+      l.attn_q_norm = Ref(m.qn, p + "attn_q_norm.weight");
+      l.attn_k_norm = Ref(m.kn, p + "attn_k_norm.weight");
+      l.attn_gate = Ref(m.gate, p + "attn_gate.weight");
+      l.ffn_norm = Ref(m.ffn_norm, p + "ffn_norm.weight");
+      l.ffn_gate = Ref(m.fg, p + "ffn_gate.weight");
+      l.ffn_up = Ref(m.fu, p + "ffn_up.weight");
+      l.ffn_down = Ref(m.fd, p + "ffn_down.weight");
+      drafter.layers.push_back(l);
+    }
+    // Target: embeddings of unit-ish scale, a Q6_K head.
+    embd_ = RandomQuant(GgmlType::kQ8_0, H, shape.vocab, 1, rng_);
+    {
+      // Q8_0 scales sized for weights; embeddings want O(1) values.
+      std::uniform_real_distribution<float> d(0.006F, 0.012F);
+      for (std::size_t b = 0; b < embd_.bytes.size(); b += 34) {
+        const std::uint16_t bits = HalfBitsOf(d(rng_));
+        std::memcpy(embd_.bytes.data() + b, &bits, 2);
+      }
+    }
+    head_ = RandomQuant(GgmlType::kQ6_K, H, shape.vocab, 1, rng_);
+    target.config.hidden_size = shape.hidden;
+    target.config.vocab_size = shape.vocab;
+    target.token_embd = Ref(embd_, "token_embd.weight");
+    target.output = Ref(head_, "output.weight");
+  }
+  TinyDrafter(const TinyDrafter&) = delete;
+  TinyDrafter& operator=(const TinyDrafter&) = delete;
+
+  ml::DFlashWeights drafter;
+  ml::ModelWeights target;
+  [[nodiscard]] const DrafterShape& shape() const { return shape_; }
+  [[nodiscard]] std::mt19937_64& rng() { return rng_; }
+  [[nodiscard]] const ml::DFlashConfig& config() const {
+    return drafter.config;
+  }
+
+private:
+  struct Mats {
+    HostMat attn_norm, q, k, v, o, gate, qn, kn, ffn_norm, fg, fu, fd;
+  };
+  ml::TensorRef Ref(const HostMat& m, const std::string& name) {
+    names_.push_back(name);
+    ml::TensorRef t;
+    t.data = m.bytes.data();
+    t.type = m.type;
+    t.cols = m.cols;
+    t.rows = m.rows;
+    t.experts = 1;
+    t.name = names_.back();
+    Require(t.SizeBytes() == m.bytes.size(), "fixture byte size mismatch");
+    return t;
+  }
+  std::mt19937_64 rng_;
+  DrafterShape shape_;
+  HostMat aux_, fc_, enc_norm_, out_norm_, embd_, head_;
+  std::vector<Mats> mats_;
+  std::deque<std::string> names_;
+};
+
+/// Context features like the target's taps: per tap a different scale (and
+/// row-dependent scales up to 1e4, as attention-sink rows reach), plus
+/// outlier channels.
+inline std::vector<float> RandomFeatures(std::size_t rows, std::size_t taps,
+                                         std::size_t hidden,
+                                         std::mt19937_64& rng) {
+  std::normal_distribution<float> dist(0.0F, 1.0F);
+  std::vector<float> f(rows * taps * hidden);
+  for (std::size_t t = 0; t < rows; ++t) {
+    const float row_scale = t % 7 == 3 ? 1e4F : 1.0F + 0.1F * (t % 5);
+    for (std::size_t k = 0; k < taps; ++k) {
+      const float scale = row_scale * (0.5F + 1.7F * k);
+      for (std::size_t i = 0; i < hidden; ++i) {
+        float v = dist(rng) * scale;
+        if (i % 67 == 11 + k) {
+          v *= 8.0F;
+        }
+        f[(t * taps + k) * hidden + i] = v;
+      }
+    }
+  }
+  return f;
+}
+
+// ---------------------------------------------------------------------------
+// Device context and taps
+// ---------------------------------------------------------------------------
+
+class DrafterCtx {
+public:
+  explicit DrafterCtx(const ml::DFlashWeights& w) {
+    CheckHip(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+             "stream");
+    ops_ = std::make_unique<gpu::DFlashOps>(stream_);
+    std::string error;
+    auto up = gpu::DeviceDrafter::Upload(w, &error);
+    Require(up.has_value(), "drafter upload: " + error);
+    device_ = std::move(*up);
+  }
+  ~DrafterCtx() {
+    ops_.reset();
+    (void)hipStreamSynchronize(stream_);
+    qfn_mmq_release_stream(stream_);
+    (void)hipStreamDestroy(stream_);
+  }
+  DrafterCtx(const DrafterCtx&) = delete;
+  DrafterCtx& operator=(const DrafterCtx&) = delete;
+  [[nodiscard]] hipStream_t stream() const { return stream_; }
+  [[nodiscard]] gpu::DFlashOps& ops() { return *ops_; }
+  [[nodiscard]] const gpu::DrafterWeights& weights() const {
+    return device_.weights();
+  }
+
+private:
+  hipStream_t stream_{};
+  std::unique_ptr<gpu::DFlashOps> ops_;
+  gpu::DeviceDrafter device_;
+};
+
+/// Installs a tap on `ops` that copies every stage to `taps` and files the
+/// activation buffers qfn_mmq quantized since the previous stage under the
+/// stage (so a projection's capture is filed under the stage it emits right
+/// after itself). Removed on destruction.
+class TapScope {
+public:
+  TapScope(gpu::DFlashOps& ops, Taps* taps) : ops_(ops) {
+    qfn_mmq_set_activation_capture(OnActivationCapture, taps);
+    ops.SetTap([taps](std::string_view name, const float* device,
+                      std::size_t count) {
+      const std::string key(name);
+      taps->f32[key] = device != nullptr && count != 0 ? ToHost(device, count)
+                                                       : std::vector<float>{};
+      auto& filed = taps->captures[key];
+      for (auto& c : taps->pending) {
+        filed.push_back(std::move(c));
+      }
+      taps->pending.clear();
+    });
+  }
+  ~TapScope() {
+    ops_.SetTap({});
+    qfn_mmq_set_activation_capture(nullptr, nullptr);
+  }
+  TapScope(const TapScope&) = delete;
+  TapScope& operator=(const TapScope&) = delete;
+
+private:
+  gpu::DFlashOps& ops_;
+};
+
+// ---------------------------------------------------------------------------
+// Oracle
+// ---------------------------------------------------------------------------
+
+struct OracleTaps {
+  std::map<std::string, std::vector<float>> f32;
+  std::vector<float> logits;
+  const std::vector<float>& F(const std::string& name) const {
+    const auto it = f32.find(name);
+    Require(it != f32.end(), "missing oracle tap " + name);
+    return it->second;
+  }
+};
+
+/// The oracle in activation mode `mode`, with F16 K/V (the GPU cache's) unless
+/// `mode` is kNone (the F32 reference, whose distance from the GPU is the
+/// expected quantization noise).
+inline ref::Options OracleOptions(ref::ActivationQuant mode) {
+  ref::Options o;
+  o.activation_quant = mode;
+  o.round_kv_f16 = mode != ref::ActivationQuant::kNone;
+  return o;
+}
+
+inline OracleTaps RunDrafterOracle(const TinyDrafter& fx,
+                                   const std::vector<float>& features,
+                                   const std::vector<std::int32_t>& ctx_pos,
+                                   const std::vector<std::int32_t>& block,
+                                   std::int32_t block_pos,
+                                   ref::ActivationQuant mode) {
+  const ref::DFlashModel model(fx.drafter, fx.target, OracleOptions(mode));
+  ref::DFlashInputs in;
+  in.features = features;
+  in.context_positions = ctx_pos;
+  in.block_tokens = block;
+  in.block_position = block_pos;
+  OracleTaps out;
+  out.logits = model.Forward(in, [&](const ref::Tap& t) {
+    const auto* p = static_cast<const float*>(t.data);
+    out.f32[std::string(t.name)] = std::vector<float>(p, p + t.Count());
+  });
+  return out;
+}
+
+inline std::vector<std::int32_t> Iota(std::int32_t begin, std::size_t n) {
+  std::vector<std::int32_t> v(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    v[i] = begin + static_cast<std::int32_t>(i);
+  }
+  return v;
+}
+
+/// [anchor, MASK x (B - 1)].
+inline std::vector<std::int32_t> BlockTokens(std::int32_t anchor,
+                                             std::uint32_t B,
+                                             std::int32_t mask) {
+  std::vector<std::int32_t> b(B, mask);
+  b[0] = anchor;
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// Checks
+// ---------------------------------------------------------------------------
+
+/// Decoded captures of one stage, each validated for the expected layout.
+inline std::vector<QuantRows> StageCaptures(const Taps& taps,
+                                            const std::string& stage,
+                                            std::size_t count, GgmlType type,
+                                            bool vector,
+                                            const std::string& label) {
+  const auto& list = taps.C(stage);
+  std::ostringstream m;
+  m << label << ": stage " << stage << " captured " << list.size()
+    << " activation buffers, expected " << count;
+  Require(list.size() == count, m.str());
+  std::vector<QuantRows> out;
+  for (const Capture& c : list) {
+    Require(c.layout == ExpectedLayout(type, vector),
+            label + ": stage " + stage + " read " + LayoutName(c.layout) +
+                " activations, expected " +
+                LayoutName(ExpectedLayout(type, vector)));
+    out.push_back(DecodeCapture(c));
+  }
+  return out;
+}
+
+/// Worst projection-stage measurements of a run.
+struct ProjStats {
+  double over_rms{0};
+  double over_bound{0};
+  std::size_t boundary_codes{0};
+  std::size_t stages{0};
+  void Add(const StageStats& s) {
+    over_rms = std::max(over_rms, s.max_over_rms);
+    over_bound = std::max(over_bound, s.max_over_bound);
+    boundary_codes += s.quant.boundary_codes;
+    ++stages;
+  }
+};
+
+/// One projection stage against its captured activations: the capture is
+/// validated against the float input `in` ([rows][w.cols]) and its exact
+/// product must match the GPU output within the float accumulation bound
+/// (CheckCapturedProjection). Throws otherwise.
+inline void CheckStage(const std::string& label, const std::string& stage,
+                       const ml::TensorRef& w, const std::vector<float>& in,
+                       std::size_t rows, const std::vector<float>& gpu_out,
+                       const QuantRows& capture, ProjStats* stats) {
+  const std::vector<std::int32_t> zeros(rows, 0);
+  const StageStats s =
+      CheckCapturedProjection(w, zeros, in, rows, gpu_out, capture);
+  if (s.quant.violations != 0) {
+    Require(false, label + ": stage " + stage +
+                       " captured activations fail validation (" +
+                       std::to_string(s.quant.violations) +
+                       " blocks): " + s.quant.first);
+  }
+  if (s.unexplained != 0) {
+    std::ostringstream m;
+    m << label << ": stage " << stage << " has " << s.unexplained
+      << " outputs beyond the accumulation bound (worst " << s.max_over_bound
+      << " of the bound, " << s.max_over_rms << " of rms); first: " << s.first;
+    Require(false, m.str());
+  }
+  if (stats != nullptr) {
+    stats->Add(s);
+  }
+}
+
+/// Every row of `x` ([rows][n]) RMS-normalized with weight row (r % w_rows) of
+/// `weight`, the oracle's RmsNormVector.
+inline std::vector<float> NormRows(const std::vector<float>& x, std::size_t n,
+                                   const float* weight, std::size_t w_rows,
+                                   float eps) {
+  std::vector<float> y(x.size());
+  for (std::size_t r = 0; r < x.size() / n; ++r) {
+    ref::RmsNormVector(x.data() + r * n, weight + (r % w_rows) * n, n, eps,
+                       y.data() + r * n);
+  }
+  return y;
+}
+
+inline std::vector<float> Values(const ml::TensorRef& t) {
+  return ref::DequantizeTensor(t);
+}
+
+/// Relative closeness of a norm output computed by two implementations of
+/// the same formula (double sum, one float rounding per product): 2e-6 of the
+/// element plus 1e-6 of the rms covers one ulp of the shared scale.
+inline void CheckNorm(const std::string& what, const std::vector<float>& got,
+                      const std::vector<float>& want, double* worst) {
+  ExpectRelNear(got, want, 2e-6, 1e-6 * Rms(want), worst, what);
+}
+
+struct EncoderReport {
+  std::string label;
+  double aux_rel{0};
+  double norm_rel{0};
+  ProjStats proj;
+  double e2e_over_rms{0};  ///< GPU fused vs the oracle in the same mode
+  double q8_noise{0};      ///< GPU fused vs the F32 oracle
+};
+
+/// Checks one encoder run (taps of a tapped run, `fused` its output) stage by
+/// stage and end to end against the oracle. `features` are what the oracle
+/// is given (a mutated GPU input must therefore fail). Throws on any failure.
+inline EncoderReport CheckEncoder(const std::string& label,
+                                  const TinyDrafter& fx,
+                                  const std::vector<float>& features,
+                                  std::uint32_t T, bool vector,
+                                  const Taps& taps,
+                                  const std::vector<float>& fused) {
+  EncoderReport rep;
+  rep.label = label;
+  const ml::DFlashConfig& c = fx.config();
+  const std::size_t H = c.hidden_size;
+  const std::size_t width = c.fused_input_width();
+  const auto aux_w = Values(fx.drafter.aux_norm);
+  const auto aux_want =
+      NormRows(features, H, aux_w.data(), c.tap_count(), c.rms_eps);
+  const auto& aux = taps.F("enc_aux_norm");
+  Require(aux.size() == T * width, label + ": enc_aux_norm size");
+  CheckNorm(label + " enc_aux_norm", aux, aux_want, &rep.aux_rel);
+  const auto& fc_out = taps.F("fc_out");
+  const auto caps =
+      StageCaptures(taps, "fc_out", 1, fx.drafter.fc.type, vector, label);
+  CheckStage(label, "fc_out", fx.drafter.fc, aux, T, fc_out, caps[0],
+             &rep.proj);
+  const auto enc_w = Values(fx.drafter.enc_output_norm);
+  CheckNorm(label + " enc_norm_out", taps.F("enc_norm_out"),
+            NormRows(fc_out, H, enc_w.data(), 1, c.rms_eps), &rep.norm_rel);
+  Require(BitIdentical(taps.F("enc_norm_out"), fused),
+          label + ": output differs from the enc_norm_out tap");
+  // End to end against DFlashModel itself (its encoder taps), in the GPU's
+  // activation mode, and the F32 oracle for the quantization noise.
+  const auto pos = Iota(0, T);
+  const auto block =
+      BlockTokens(1, 2, static_cast<std::int32_t>(c.mask_token_id));
+  const ref::ActivationQuant mode = ModeFor(vector);
+  const OracleTaps want = RunDrafterOracle(fx, features, pos, block,
+                                           static_cast<std::int32_t>(T), mode);
+  const OracleTaps exact =
+      RunDrafterOracle(fx, features, pos, block, static_cast<std::int32_t>(T),
+                       ref::ActivationQuant::kNone);
+  rep.e2e_over_rms = Compare(fused, want.F("enc_norm_out")).max_over_rms;
+  rep.q8_noise = Compare(fused, exact.F("enc_norm_out")).max_over_rms;
+  // The two sides quantize the same aux rows (equal to float noise), so they
+  // differ only by an occasional code flip at a rounding tie and by the
+  // summation order; that must stay far below the quantization noise itself.
+  Require(rep.e2e_over_rms <= 0.1 * rep.q8_noise && rep.e2e_over_rms <= 5e-3,
+          label + ": encoder output differs from the oracle by " +
+              std::to_string(rep.e2e_over_rms) + " of rms (Q8 noise " +
+              std::to_string(rep.q8_noise) + ")");
+  return rep;
+}
+
+inline void PrintEncoder(const EncoderReport& r) {
+  std::cout << std::setprecision(3) << std::scientific << "  " << r.label
+            << ": aux " << r.aux_rel << ", fc " << r.proj.over_rms
+            << " of rms (" << r.proj.over_bound << " of bound, boundary codes "
+            << r.proj.boundary_codes << "), norm " << r.norm_rel << ", e2e "
+            << r.e2e_over_rms << " vs Q8 noise " << r.q8_noise
+            << std::defaultfloat << "\n";
+}
+
+}  // namespace gufo::testing::laguna
+
+#endif  // GUFO_TESTS_MODELS_LAGUNA_DFLASH_GPU_HPP_

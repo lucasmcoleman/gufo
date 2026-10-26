@@ -1,7 +1,8 @@
 # Laguna-S-2.1 model package: configuration, weight index, tokenizer, the
 # F32/Q8-aware reference forward (the oracle) and, with HIP, the GPU FFN
 # operators (phase 3a), the attention operator (phase 3b), the
-# full-model executor (phase 4) and the serving engine (phase 5).
+# full-model executor (phase 4), the serving engine (phase 5) and the DFlash
+# drafter's GPU operators (phase 6c).
 # The BPE engine comes from the Qwen tokenizer in gufo_core.
 add_library(gufo_laguna STATIC
   budget.cpp
@@ -23,6 +24,7 @@ if (ENGINE_ENABLE_HIP)
   set(LAGUNA_HIP_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ffn.hip.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/attention.hip.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/dflash_ops.hip.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/device_model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/executor.hip.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/engine.cpp)

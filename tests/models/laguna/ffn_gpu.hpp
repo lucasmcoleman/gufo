@@ -104,6 +104,11 @@ inline HostMat RandomQuant(GgmlType type, std::size_t cols, std::size_t rows,
       d_lo = 6e-5F;
       d_hi = 1e-4F;
       break;
+    case GgmlType::kQ4_K:
+      block_bytes = 144;
+      d_lo = 1.2e-4F;
+      d_hi = 2e-4F;
+      break;
     case GgmlType::kIQ4_XS:
       block_bytes = 136;
       d_lo = 3e-5F;
@@ -145,6 +150,10 @@ inline HostMat RandomQuant(GgmlType type, std::size_t cols, std::size_t rows,
       case GgmlType::kQ5_K:
         put_half(blk, d);
         put_half(blk + 2, d * 15.5F);
+        break;
+      case GgmlType::kQ4_K:  // codes 0..15: dmin * m centres them
+        put_half(blk, d);
+        put_half(blk + 2, d * 7.5F);
         break;
       case GgmlType::kIQ4_XS:
         put_half(blk, d);
