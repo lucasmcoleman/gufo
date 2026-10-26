@@ -199,6 +199,27 @@ void GqaAttention(const float* q, const float* k, const float* v,
                   std::uint32_t kv_heads, std::uint32_t head_dim,
                   std::uint32_t window, float scale, float* out);
 
+/// GqaAttention with explicit absolute positions: query row i sits at
+/// `q_positions[i]`, key row j at `k_positions[j]`, and key j is visible from
+/// query i iff k_pos <= q_pos and (window == 0 or q_pos - k_pos < window).
+/// q is [Q][heads*hd], k and v are [K][kv_heads*hd]; the keys need not be
+/// sorted. A query with no visible key yields zeros. GqaAttention is this with
+/// positions 0..T-1 for both.
+void GqaAttentionAt(const float* q, std::span<const std::int32_t> q_positions,
+                    const float* k, const float* v,
+                    std::span<const std::int32_t> k_positions,
+                    std::uint32_t heads, std::uint32_t kv_heads,
+                    std::uint32_t head_dim, std::uint32_t window, float scale,
+                    float* out);
+
+/// The oracle's RMSNorm row (double sum, float scale) times `weight`.
+void RmsNormVector(const float* x, const float* weight, std::size_t n,
+                   float eps, float* y);
+/// A whole tensor dequantized to F32.
+[[nodiscard]] std::vector<float> DequantizeTensor(const TensorRef& t);
+/// log(1 + exp(x)), identity above 20, as llama.cpp's softplus.
+[[nodiscard]] float SoftplusF32(float x);
+
 /// Routing of one token. `probs` and `weights` are in selection order.
 struct Routing {
   std::vector<std::uint32_t> ids;
@@ -256,6 +277,25 @@ private:
   const ModelWeights& weights_;
   Options options_;
 };
+
+/// Residual-stream rows of selected target layers, for the DFlash drafter.
+struct TargetTaps {
+  std::vector<std::uint32_t> layers;  ///< Zero-based layers whose OUTPUT.
+  std::size_t hidden_size{0};
+  /// [T][layers.size() * hidden]: for each token the taps concatenated in
+  /// `layers` order, tap k at offset k * hidden (the drafter's input layout).
+  std::vector<float> features;
+  std::vector<float> logits;  ///< The same forward's result_output.
+};
+
+/// Runs `model` over `tokens` and gathers the `l_out-N` tap (the residual
+/// stream after the residual add of zero-based layer N) for each entry of
+/// `output_layers`. For the Laguna drafter pass DFlashConfig::tap_layer(i) for
+/// every tap, i.e. 1, 10, 19, 29, 38, 47; layer 47 (the last) is the stream
+/// before the final norm. Throws when a layer has no tap.
+[[nodiscard]] TargetTaps ForwardWithTaps(
+    const Model& model, std::span<const std::int32_t> tokens,
+    std::span<const std::uint32_t> output_layers);
 
 }  // namespace gufo::models::laguna::reference
 

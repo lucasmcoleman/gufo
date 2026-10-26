@@ -37,11 +37,17 @@ add_dependencies(laguna_tests laguna_oracle)
 # reads the real drafter GGUF header (and the target's, for the pairing) and
 # skips (status 77) without them; a skip verifies nothing.
 add_laguna_test(dflash_contract gufo_laguna "cpu")
+# Oracle for the drafter forward on tiny random models (no model file).
+add_laguna_test(dflash_reference gufo_laguna "cpu")
 
 foreach(name IN ITEMS config weights tokenizer_golden dflash)
   add_laguna_test(${name} gufo_laguna "cpu;external-model")
   set_tests_properties(laguna.${name} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
+# Opt-in (GUFO_LAGUNA_DFLASH_REAL=1): real drafter on CPU, taps from the
+# 74 GB target's CPU oracle. Skips (77) by default and below 90 GiB MemAvailable.
+add_laguna_test(dflash_real_smoke gufo_laguna "cpu;external-model;opt-in")
+set_tests_properties(laguna.dflash_real_smoke PROPERTIES SKIP_RETURN_CODE 77)
 add_laguna_test(chat_template_tokens gufo_laguna "cpu;external-model")
 set_tests_properties(laguna.chat_template_tokens PROPERTIES SKIP_RETURN_CODE 77)
 target_compile_definitions(laguna_chat_template_tokens_test PRIVATE

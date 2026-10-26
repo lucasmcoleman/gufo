@@ -331,3 +331,31 @@ say the drafter can pay.
   moved out of `weights.cpp` unchanged so the two indexes share them.
 - Tests `laguna.dflash_contract` (model-free) and `laguna.dflash` (real header,
   exit 77 without the file).
+
+## What phase 6b added (2026-10-26, CPU only, no GPU used)
+
+- `src/models/laguna/dflash_reference.{hpp,cpp}`: `reference::DFlashModel`,
+  the drafter forward in F32 (or the target oracle's activation-quant and F16
+  K/V modes), built on the target oracle's helpers. `reference::ForwardWithTaps`
+  (in `reference.*`) gathers the `l_out-N` rows of chosen target layers
+  (1, 10, 19, 29, 38, 47 = `DFlashConfig::tap_layer(i)`), and
+  `GqaAttentionAt` is the oracle's attention with explicit positions.
+- Tests: `laguna.dflash_reference` (tiny random models with unequal dimensions
+  against an independent naive double implementation: window edge, context and
+  block positions, in-block causality, tap names, tap-index convention with a
+  tap one layer early failing), and the opt-in `laguna.dflash_real_smoke`
+  (`GUFO_LAGUNA_DFLASH_REAL=1`, needs MemAvailable over 90 GiB).
+- 6b-ref: `tests/models/laguna/fork_compare/` (CPU-only build of the fork at
+  06f8cebd7 under `/server/staging/laguna/dflash-ref/build-cpu`). On the real
+  drafter and an 8-token prompt the fork's encoder output matches the oracle
+  to 1.2e-6 relative RMS when the oracle uses the CPU activation quantization,
+  and the block Q, K, V and gate taps of layer 0 to 4e-7. The first
+  difference is the attention output of layer 0 (3e-4, uniform over the 16
+  rows, so a rounding effect, not a mask or position fault), which the
+  quantized projections then amplify to 1 to 5 percent on the draft logits.
+  Top-1 of the 15 drafts agrees at 14 of 15 positions (position 14: fork 350,
+  oracle 81; not examined further). Not yet explained: the 3e-4
+  attention difference (not the F16 Q conversion; flash-attention
+  accumulation in the fork is the suspect). One prompt only, so this confirms
+  the graph (tap convention, per-tap norm, K/V injection, mask, gate) and
+  not the acceptance rate.

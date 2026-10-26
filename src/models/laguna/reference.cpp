@@ -325,6 +325,19 @@ void MatMulRows(const TensorRef& w, std::uint64_t expert, const float* x,
   MatMul(w, expert, x, n, y, options);
 }
 
+void RmsNormVector(const float* x, const float* weight, std::size_t n,
+                   float eps, float* y) {
+  RmsNormRow(x, weight, n, eps, y);
+}
+
+std::vector<float> DequantizeTensor(const TensorRef& t) {
+  return LoadF32(t);
+}
+
+float SoftplusF32(float x) {
+  return Softplus(x);
+}
+
 float RoundToF16(float value) noexcept {
   return quant::Fp16ToFloat(FloatToHalfBits(value));
 }
@@ -581,10 +594,12 @@ void ApplyRope(float* x, std::span<const std::int32_t> positions,
   }
 }
 
-void GqaAttention(const float* q, const float* k, const float* v,
-                  std::size_t tokens, std::uint32_t heads,
-                  std::uint32_t kv_heads, std::uint32_t head_dim,
-                  std::uint32_t window, float scale, float* out) {
+void GqaAttentionAt(const float* q, std::span<const std::int32_t> q_positions,
+                    const float* k, const float* v,
+                    std::span<const std::int32_t> k_positions,
+                    std::uint32_t heads, std::uint32_t kv_heads,
+                    std::uint32_t head_dim, std::uint32_t window, float scale,
+                    float* out) {
   if (kv_heads == 0 || heads % kv_heads != 0) {
     throw std::invalid_argument(
         "laguna oracle: heads not a multiple of kv heads");
@@ -593,39 +608,61 @@ void GqaAttention(const float* q, const float* k, const float* v,
   const std::size_t q_row = static_cast<std::size_t>(heads) * head_dim;
   const std::size_t kv_row = static_cast<std::size_t>(kv_heads) * head_dim;
   std::vector<double> score;
-  for (std::size_t p = 0; p < tokens; ++p) {
-    // Visible keys j: j <= p and p - j < window (llama.cpp SWA_TYPE_STANDARD).
-    const std::size_t first =
-        window == 0 || p + 1 <= window ? 0 : p + 1 - window;
-    score.assign(p - first + 1, 0.0);
+  std::vector<std::size_t> visible;
+  for (std::size_t p = 0; p < q_positions.size(); ++p) {
+    // Visible keys: k_pos <= q_pos and q_pos - k_pos < window
+    // (llama.cpp SWA_TYPE_STANDARD), in key order.
+    const std::int64_t qp = q_positions[p];
+    visible.clear();
+    for (std::size_t j = 0; j < k_positions.size(); ++j) {
+      const std::int64_t kp = k_positions[j];
+      if (kp <= qp && (window == 0 || qp - kp < window)) {
+        visible.push_back(j);
+      }
+    }
+    score.assign(visible.size(), 0.0);
     for (std::uint32_t h = 0; h < heads; ++h) {
+      float* oh = out + p * q_row + static_cast<std::size_t>(h) * head_dim;
+      if (visible.empty()) {
+        std::fill(oh, oh + head_dim, 0.0F);
+        continue;
+      }
       const float* qh = q + p * q_row + static_cast<std::size_t>(h) * head_dim;
       const std::size_t kvh = h / group;
       double top = -std::numeric_limits<double>::infinity();
-      for (std::size_t j = first; j <= p; ++j) {
-        const float* kj = k + j * kv_row + kvh * head_dim;
+      for (std::size_t i = 0; i < visible.size(); ++i) {
+        const float* kj = k + visible[i] * kv_row + kvh * head_dim;
         double dot = 0.0;
         for (std::uint32_t d = 0; d < head_dim; ++d) {
           dot += static_cast<double>(qh[d]) * kj[d];
         }
-        score[j - first] = dot * scale;
-        top = std::max(top, score[j - first]);
+        score[i] = dot * scale;
+        top = std::max(top, score[i]);
       }
       double denom = 0.0;
       for (double& s : score) {
         s = std::exp(s - top);
         denom += s;
       }
-      float* oh = out + p * q_row + static_cast<std::size_t>(h) * head_dim;
       for (std::uint32_t d = 0; d < head_dim; ++d) {
         double acc = 0.0;
-        for (std::size_t j = first; j <= p; ++j) {
-          acc += score[j - first] * v[j * kv_row + kvh * head_dim + d];
+        for (std::size_t i = 0; i < visible.size(); ++i) {
+          acc += score[i] * v[visible[i] * kv_row + kvh * head_dim + d];
         }
         oh[d] = static_cast<float>(acc / denom);
       }
     }
   }
+}
+
+void GqaAttention(const float* q, const float* k, const float* v,
+                  std::size_t tokens, std::uint32_t heads,
+                  std::uint32_t kv_heads, std::uint32_t head_dim,
+                  std::uint32_t window, float scale, float* out) {
+  std::vector<std::int32_t> positions(tokens);
+  std::iota(positions.begin(), positions.end(), 0);
+  GqaAttentionAt(q, positions, k, v, positions, heads, kv_heads, head_dim,
+                 window, scale, out);
 }
 
 Routing Route(const float* logits, const float* bias, std::uint32_t experts,
@@ -1093,6 +1130,43 @@ std::vector<float> Model::Forward(std::span<const std::int32_t> tokens,
          logits.data(), options_);
   emit_f32("result_output", -1, {weights_.output.rows, rows, 1}, logits);
   return logits;
+}
+
+TargetTaps ForwardWithTaps(const Model& model,
+                           std::span<const std::int32_t> tokens,
+                           std::span<const std::uint32_t> output_layers) {
+  const std::size_t T = tokens.size();
+  TargetTaps out;
+  out.layers.assign(output_layers.begin(), output_layers.end());
+  std::vector<std::vector<float>> found(output_layers.size());
+  std::vector<bool> seen(output_layers.size(), false);
+  std::size_t hidden = 0;
+  out.logits = model.Forward(tokens, [&](const Tap& tap) {
+    for (std::size_t i = 0; i < output_layers.size(); ++i) {
+      if (tap.name == "l_out-" + std::to_string(output_layers[i])) {
+        hidden = tap.ne[0];
+        found[i].assign(static_cast<const float*>(tap.data),
+                        static_cast<const float*>(tap.data) + tap.Count());
+        seen[i] = true;
+      }
+    }
+  });
+  for (std::size_t i = 0; i < output_layers.size(); ++i) {
+    if (!seen[i] || found[i].size() != T * hidden) {
+      throw std::invalid_argument("laguna oracle: no l_out tap for layer " +
+                                  std::to_string(output_layers[i]));
+    }
+  }
+  out.hidden_size = hidden;
+  out.features.resize(T * output_layers.size() * hidden);
+  for (std::size_t t = 0; t < T; ++t) {
+    for (std::size_t i = 0; i < output_layers.size(); ++i) {
+      std::copy_n(
+          found[i].data() + t * hidden, hidden,
+          out.features.data() + (t * output_layers.size() + i) * hidden);
+    }
+  }
+  return out;
 }
 
 }  // namespace gufo::models::laguna::reference
