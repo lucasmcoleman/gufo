@@ -15,7 +15,10 @@ ASSISTANT_OPENING_TOKENS = 16
 # two plus two?", the reasoning-separator and reasoning-budget prompts and the
 # cache-growth BETA turn, with identical prompt token counts, and still
 # reasons on "Compute 123 times 456." (job 961 triage,
-# /server/staging/laguna/p5-real/triage/probe-llama.json). For these
+# /server/staging/laguna/p5-real/triage/probe-llama.json). The same holds for
+# tool-streaming's thinking prompt: from the exact prompt ids gufo renders,
+# llama.cpp's first token is </think> at logprob -0.000 (job 961 tools triage,
+# /server/staging/laguna/p5-real/triage-tools/probe-ids.json). For these
 # families an enabled-thinking reply may have an empty reasoning channel.
 # Everything else stays strict: thinking off must leave reasoning empty, the
 # framing must not reach the text, and answers and replays are unchanged.

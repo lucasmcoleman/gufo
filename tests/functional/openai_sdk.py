@@ -1694,6 +1694,18 @@ def check_native_tools(client, model, checks, vision=False):
         record("responses_image_tool", result.to_dict())
 
 
+# Presets whose model answers the foreign-marker prompt below with the quoted
+# envelope as its own invented call syntax and no native call. Laguna-S-2.1
+# does this in llama.cpp d854d98 on the same GGUF, greedy, both through its
+# chat endpoint and from the exact prompt ids gufo renders: the first token is
+# "<" at logprob -0.012, then `<tool_calls>\n<invoke name="read" ...`, with no
+# <tool_call> (job 961 tools triage,
+# /server/staging/laguna/p5-real/triage-tools/probe-llama.json and
+# probe-ids.json). The admitted-opener property stays strict for them: the
+# quote is text and no foreign dialect becomes a call.
+FOREIGN_ENVELOPE_REPLY_PRESETS = frozenset({"laguna"})
+
+
 def check_tool_edges(client, model, checks, sampling_preset=None):
     """Exercise schema-to-native-to-JSON conversion through the real model."""
     expected = {"n": 42, "b": True, "a": [1], "o": {"x": 2}, "s": "42", "z": None}
@@ -1773,6 +1785,15 @@ def check_tool_edges(client, model, checks, sampling_preset=None):
         # case. Other models may omit it: record that rather than claim it.
         exercised = literal in result["text"]
         assert exercised or sampling_preset != "qwen38", result
+        if (sampling_preset in FOREIGN_ENVELOPE_REPLY_PRESETS and not result["tools"]
+                and result["finish"] == "stop"):
+            assert "<tool_calls>" in result["text"], result
+            assert not any(marker in result["text"] for marker in
+                           ("<tool_call>", "<function=", "</parameter>")), result
+            checks[f"foreign_marker_prose_stream{stream}"] = {
+                **result, "foreign_marker_exercised": exercised,
+                "foreign_envelope_reply": True}
+            continue
         assert result["finish"] == "tool_calls" and len(result["tools"]) == 1, result
         function = result["tools"][0]["function"]
         assert function["name"] == "read", result
@@ -2880,7 +2901,8 @@ def main():
             "reasoning-separator": lambda: check_reasoning_separator(
                 client, args.model, checks, chat_result, args.server_log,
                 args.sampling_preset),
-            "tool-streaming": lambda: check_tool_streaming(client, args.model, checks, chat_result),
+            "tool-streaming": lambda: check_tool_streaming(
+                client, args.model, checks, chat_result, args.sampling_preset),
             "reasoning-budget": lambda: check_reasoning_budget(
                 client, args.model, checks, chat_result),
             "tool-agent": lambda: check_tool_agent(
@@ -2891,7 +2913,8 @@ def main():
             "messages-tools": lambda: check_messages_tools(
                 client, args.model, checks, chat_result),
             "tool-untyped": lambda: check_untyped_agent_tools(
-                client, args.model, checks, chat_result, args.vision, image_content),
+                client, args.model, checks, chat_result, args.vision, image_content,
+                args.sampling_preset),
             "tool-mixed": lambda: check_mixed_tool_schemas(
                 client, args.model, checks, chat_result, args.vision, image_content,
                 args.sampling_preset),

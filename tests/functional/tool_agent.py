@@ -138,7 +138,21 @@ def agent_tools():
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
             "required": ["path"]}}}]
 
-def check_untyped_agent_tools(client, model, checks, chat_result, vision, image_content):
+# Presets whose model may open an explicitly requested call with a one-line
+# acknowledgement. For the typed-neighbor edit request, Laguna-S-2.1's first
+# token is a near tie between "<tool_call>" and "I": llama.cpp d854d98 on the
+# same GGUF writes "I'll make that edit for you." before the call through its
+# chat endpoint, and from the exact prompt ids gufo renders gives
+# <tool_call> -0.622 / I -0.790, against gufo's I -0.643 / <tool_call> -0.763,
+# a gap inside the measured gufo-vs-llama.cpp variability (mean KL 0.025,
+# p99 0.317; job 961 tools triage, /server/staging/laguna/p5-real/triage-tools/
+# probe-llama.json, probe-ids.json, gufo-first-token.txt). The call itself,
+# its arguments, the empty reasoning channel and markup-free text stay strict.
+CALL_PREAMBLE_PRESETS = frozenset({"laguna"})
+
+
+def check_untyped_agent_tools(client, model, checks, chat_result, vision, image_content,
+                              sampling_preset=None):
     """An untyped neighbor must neither switch framing nor erase arguments."""
     def record(name, result):
         checks[name] = result
@@ -151,7 +165,12 @@ def check_untyped_agent_tools(client, model, checks, chat_result, vision, image_
         function = result["tools"][0]["function"]
         assert function["name"] == name, result
         assert json.loads(function["arguments"]) == expected, result
-        assert not result["text"].strip() and not result["reasoning"], result
+        assert not result["reasoning"], result
+        text = result["text"].strip()
+        if sampling_preset in CALL_PREAMBLE_PRESETS:
+            assert "\n" not in text and "<" not in text, result
+        else:
+            assert not text, result
 
     common = dict(model=model, tool_choice="auto", parallel_tool_calls=False,
                   temperature=0, seed=41, max_completion_tokens=128,

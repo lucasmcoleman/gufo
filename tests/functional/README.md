@@ -861,8 +861,8 @@ nix develop -c python3 tests/functional/embedding_images.py \
 
 `laguna_suites.py` is Laguna's opt-in to the shared runner. It selects the
 `laguna` sampling preset and the suites whose assertions hold for it (core and
-RAM-snapshot cache groups; `--group tools` for the tool suites, whose output
-dialect is the JSON fallback), and starts a server on the real GGUF only when
+RAM-snapshot cache groups; `--group tools` for the tool suites, in Laguna's
+native `<arg_key>`/`<arg_value>` call dialect), and starts a server on the real GGUF only when
 the file exists: otherwise it prints `SKIP` and exits 77. Each suite runs under
 the server configuration `impact.json` assigns it, as for the other families:
 `standard` (`--context 32768 --sessions 2`) and `single-session`
@@ -881,9 +881,15 @@ GPU_ADMISSION_LOCK=/server/state/gpu-admission/gpu.lock \
 Laguna thinks adaptively: with thinking on, its prompt opens `<think>` and the
 model may close it at once on a simple prompt, as llama.cpp does with the same
 GGUF. The `laguna` preset is in `ADAPTIVE_THINKING_PRESETS` (`cache_growth.py`),
-so `sampling-defaults`, `reasoning-separator`, `long-context` and `cache-growth`
-accept an empty reasoning channel when thinking is on; thinking off, framing,
-answers and replays stay strict. `batch` needs physical batching at the
+so `sampling-defaults`, `reasoning-separator`, `long-context`, `cache-growth`
+and `tool-streaming` accept an empty reasoning channel when thinking is on;
+thinking off, framing, answers and replays stay strict. Two tool expectations
+follow the same rule, each with its llama.cpp evidence beside the preset set:
+`FOREIGN_ENVELOPE_REPLY_PRESETS` (`openai_sdk.py`; `tool-edges` asks for a
+literal `<tool_calls></tool_calls>` and the model answers in that invented
+syntax instead of calling) and `CALL_PREAMBLE_PRESETS` (`tool_agent.py`;
+`tool-untyped` tolerates a one-line acknowledgement before the requested
+call). `batch` needs physical batching at the
 configured width, which the Laguna runner does not provide yet (serial plan
 only), so it fails visibly.
 

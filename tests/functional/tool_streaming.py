@@ -5,6 +5,7 @@ import time
 
 import openai
 
+from cache_growth import reasoning_mode_matches
 from metrics import validate_tool_events
 
 
@@ -158,7 +159,7 @@ def analyze(api, events, arrivals):
                 fragments=fragments, terminal_ms=arrivals[-1])
 
 
-def check_tool_streaming(client, model, checks, chat_result):
+def check_tool_streaming(client, model, checks, chat_result, sampling_preset=None):
     for api in ("chat", "responses", "messages"):
         for thinking in (False, True):
             body = request(model, api, thinking)
@@ -169,7 +170,9 @@ def check_tool_streaming(client, model, checks, chat_result):
             assert len(result["arguments"]) == 1, result
             assert json.loads(result["arguments"][0]) == EXPECTED, result
             assert not result["content"].strip(), result
-            assert bool(result["reasoning"].strip()) == thinking, result
+            # Adaptive families may close reasoning at once (cache_growth.py).
+            assert reasoning_mode_matches(
+                result["reasoning"].strip(), thinking, sampling_preset), result
             assert len(result["fragments"]) > 3, ("tool arguments were buffered", result)
             assert result["fragments"][0]["ms"] < result["fragments"][-1]["ms"] < result["terminal_ms"], result
 
@@ -225,7 +228,7 @@ def check_tool_streaming(client, model, checks, chat_result):
                 raise AssertionError("no partial argument reached the cancelling client")
         checks[f"tool_streaming_cancel_{thinking}"] = {
             "partial_arguments": received, "reasoning": reasoning}
-        assert bool(reasoning.strip()) == thinking, reasoning
+        assert reasoning_mode_matches(reasoning.strip(), thinking, sampling_preset), reasoning
         resumed = chat_result(client, body, True)
         checks[f"tool_streaming_after_cancel_{thinking}"] = resumed
         assert resumed["finish"] == "tool_calls" and len(resumed["tools"]) == 1, resumed
