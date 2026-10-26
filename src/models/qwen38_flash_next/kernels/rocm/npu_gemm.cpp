@@ -291,6 +291,17 @@ struct NpuGemm::Impl {
     last_error = e.what();
   }
 
+  // Poisons this object from the host thread when a stream callback could not
+  // be enqueued: without it the C buffers would be read without the runs (or
+  // the wait) that fill them, and Healthy() is what makes the caller discard
+  // the batch.
+  void FailLaunch(const char* what) {
+    const std::lock_guard lock(mutex);
+    failed = true;
+    last_error = what;
+    std::fprintf(stderr, "NPU: %s\n", what);
+  }
+
   // Waits for `run` with a bound; a timeout poisons this object instead of
   // blocking the worker (and through it the HIP stream) forever.
   bool WaitRun(xrt::run& run) {
@@ -428,6 +439,12 @@ struct NpuGemm::Impl {
       }
     } catch (const std::exception& e) {
       Fail(e);
+      // Runs launched before the failure may still be writing their C
+      // buffers: keep them alive like timed-out runs instead of destroying
+      // them under the NPU.
+      for (auto& entry : pending) {
+        abandoned.push_back(std::move(entry.first));
+      }
       pending.clear();
     }
     submit_us += std::chrono::duration<double, std::micro>(
@@ -582,6 +599,9 @@ int NpuGemm::NewBuffer(std::size_t bytes, std::string* error) {
       buffer.shared_bo =
           xrt::bo(i.device, host, bytes, XRT_BO_FLAGS_HOST_ONLY, i.group_a);
     }
+    // The worker and the keepalive thread index `buffers` under `mutex`; a
+    // reallocating push_back must not race them.
+    const std::lock_guard lock(i.mutex);
     i.buffers.push_back(std::move(buffer));
   } catch (const std::exception& e) {
     (void)hipHostFree(host);
@@ -624,6 +644,7 @@ bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
       call);
   if (status != hipSuccess) {
     delete call;
+    impl_->FailLaunch("NPU submit could not be enqueued on the stream");
     return false;
   }
   return true;
@@ -635,9 +656,13 @@ void* NpuGemm::Staged(hipStream_t /*stream*/, int id) {
 
 bool NpuGemm::Wait(hipStream_t stream) {
   Trace("wait_host");
-  return hipLaunchHostFunc(
-             stream, [](void* data) { static_cast<Impl*>(data)->WaitNow(); },
-             impl_.get()) == hipSuccess;
+  if (hipLaunchHostFunc(
+          stream, [](void* data) { static_cast<Impl*>(data)->WaitNow(); },
+          impl_.get()) != hipSuccess) {
+    impl_->FailLaunch("NPU wait could not be enqueued on the stream");
+    return false;
+  }
+  return true;
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
