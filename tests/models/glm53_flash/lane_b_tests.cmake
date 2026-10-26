@@ -36,3 +36,13 @@ if (ENGINE_ENABLE_HIP)
   add_glm53_flash_test(expert_vec gufo_glm53_flash "hip;gpu;gfx1151")
   set_tests_properties(glm53_flash.expert_vec PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+if (ENGINE_ENABLE_HIP)
+  # Prefill operator variants of the 2026-10-26 borrow round (KDA low-rank,
+  # multi-row MLA head kernel, router SGEMM), all default off.
+  add_glm53_flash_test(borrow_prefill_ops gufo_glm53_flash "hip;gpu;gfx1151")
+  target_compile_definitions(glm53_flash_borrow_prefill_ops_test PRIVATE
+    GLM53_ROCM_BUILD=1)
+  set_tests_properties(glm53_flash.borrow_prefill_ops PROPERTIES
+    SKIP_RETURN_CODE 77)
+endif()

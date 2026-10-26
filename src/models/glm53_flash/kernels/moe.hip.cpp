@@ -8,10 +8,12 @@
 #include <limits>
 
 #include <optional>
+#include <string_view>
 #include <type_traits>
 
 #include "ds4_mmq.h"
 #include "ds4_pool.h"
+#include "src/models/glm53_flash/kernels/blas.hpp"
 #include "src/models/glm53_flash/kernels/expert_vec.hpp"
 #include "src/models/glm53_flash/kernels/mmq/iq.hpp"
 #include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
@@ -380,6 +382,42 @@ bool Project(const DeviceMatrix& w, const float* x, const std::int32_t* ids,
   }
   return hipGetLastError() == hipSuccess;
 }
+/// GUFO_GLM53_ROUTER_GEMM=sgemm: prefill router logits (F32 [experts x
+/// hidden]) as one hipBLAS SGEMM instead of FloatProjectWave<float>'s
+/// Kahan-compensated wave per output. Plain F32 accumulation, so near-tied
+/// top-8 choices can flip: quality-gated, off by default. Decode (<= 8
+/// tokens) and GUFO_GLM53_EXACT_PREFILL keep the wave kernel. Idea from the
+/// router GEMM of mikealanni/gufo 06094a2b / 92f05df6 (MIT, Mike Alani).
+bool RouterSgemmEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_GLM53_ROUTER_GEMM");
+    return v != nullptr && std::string_view(v) == "sgemm";
+  }();
+  return enabled;
+}
+
+}  // namespace
+
+bool RouterSgemm(const float* router, const float* x, float* logits,
+                 std::uint32_t tokens, std::uint32_t experts,
+                 std::uint32_t hidden, Stream stream) {
+  const hipblasHandle_t h = BlasHandle(stream);
+  if (h == nullptr || tokens > INT32_MAX || experts > INT32_MAX ||
+      hidden > INT32_MAX) {
+    return false;
+  }
+  const float one = 1.0F, zero = 0.0F;
+  const int m = static_cast<int>(experts), n = static_cast<int>(tokens),
+            k = static_cast<int>(hidden);
+  // Row-major logits[T][E] = x[T][H] router[E][H]^T is column-major
+  // logits^T (E x T) = router^T-view (op T of the H x E column-major view)
+  // times x^T (H x T).
+  return hipblasSgemm(h, HIPBLAS_OP_T, HIPBLAS_OP_N, m, n, k, &one, router, k,
+                      x, k, &zero, logits, m) == HIPBLAS_STATUS_SUCCESS;
+}
+
+namespace {
+
 __global__ void Activate(float* gate, const float* up, std::size_t n,
                          float clamp) {
   for (std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
@@ -703,8 +741,11 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
                               h,        c.num_experts,
                               1,        std::size_t{h} * sizeof(float)};
     scope.emplace(ctx.profiler, "ffn_moe/router", ctx.stream);
-    if (!Project(router, x, nullptr, ptr(b.logits), tokens, 1, true,
-                 ctx.stream))
+    const bool sgemm = RouterSgemmEnabled() && tokens > 8 && !ExactPrefill() &&
+                       RouterSgemm(w.router, x, ptr(b.logits), tokens,
+                                   c.num_experts, h, ctx.stream);
+    if (!sgemm && !Project(router, x, nullptr, ptr(b.logits), tokens, 1, true,
+                           ctx.stream))
       return false;
     tap("ffn_moe_logits", ptr(b.logits), c.num_experts, tokens);
     scope.emplace(ctx.profiler, "ffn_moe/topk", ctx.stream);

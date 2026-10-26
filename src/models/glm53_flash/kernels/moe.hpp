@@ -10,6 +10,13 @@ namespace gufo::models::glm53_flash {
 // Negative or nonfinite clamps are rejected; zero disables clamping.
 [[nodiscard]] std::size_t FfnScratchBytes(const Config& config,
                                           std::uint32_t max_tokens) noexcept;
+// Router logits[T][experts] = x[T][hidden] router[experts][hidden]^T as one
+// hipBLAS SGEMM on `stream` (GUFO_GLM53_ROUTER_GEMM=sgemm, prefill only).
+// False (nothing launched) without a BLAS handle or on oversized shapes.
+[[nodiscard]] bool RouterSgemm(const float* router, const float* x,
+                               float* logits, std::uint32_t tokens,
+                               std::uint32_t experts, std::uint32_t hidden,
+                               Stream stream);
 // True if FfnForward on these weights and `tokens` only enqueues kernels on
 // ctx.stream over caller scratch: no allocation, pool use or host sync, so a
 // HIP graph may capture it (LayerOps::ffn_capture_safe). Dense SwiGLU and
