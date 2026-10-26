@@ -514,15 +514,10 @@ RopeParams RopeFor(const Config& config, std::uint32_t il) {
   return rope;
 }
 
-void ApplyRope(float* x, std::span<const std::int32_t> positions,
-               std::uint32_t heads, std::uint32_t head_dim,
-               const RopeParams& rope) {
+RopeSetup MakeRopeSetup(const RopeParams& rope) {
   const std::uint32_t n_rot = rope.n_rot;
-  if (n_rot > head_dim || n_rot % 2 != 0) {
-    throw std::invalid_argument("laguna oracle: bad rotary dimension");
-  }
+  RopeSetup setup;
   // ggml_rope_yarn_corr_dims
-  float corr[2] = {0.0F, 0.0F};
   if (rope.ext_factor != 0.0F) {
     const auto corr_dim = [&](float n_rot_beta) {
       return static_cast<float>(n_rot) *
@@ -532,11 +527,28 @@ void ApplyRope(float* x, std::span<const std::int32_t> positions,
     };
     const float start = std::floor(corr_dim(rope.beta_fast));
     const float end = std::ceil(corr_dim(rope.beta_slow));
-    corr[0] = std::max(0.0F, start);
-    corr[1] = std::min(static_cast<float>(n_rot) - 1.0F, end);
+    setup.corr[0] = std::max(0.0F, start);
+    setup.corr[1] = std::min(static_cast<float>(n_rot) - 1.0F, end);
   }
-  const float theta_scale =
+  setup.theta_scale =
       std::pow(rope.freq_base, -2.0F / static_cast<float>(n_rot));
+  setup.mscale = rope.attn_factor;
+  if (rope.ext_factor != 0.0F) {
+    setup.mscale *= 1.0F + 0.1F * std::log(1.0F / rope.freq_scale);
+  }
+  return setup;
+}
+
+void ApplyRope(float* x, std::span<const std::int32_t> positions,
+               std::uint32_t heads, std::uint32_t head_dim,
+               const RopeParams& rope) {
+  const std::uint32_t n_rot = rope.n_rot;
+  if (n_rot > head_dim || n_rot % 2 != 0) {
+    throw std::invalid_argument("laguna oracle: bad rotary dimension");
+  }
+  const RopeSetup setup = MakeRopeSetup(rope);
+  const float* corr = setup.corr;
+  const float theta_scale = setup.theta_scale;
   std::vector<float> cache(n_rot);
   for (std::size_t t = 0; t < positions.size(); ++t) {
     // ggml_rope_cache_init / rope_yarn, in the same float arithmetic.
@@ -544,14 +556,13 @@ void ApplyRope(float* x, std::span<const std::int32_t> positions,
     for (std::uint32_t i0 = 0; i0 < n_rot; i0 += 2) {
       const float theta_interp = rope.freq_scale * theta;
       float rotated = theta_interp;
-      float mscale = rope.attn_factor;
+      const float mscale = setup.mscale;
       if (rope.ext_factor != 0.0F) {
         const float y = (static_cast<float>(i0 / 2) - corr[0]) /
                         std::max(0.001F, corr[1] - corr[0]);
         const float ramp = 1.0F - std::min(1.0F, std::max(0.0F, y));
         const float ramp_mix = ramp * rope.ext_factor;
         rotated = theta_interp * (1.0F - ramp_mix) + theta * ramp_mix;
-        mscale *= 1.0F + 0.1F * std::log(1.0F / rope.freq_scale);
       }
       cache[i0] = std::cos(rotated) * mscale;
       cache[i0 + 1] = std::sin(rotated) * mscale;
@@ -889,6 +900,101 @@ bool TapWriter::Finish(std::string* error) {
 
 // ---- Model ----
 
+std::vector<float> AttnForward(const Config& c, const LayerWeights& lw,
+                               std::uint32_t il, const float* n_ptr,
+                               std::size_t T, const Options& options,
+                               const TapFn& tap, int layer) {
+  const std::size_t H = c.hidden_size;
+  const std::uint32_t hd = c.head_dim;
+  const std::uint32_t kvh = c.num_kv_heads;
+  const std::size_t kv_dim = c.kv_dim();
+  const std::uint32_t heads = c.n_head(il);
+  const std::size_t q_dim = c.q_dim(il);
+  const float kq_scale = 1.0F / std::sqrt(static_cast<float>(hd));
+  std::vector<std::int32_t> positions(T);
+  std::iota(positions.begin(), positions.end(), 0);
+  const auto emit_f32 = [&](const char* name, int,
+                            std::array<std::uint64_t, 3> ne,
+                            const std::vector<float>& data) {
+    if (!tap) {
+      return;
+    }
+    const std::string full =
+        layer >= 0 ? std::string(name) + "-" + std::to_string(layer)
+                   : std::string(name);
+    tap(Tap{full, TapType::kF32, ne, data.data()});
+  };
+  const std::vector<float> n(n_ptr, n_ptr + T * H);
+  std::vector<float> q(T * q_dim);
+  std::vector<float> k(T * kv_dim);
+  std::vector<float> v(T * kv_dim);
+  MatMul(lw.attn_q, 0, n.data(), T, q.data(), options);
+  MatMul(lw.attn_k, 0, n.data(), T, k.data(), options);
+  MatMul(lw.attn_v, 0, n.data(), T, v.data(), options);
+  emit_f32("Qcur", layer, {q_dim, T, 1}, q);
+  emit_f32("Kcur", layer, {kv_dim, T, 1}, k);
+  emit_f32("Vcur", layer, {kv_dim, T, 1}, v);
+
+  // Output gate input: the same attn_norm output as q/k/v.
+  std::vector<float> gate(T * heads);
+  MatMul(lw.attn_gate, 0, n.data(), T, gate.data(), options);
+  emit_f32("attn_gate_proj", layer, {heads, T, 1}, gate);
+
+  const std::vector<float> q_norm_w = LoadF32(lw.attn_q_norm);
+  const std::vector<float> k_norm_w = LoadF32(lw.attn_k_norm);
+  for (std::size_t i = 0; i < T * heads; ++i) {
+    RmsNormRow(q.data() + i * hd, q_norm_w.data(), hd, c.rms_eps,
+               q.data() + i * hd);
+  }
+  for (std::size_t i = 0; i < T * kvh; ++i) {
+    RmsNormRow(k.data() + i * hd, k_norm_w.data(), hd, c.rms_eps,
+               k.data() + i * hd);
+  }
+  emit_f32("Qcur_normed", layer, {hd, heads, T}, q);
+  emit_f32("Kcur_normed", layer, {hd, kvh, T}, k);
+
+  const RopeParams rope = RopeFor(c, il);
+  ApplyRope(q.data(), positions, heads, hd, rope);
+  ApplyRope(k.data(), positions, kvh, hd, rope);
+  emit_f32("Qcur_rope", layer, {hd, heads, T}, q);
+  emit_f32("Kcur_rope", layer, {hd, kvh, T}, k);
+
+  if (options.round_kv_f16) {
+    for (float& value : k) {
+      value = RoundToF16(value);
+    }
+    for (float& value : v) {
+      value = RoundToF16(value);
+    }
+  }
+
+  std::vector<float> attn(T * q_dim);
+  GqaAttention(q.data(), k.data(), v.data(), T, heads, kvh, hd,
+               c.is_full_attention(il) ? 0U : c.sliding_window, kq_scale,
+               attn.data());
+  emit_f32("attn_out", layer, {q_dim, T, 1}, attn);
+
+  for (float& g : gate) {
+    g = Softplus(g);
+  }
+  emit_f32("attn_gate_softplus", layer, {heads, T, 1}, gate);
+  for (std::size_t t = 0; t < T; ++t) {
+    for (std::uint32_t head = 0; head < heads; ++head) {
+      float* out =
+          attn.data() + t * q_dim + static_cast<std::size_t>(head) * hd;
+      for (std::uint32_t d = 0; d < hd; ++d) {
+        out[d] *= gate[t * heads + head];
+      }
+    }
+  }
+  emit_f32("attn_gated", layer, {q_dim, T, 1}, attn);
+
+  std::vector<float> o(T * H);
+  MatMul(lw.attn_output, 0, attn.data(), T, o.data(), options);
+  emit_f32("attn_o_proj", layer, {H, T, 1}, o);
+  return o;
+}
+
 Model::Model(const ModelWeights& weights, Options options)
     : weights_(weights), options_(options) {}
 
@@ -900,12 +1006,6 @@ std::vector<float> Model::Forward(std::span<const std::int32_t> tokens,
     throw std::invalid_argument("laguna oracle: empty token list");
   }
   const std::size_t H = c.hidden_size;
-  const std::uint32_t hd = c.head_dim;
-  const std::uint32_t kvh = c.num_kv_heads;
-  const std::size_t kv_dim = c.kv_dim();
-  const float kq_scale = 1.0F / std::sqrt(static_cast<float>(hd));
-  std::vector<std::int32_t> positions(T);
-  std::iota(positions.begin(), positions.end(), 0);
 
   const auto emit = [&](const char* name, int layer, TapType type,
                         std::array<std::uint64_t, 3> ne, const void* data) {
@@ -941,8 +1041,6 @@ std::vector<float> Model::Forward(std::span<const std::int32_t> tokens,
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     const LayerWeights& lw = weights_.layers[il];
     const int layer = static_cast<int>(il);
-    const std::uint32_t heads = c.n_head(il);
-    const std::size_t q_dim = c.q_dim(il);
 
     // ---- attention ----
     const std::vector<float> attn_norm_w = LoadF32(lw.attn_norm);
@@ -953,73 +1051,8 @@ std::vector<float> Model::Forward(std::span<const std::int32_t> tokens,
     }
     emit_f32("attn_norm", layer, {H, T, 1}, n);
 
-    std::vector<float> q(T * q_dim);
-    std::vector<float> k(T * kv_dim);
-    std::vector<float> v(T * kv_dim);
-    MatMul(lw.attn_q, 0, n.data(), T, q.data(), options_);
-    MatMul(lw.attn_k, 0, n.data(), T, k.data(), options_);
-    MatMul(lw.attn_v, 0, n.data(), T, v.data(), options_);
-    emit_f32("Qcur", layer, {q_dim, T, 1}, q);
-    emit_f32("Kcur", layer, {kv_dim, T, 1}, k);
-    emit_f32("Vcur", layer, {kv_dim, T, 1}, v);
-
-    // Output gate input: the same attn_norm output as q/k/v.
-    std::vector<float> gate(T * heads);
-    MatMul(lw.attn_gate, 0, n.data(), T, gate.data(), options_);
-    emit_f32("attn_gate_proj", layer, {heads, T, 1}, gate);
-
-    const std::vector<float> q_norm_w = LoadF32(lw.attn_q_norm);
-    const std::vector<float> k_norm_w = LoadF32(lw.attn_k_norm);
-    for (std::size_t i = 0; i < T * heads; ++i) {
-      RmsNormRow(q.data() + i * hd, q_norm_w.data(), hd, c.rms_eps,
-                 q.data() + i * hd);
-    }
-    for (std::size_t i = 0; i < T * kvh; ++i) {
-      RmsNormRow(k.data() + i * hd, k_norm_w.data(), hd, c.rms_eps,
-                 k.data() + i * hd);
-    }
-    emit_f32("Qcur_normed", layer, {hd, heads, T}, q);
-    emit_f32("Kcur_normed", layer, {hd, kvh, T}, k);
-
-    const RopeParams rope = RopeFor(c, il);
-    ApplyRope(q.data(), positions, heads, hd, rope);
-    ApplyRope(k.data(), positions, kvh, hd, rope);
-    emit_f32("Qcur_rope", layer, {hd, heads, T}, q);
-    emit_f32("Kcur_rope", layer, {hd, kvh, T}, k);
-
-    if (options_.round_kv_f16) {
-      for (float& value : k) {
-        value = RoundToF16(value);
-      }
-      for (float& value : v) {
-        value = RoundToF16(value);
-      }
-    }
-
-    std::vector<float> attn(T * q_dim);
-    GqaAttention(q.data(), k.data(), v.data(), T, heads, kvh, hd,
-                 c.is_full_attention(il) ? 0U : c.sliding_window, kq_scale,
-                 attn.data());
-    emit_f32("attn_out", layer, {q_dim, T, 1}, attn);
-
-    for (float& g : gate) {
-      g = Softplus(g);
-    }
-    emit_f32("attn_gate_softplus", layer, {heads, T, 1}, gate);
-    for (std::size_t t = 0; t < T; ++t) {
-      for (std::uint32_t head = 0; head < heads; ++head) {
-        float* out =
-            attn.data() + t * q_dim + static_cast<std::size_t>(head) * hd;
-        for (std::uint32_t d = 0; d < hd; ++d) {
-          out[d] *= gate[t * heads + head];
-        }
-      }
-    }
-    emit_f32("attn_gated", layer, {q_dim, T, 1}, attn);
-
-    std::vector<float> o(T * H);
-    MatMul(lw.attn_output, 0, attn.data(), T, o.data(), options_);
-    emit_f32("attn_o_proj", layer, {H, T, 1}, o);
+    const std::vector<float> o =
+        AttnForward(c, lw, il, n.data(), T, options_, tap, layer);
 
     std::vector<float> ffn_inp(T * H);
     for (std::size_t i = 0; i < T * H; ++i) {

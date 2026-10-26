@@ -38,4 +38,12 @@ if (ENGINE_ENABLE_HIP)
   add_laguna_test(ffn_ops gufo_laguna "hip;gpu;gfx1151")
   add_laguna_test(ffn_real gufo_laguna "hip;gpu;gfx1151;external-model")
   set_tests_properties(laguna.ffn_real PROPERTIES SKIP_RETURN_CODE 77)
+
+  # GPU attention operator (phase 3b) against the CPU oracle. `attention_ops`
+  # runs on random tiny layers and skips nothing. `attention_real` uses real
+  # GGUF layers (full L0 and L4, sliding L1), so without the model it exits 77
+  # and CTest reports a skip, which verifies nothing.
+  add_laguna_test(attention_ops gufo_laguna "hip;gpu;gfx1151")
+  add_laguna_test(attention_real gufo_laguna "hip;gpu;gfx1151;external-model")
+  set_tests_properties(laguna.attention_real PROPERTIES SKIP_RETURN_CODE 77)
 endif()

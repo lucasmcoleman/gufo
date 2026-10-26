@@ -171,6 +171,19 @@ struct RopeParams {
 /// layers: plain RoPE). With YaRN, ggml multiplies cos/sin by
 /// attn_factor * (1 + 0.1 ln(1/freq_scale)), which equals Config::YarnMscale().
 [[nodiscard]] RopeParams RopeFor(const Config& config, std::uint32_t il);
+/// Host-side constants of ggml's rope cache for one layer, in the float
+/// arithmetic ApplyRope uses (also consumed by the GPU attention operator so
+/// both sides start from the same bits). Per pair i0/2 the angle is the
+/// position multiplied i0/2 times by `theta_scale`; with YaRN it is blended
+/// between interpolated and extrapolated by a ramp over `corr`, and cos/sin
+/// are multiplied by `mscale` (attn_factor times 1 + 0.1 ln(1/freq_scale)
+/// with YaRN).
+struct RopeSetup {
+  float theta_scale{1.0F};
+  float corr[2]{0.0F, 0.0F};
+  float mscale{1.0F};
+};
+[[nodiscard]] RopeSetup MakeRopeSetup(const RopeParams& rope);
 /// Rotates `heads` heads of `head_dim` channels per token in place. `x` holds
 /// `positions.size()` rows of `heads * head_dim`.
 void ApplyRope(float* x, std::span<const std::int32_t> positions,
@@ -214,6 +227,19 @@ struct Routing {
                                             const Options& options,
                                             const TapFn& tap = {},
                                             int layer_index = -1);
+
+/// The attention block of one layer over its post-`attn_norm` rows `n`
+/// ([T][hidden], positions 0..T-1, full recompute): q/k/v and gate projections,
+/// per-head QK RMSNorm, NeoX RoPE (YaRN on full layers), F16 K/V rounding when
+/// `options.round_kv_f16`, causal (sliding on SWA layers) GQA attention, the
+/// softplus output gate and the output projection. Returns T rows of `hidden`
+/// values (before the residual add). With `tap`, emits the attention taps
+/// `Model::Forward` emits ("Qcur", ..., "attn_o_proj", suffix "-<layer_index>"
+/// or none when negative). Model::Forward calls this.
+[[nodiscard]] std::vector<float> AttnForward(
+    const Config& config, const LayerWeights& layer, std::uint32_t il,
+    const float* n, std::size_t tokens, const Options& options,
+    const TapFn& tap = {}, int layer_index = -1);
 
 class Model {
 public:

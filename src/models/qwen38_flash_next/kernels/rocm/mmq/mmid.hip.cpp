@@ -132,9 +132,6 @@ static __global__ void mm_ids_scatter_kernel(
     ids_dst[pos] = it * n_expert_used + iex;
 }
 
-static int32_t * g_ids_scratch = nullptr;
-static size_t g_ids_scratch_elems = 0;
-
 static void launch_mm_ids_helper_scan(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, hipStream_t stream) {
@@ -143,17 +140,16 @@ static void launch_mm_ids_helper_scan(
     const size_t need = (size_t)n_rows + (size_t)n_blocks * (n_experts + 1);
     const size_t lds = (size_t)(n_experts + 1) * kIdsWaves * sizeof(int32_t);
     GGML_ASSERT(n_rows > 0 && lds <= 48 * 1024 && "routed id maps: shape");
-    if (need > g_ids_scratch_elems) {
-        // Grown only while the previous buffer may still be in flight, so
-        // the old allocation is left to the process (it happens once per
-        // widest shape).
-        int32_t * grown = nullptr;
-        HIP_CHECK(gufo::hip::AllocateDevice(&grown, need * sizeof(int32_t)));
-        g_ids_scratch = grown;
-        g_ids_scratch_elems = need;
-    }
-    int32_t * local_rank = g_ids_scratch;
-    int32_t * block_counts = g_ids_scratch + n_rows;
+    // The scratch comes from the stream's own arena (qfn_pool_for_stream) and
+    // is released on return, in stream order, like every other allocation of
+    // the tier. It used to be one process-wide buffer: two streams running the
+    // routed or batched kernels at once overwrote each other's ranks and block
+    // counts, and growing it raced between host threads.
+    int device = 0;
+    HIP_CHECK(hipGetDevice(&device));
+    ggml_hip_pool_alloc<int32_t> scratch(qfn_pool_for_stream(device, stream), need);
+    int32_t * local_rank = scratch.get();
+    int32_t * block_counts = local_rank + n_rows;
     mm_ids_rank_kernel<<<n_blocks, kIdsRowsPerBlock, lds, stream>>>(
         ids, local_rank, block_counts, n_rows, n_experts, n_expert_used, si1);
     mm_ids_bounds_kernel<<<1, 1024, (size_t)(n_experts + 1) * sizeof(int32_t), stream>>>(

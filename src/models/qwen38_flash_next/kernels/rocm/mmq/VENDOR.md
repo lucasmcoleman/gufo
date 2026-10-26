@@ -21,3 +21,8 @@ under `tests/models/qwen38_flash_next/` plus the AR/MTP session replay.
 The routed GEMM test compares supported formats against a floating-point
 reference and checks the paired adapter against two separate projections.
 Build and validate through Nix as described in `AGENTS.md`.
+
+The routed id-map builder (`mmid.hip.cpp`) takes its scratch from the calling
+stream's arena (`qfn_pool_for_stream`), not a process-wide buffer: two streams
+running the batched or routed kernels concurrently overwrote each other's ranks
+(found by the Laguna attention two-stream test).
