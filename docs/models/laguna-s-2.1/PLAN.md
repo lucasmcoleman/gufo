@@ -69,6 +69,8 @@ llama.cpp-named taps diffed against `llama-eval-callback` dumps.
    runs are pending a GPU window. See "Phase 5: serve path" below.
 6. DFlash drafter (`laguna-s-2.1-DFlash-Q4_K.gguf`, arch `dflash`), only after
    5, with its own feature-layer and mask verification.
+   Spec, evidence and test plan: `DFLASH.md`. Config and weight index (CPU)
+   are in; the rest is gated on a verify-cost measurement.
 
 Lessons source: codexms #965 review of #ai-dev-gufo 12015-16101,
 `/server/staging/laguna/codexms-965-RESULT.txt`. Reference build:

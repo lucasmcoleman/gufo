@@ -33,7 +33,12 @@ add_executable(laguna_oracle oracle_cli.cpp)
 target_link_libraries(laguna_oracle PRIVATE gufo_laguna)
 add_dependencies(laguna_tests laguna_oracle)
 
-foreach(name IN ITEMS config weights tokenizer_golden)
+# DFlash drafter (phase 6a, CPU only). `dflash_contract` needs no model. `dflash`
+# reads the real drafter GGUF header (and the target's, for the pairing) and
+# skips (status 77) without them; a skip verifies nothing.
+add_laguna_test(dflash_contract gufo_laguna "cpu")
+
+foreach(name IN ITEMS config weights tokenizer_golden dflash)
   add_laguna_test(${name} gufo_laguna "cpu;external-model")
   set_tests_properties(laguna.${name} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()

@@ -7,6 +7,7 @@ add_library(gufo_laguna STATIC
   budget.cpp
   chat_template.cpp
   config.cpp
+  dflash.cpp
   reference.cpp
   tokenizer.cpp
   weights.cpp)
