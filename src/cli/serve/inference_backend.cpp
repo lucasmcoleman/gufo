@@ -2358,9 +2358,10 @@ const LagunaTextRunnerState& RequireLagunaState(const TextRunnerState& state) {
 /// the accepted drafts; the session's state after a step is the one plain
 /// decode reaches after the same tokens, so snapshots, cancellation and
 /// prefix reuse need nothing extra. A request that samples at random decodes
-/// plainly (no lossless sampled verifier yet), its session suspended from
-/// speculation so it can share batched decode passes; speculating sessions
-/// decode alone (DFLASH rule 6).
+/// plainly (no lossless sampled verifier yet). Requests decoding at the same
+/// time share batched plain passes (DecodeBatch): a speculating session cannot
+/// join a shared pass (DFLASH rule 6), so speculation is for a request that
+/// decodes alone.
 class LagunaTextRunner final : public HipTextModelRunner {
 public:
   LagunaTextRunner(std::shared_ptr<models::laguna::Model> model,
@@ -2660,9 +2661,12 @@ public:
     return SpeculativeStep(laguna, max_tokens, sampler);
   }
 
-  /// Speculating requests verify alone, one after the other (DFLASH rule 6);
-  /// the others select their token and advance together in shared decode
-  /// passes (Session::EvaluateBatch).
+  /// Several requests ready to decode at once share batched decode passes
+  /// (Session::EvaluateBatch), greedy ones included: their drafters are
+  /// suspended, because a speculating session cannot join a shared pass
+  /// (DFLASH rule 6) and verifying the sessions one after another would give
+  /// up the batching that concurrent requests rely on. Speculation resumes,
+  /// with a cold drafter ring, when a request decodes alone (DecodeStep).
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
     if (!speculative_) {
@@ -2681,9 +2685,6 @@ public:
               "text runner decode step budget must be at least one token");
         }
         auto& laguna = RequireLagunaState(decode.state.get());
-        if (!decode.sampler.get().config().uses_random_sampling()) {
-          continue;
-        }
         laguna.session().SuspendDrafter();
         auto selection = Select(laguna, decode.sampler.get());
         if (selection.stop) {
@@ -2721,21 +2722,6 @@ public:
         } else {
           steps[i].execution_plan = plan;
         }
-      }
-    }
-    for (std::size_t i = 0; i < decodes.size(); ++i) {
-      const auto& decode = decodes[i];
-      if (steps[i].failure || steps[i].stop || !steps[i].selections.empty() ||
-          decode.max_tokens == 0 ||
-          decode.sampler.get().config().uses_random_sampling()) {
-        continue;
-      }
-      try {
-        steps[i] = SpeculativeStep(RequireLagunaState(decode.state.get()),
-                                   decode.max_tokens, decode.sampler.get());
-      } catch (...) {
-        steps[i] = {};
-        steps[i].failure = std::current_exception();
       }
     }
     return steps;
