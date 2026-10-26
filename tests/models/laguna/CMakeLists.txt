@@ -30,3 +30,12 @@ foreach(name IN ITEMS config weights tokenizer_golden)
 endforeach()
 target_compile_definitions(laguna_tokenizer_golden_test PRIVATE
   GUFO_LAGUNA_TOKENIZER_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/tokenizer_goldens.json")
+
+# GPU FFN operators (phase 3a) against the CPU oracle. `ffn_ops` runs on random
+# tiny layers and skips nothing. `ffn_real` slices the real GGUF, so without it
+# the test exits 77 and CTest reports a skip, which verifies nothing.
+if (ENGINE_ENABLE_HIP)
+  add_laguna_test(ffn_ops gufo_laguna "hip;gpu;gfx1151")
+  add_laguna_test(ffn_real gufo_laguna "hip;gpu;gfx1151;external-model")
+  set_tests_properties(laguna.ffn_real PROPERTIES SKIP_RETURN_CODE 77)
+endif()

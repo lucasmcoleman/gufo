@@ -149,6 +149,112 @@ double DotRow(const float* w, const float* x, std::size_t n) {
   return total + tail;
 }
 
+/// `value` moved by `steps` fp16 steps (same sign: toward larger magnitude).
+float NudgeHalf(float value, int steps) {
+  std::uint16_t bits = FloatToHalfBits(value);
+  bits = static_cast<std::uint16_t>(bits + steps);
+  return quant::Fp16ToFloat(bits);
+}
+
+/// The ggml mul_mat_q tile arithmetic for Q4_K/Q5_K weights, which is not
+/// "round the inputs, then multiply dequantized weights": the tile loader
+/// stores the per-sub-block scale and min as fp16 products (d * sc and
+/// -dmin * m, `x_dm = dm * make_half2(sc, m)`), the activation block carries
+/// half2(d, d * sum(q)) (DS4 layout), and a sub-block contributes
+///   x_dm.x * d8 * sum(qw * qx)  +  x_dm.y * half(d * sum(qx)).
+/// Sub-blocks are 32 elements; the integer dot is exact.
+void MmqKQuantMatMul(const TensorRef& w, std::uint64_t expert, const float* x,
+                     std::size_t n, float* y, const Options& options) {
+  const std::size_t cols = w.cols;
+  const std::size_t rows = w.rows;
+  if (cols % 256 != 0) {
+    throw std::invalid_argument("laguna oracle: activation row not aligned");
+  }
+  const bool q5 = w.type == GgmlType::kQ5_K;
+  const std::size_t groups = cols / 32;
+  const ScaleNudge& nudge = options.nudge;
+  std::vector<std::int8_t> q(n * cols);
+  std::vector<float> d8(n * groups);
+  std::vector<float> sb(n * groups);
+  for (std::size_t t = 0; t < n; ++t) {
+    for (std::size_t g = 0; g < groups; ++g) {
+      const float* row = x + t * cols + g * 32;
+      float amax = 0.0F;
+      for (std::size_t j = 0; j < 32; ++j) {
+        amax = std::max(amax, std::fabs(row[j]));
+      }
+      const float d_inv = 127.0F / amax;
+      const float d = 1.0F / d_inv;
+      int sum = 0;
+      for (std::size_t j = 0; j < 32; ++j) {
+        const int v =
+            amax == 0.0F ? 0 : static_cast<int>(std::round(row[j] * d_inv));
+        q[t * cols + g * 32 + j] = static_cast<std::int8_t>(v);
+        sum += v;
+      }
+      d8[t * groups + g] = RoundToF16(amax == 0.0F ? 0.0F : d);
+      sb[t * groups + g] =
+          RoundToF16(amax == 0.0F ? 0.0F : d * static_cast<float>(sum));
+    }
+  }
+  if (nudge.group >= 0 && static_cast<std::size_t>(nudge.group) < groups) {
+    float& v = nudge.kind == 0 ? d8[nudge.group] : sb[nudge.group];
+    v = NudgeHalf(v, nudge.steps);
+  }
+  const std::size_t block_bytes = q5 ? 176 : 144;
+  const std::size_t row_bytes = w.RowBytes();
+  const std::uint8_t* base = w.Expert(expert);
+  ParallelChunks(
+      rows, 8, ResolveThreads(options.threads),
+      [&](std::size_t begin, std::size_t end) {
+        for (std::size_t r = begin; r < end; ++r) {
+          for (std::size_t t = 0; t < n; ++t) {
+            double acc = 0.0;
+            for (std::size_t b = 0; b < cols / 256; ++b) {
+              const std::uint8_t* blk = base + r * row_bytes + b * block_bytes;
+              std::uint16_t dh = 0;
+              std::uint16_t dminh = 0;
+              std::memcpy(&dh, blk, 2);
+              std::memcpy(&dminh, blk + 2, 2);
+              const float dw = quant::Fp16ToFloat(dh);
+              const float dmin = quant::Fp16ToFloat(dminh);
+              const std::uint8_t* scales = blk + 4;
+              const std::uint8_t* qh = q5 ? blk + 16 : nullptr;
+              const std::uint8_t* qs = blk + (q5 ? 48 : 16);
+              for (int j = 0; j < 8; ++j) {
+                int sc = 0;
+                int m = 0;
+                if (j < 4) {
+                  sc = scales[j] & 63;
+                  m = scales[j + 4] & 63;
+                } else {
+                  sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+                  m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+                }
+                const float dm_x = RoundToF16(dw * static_cast<float>(sc));
+                const float dm_y = -RoundToF16(dmin * static_cast<float>(m));
+                long dot = 0;
+                const std::int8_t* qx = q.data() + t * cols + b * 256 + j * 32;
+                for (int l = 0; l < 32; ++l) {
+                  const std::uint8_t byte = qs[32 * (j / 2) + l];
+                  int qw = (j & 1) != 0 ? (byte >> 4) : (byte & 0xF);
+                  if (q5 && ((qh[l] >> j) & 1) != 0) {
+                    qw += 16;
+                  }
+                  dot += static_cast<long>(qw) * qx[l];
+                }
+                const std::size_t g = b * 8 + j;
+                acc += static_cast<double>(dm_x) * d8[t * groups + g] *
+                           static_cast<double>(dot) +
+                       static_cast<double>(dm_y) * sb[t * groups + g];
+              }
+            }
+            y[t * rows + r] = static_cast<float>(acc);
+          }
+        }
+      });
+}
+
 /// y[t][r] = sum_c W[expert][r][c] * x[t][c], with the inputs rounded per the
 /// activation mode. W rows are dequantized one at a time.
 void MatMul(const TensorRef& w, std::uint64_t expert, const float* x,
@@ -158,8 +264,14 @@ void MatMul(const TensorRef& w, std::uint64_t expert, const float* x,
   if (w.empty() || expert >= w.experts) {
     throw std::invalid_argument("laguna oracle: bad matmul operand");
   }
+  if (options.activation_quant == ActivationQuant::kGpuMmq &&
+      (w.type == GgmlType::kQ4_K || w.type == GgmlType::kQ5_K)) {
+    MmqKQuantMatMul(w, expert, x, n, y, options);
+    return;
+  }
   std::vector<float> xr(x, x + n * cols);
-  RoundActivations(w.type, options.activation_quant, xr.data(), n, cols);
+  RoundActivations(w.type, options.activation_quant, xr.data(), n, cols,
+                   &options.nudge);
   const std::uint8_t* base = w.Expert(expert);
   const std::size_t row_bytes = w.RowBytes();
   ParallelChunks(rows, 8, ResolveThreads(options.threads),
@@ -208,6 +320,11 @@ float Sigmoid(float x) {
 
 }  // namespace
 
+void MatMulRows(const TensorRef& w, std::uint64_t expert, const float* x,
+                std::size_t n, float* y, const Options& options) {
+  MatMul(w, expert, x, n, y, options);
+}
+
 float RoundToF16(float value) noexcept {
   return quant::Fp16ToFloat(FloatToHalfBits(value));
 }
@@ -233,8 +350,17 @@ void DequantizeRow(GgmlType type, const void* src, float* dst,
 }
 
 void RoundActivations(GgmlType weight_type, ActivationQuant mode, float* x,
-                      std::size_t rows, std::size_t cols) {
-  enum class Kind { kNone, kQ8_0, kQ8_K, kF16, kBF16 } kind = Kind::kNone;
+                      std::size_t rows, std::size_t cols,
+                      const ScaleNudge* nudge) {
+  enum class Kind {
+    kNone,
+    kQ8_0,
+    kQ8_K,
+    kF16,
+    kBF16,
+    kMmqHalfScale,
+    kMmqFloatScale
+  } kind = Kind::kNone;
   if (mode == ActivationQuant::kCpu) {
     switch (weight_type) {
       case GgmlType::kQ8_0:
@@ -261,12 +387,26 @@ void RoundActivations(GgmlType weight_type, ActivationQuant mode, float* x,
     if (quant::QuantizedBlockElements(weight_type) != 0) {
       kind = Kind::kQ8_0;  // Q8_1 rounds exactly like Q8_0
     }
+  } else if (mode == ActivationQuant::kGpuMmq) {
+    switch (weight_type) {
+      case GgmlType::kQ4_K:
+      case GgmlType::kQ5_K:
+        kind = Kind::kMmqHalfScale;
+        break;
+      default:
+        if (quant::QuantizedBlockElements(weight_type) != 0) {
+          kind = Kind::kMmqFloatScale;
+        }
+        break;
+    }
   }
   if (kind == Kind::kNone) {
     return;
   }
   const std::size_t block = kind == Kind::kQ8_K ? 256 : 32;
-  if ((kind == Kind::kQ8_0 || kind == Kind::kQ8_K) && cols % block != 0) {
+  if ((kind == Kind::kQ8_0 || kind == Kind::kQ8_K ||
+       kind == Kind::kMmqHalfScale || kind == Kind::kMmqFloatScale) &&
+      cols % block != 0) {
     throw std::invalid_argument(
         "laguna oracle: activation row not block aligned");
   }
@@ -293,9 +433,31 @@ void RoundActivations(GgmlType weight_type, ActivationQuant mode, float* x,
           }
           const float d = amax / 127.0F;
           const float id = d != 0.0F ? 1.0F / d : 0.0F;
-          const float stored = RoundToF16(d);
+          float stored = RoundToF16(d);
+          if (nudge != nullptr && r == 0 && nudge->kind == 0 &&
+              nudge->group == static_cast<int>(b / 32)) {
+            stored = NudgeHalf(stored, nudge->steps);
+          }
           for (std::size_t j = 0; j < 32; ++j) {
             row[b + j] = std::round(row[b + j] * id) * stored;
+          }
+        }
+        break;
+      case Kind::kMmqHalfScale:
+      case Kind::kMmqFloatScale:
+        // quantize_mmq_q8_1: d_inv = 127 / amax, q = roundf(x * d_inv), the
+        // scale d = 1 / d_inv is stored as fp16 (DS4 layout) or as float (D4).
+        for (std::size_t b = 0; b < cols; b += 32) {
+          float amax = 0.0F;
+          for (std::size_t j = 0; j < 32; ++j) {
+            amax = std::max(amax, std::fabs(row[b + j]));
+          }
+          const float d_inv = 127.0F / amax;
+          const float d = 1.0F / d_inv;
+          const float stored = kind == Kind::kMmqHalfScale ? RoundToF16(d) : d;
+          for (std::size_t j = 0; j < 32; ++j) {
+            row[b + j] =
+                amax == 0.0F ? 0.0F : std::round(row[b + j] * d_inv) * stored;
           }
         }
         break;
@@ -503,6 +665,173 @@ Routing Route(const float* logits, const float* bias, std::uint32_t experts,
   return routing;
 }
 
+std::vector<float> FfnForward(const Config& c, const LayerWeights& lw,
+                              const float* fn_ptr, std::size_t T,
+                              const Options& options, const TapFn& tap,
+                              int layer) {
+  const std::size_t H = c.hidden_size;
+  const auto emit = [&](const char* name, TapType type,
+                        std::array<std::uint64_t, 3> ne, const void* data) {
+    if (!tap) {
+      return;
+    }
+    const std::string full =
+        layer >= 0 ? std::string(name) + "-" + std::to_string(layer)
+                   : std::string(name);
+    tap(Tap{full, type, ne, data});
+  };
+  const auto emit_f32 = [&](const char* name, int,
+                            std::array<std::uint64_t, 3> ne,
+                            const std::vector<float>& data) {
+    emit(name, TapType::kF32, ne, data.data());
+  };
+  const std::vector<float> fn(fn_ptr, fn_ptr + T * H);
+  std::vector<float> ffn_out(T * H);
+  if (!lw.moe) {
+    const std::size_t ff = lw.ffn_gate.rows;
+    std::vector<float> up(T * ff);
+    std::vector<float> gt(T * ff);
+    MatMul(lw.ffn_up, 0, fn.data(), T, up.data(), options);
+    MatMul(lw.ffn_gate, 0, fn.data(), T, gt.data(), options);
+    emit_f32("ffn_up", layer, {ff, T, 1}, up);
+    emit_f32("ffn_gate", layer, {ff, T, 1}, gt);
+    std::vector<float> act(T * ff);
+    for (std::size_t i = 0; i < T * ff; ++i) {
+      act[i] = Silu(gt[i]) * up[i];
+    }
+    emit_f32("ffn_swiglu", layer, {ff, T, 1}, act);
+    MatMul(lw.ffn_down, 0, act.data(), T, ffn_out.data(), options);
+    emit_f32("ffn_down", layer, {H, T, 1}, ffn_out);
+  } else {
+    const std::uint32_t E = c.num_experts;
+    const std::uint32_t used = c.num_experts_used;
+    const std::size_t eff = c.expert_ff;
+    std::vector<float> logits(T * E);
+    MatMul(lw.ffn_gate_inp, 0, fn.data(), T, logits.data(), options);
+    emit_f32("ffn_moe_logits", layer, {E, T, 1}, logits);
+    const std::vector<float> bias = LoadF32(lw.ffn_exp_probs_b);
+
+    std::vector<float> probs(T * E);
+    std::vector<float> biased(T * E);
+    std::vector<std::int32_t> topk(T * used);
+    std::vector<float> sel_probs(T * used);
+    std::vector<float> sums(T);
+    std::vector<float> clamped(T);
+    std::vector<float> normed(T * used);
+    std::vector<float> scaled(T * used);
+    std::vector<std::vector<std::pair<std::size_t, std::uint32_t>>> by_expert(
+        E);
+    for (std::size_t t = 0; t < T; ++t) {
+      for (std::uint32_t e = 0; e < E; ++e) {
+        probs[t * E + e] = Sigmoid(logits[t * E + e]);
+        biased[t * E + e] = probs[t * E + e] + bias[e];
+      }
+      const Routing r = Route(logits.data() + t * E, bias.data(), E, used,
+                              c.expert_weights_norm, c.expert_weights_scale,
+                              options.router_denominator);
+      sums[t] = r.sum;
+      clamped[t] = r.denominator;
+      for (std::uint32_t s = 0; s < used; ++s) {
+        topk[t * used + s] = static_cast<std::int32_t>(r.ids[s]);
+        sel_probs[t * used + s] = r.probs[s];
+        normed[t * used + s] =
+            c.expert_weights_norm ? r.probs[s] / r.denominator : r.probs[s];
+        scaled[t * used + s] = r.weights[s];
+        by_expert[r.ids[s]].emplace_back(t, s);
+      }
+    }
+    emit_f32("ffn_moe_probs", layer, {E, T, 1}, probs);
+    emit_f32("ffn_moe_probs_biased", layer, {E, T, 1}, biased);
+    emit("ffn_moe_topk", TapType::kI32, {used, T, 1}, topk.data());
+    emit_f32("ffn_moe_weights", layer, {1, used, T}, sel_probs);
+    if (c.expert_weights_norm) {
+      emit_f32("ffn_moe_weights_sum", layer, {1, T, 1}, sums);
+      emit_f32("ffn_moe_weights_sum_clamped", layer, {1, T, 1}, clamped);
+      emit_f32("ffn_moe_weights_norm", layer, {used, T, 1}, normed);
+    }
+    if (c.expert_weights_scale != 0.0F && c.expert_weights_scale != 1.0F) {
+      emit_f32("ffn_moe_weights_scaled", layer, {1, used, T}, scaled);
+    }
+
+    // Routed experts, grouped by expert so each is dequantized once.
+    std::vector<float> e_gate(T * used * eff);
+    std::vector<float> e_up(T * used * eff);
+    std::vector<float> e_act(T * used * eff);
+    std::vector<float> e_down(T * used * H);
+    for (std::uint32_t e = 0; e < E; ++e) {
+      const auto& list = by_expert[e];
+      if (list.empty()) {
+        continue;
+      }
+      const std::size_t m = list.size();
+      std::vector<float> xin(m * H);
+      for (std::size_t i = 0; i < m; ++i) {
+        std::copy_n(fn.data() + list[i].first * H, H, xin.data() + i * H);
+      }
+      std::vector<float> g(m * eff);
+      std::vector<float> u(m * eff);
+      MatMul(lw.ffn_gate_exps, e, xin.data(), m, g.data(), options);
+      MatMul(lw.ffn_up_exps, e, xin.data(), m, u.data(), options);
+      std::vector<float> a(m * eff);
+      for (std::size_t i = 0; i < m * eff; ++i) {
+        a[i] = Silu(g[i]) * u[i];
+      }
+      std::vector<float> d(m * H);
+      MatMul(lw.ffn_down_exps, e, a.data(), m, d.data(), options);
+      for (std::size_t i = 0; i < m; ++i) {
+        const std::size_t slot = list[i].first * used + list[i].second;
+        std::copy_n(g.data() + i * eff, eff, e_gate.data() + slot * eff);
+        std::copy_n(u.data() + i * eff, eff, e_up.data() + slot * eff);
+        std::copy_n(a.data() + i * eff, eff, e_act.data() + slot * eff);
+        std::copy_n(d.data() + i * H, H, e_down.data() + slot * H);
+      }
+    }
+    emit_f32("ffn_moe_gate", layer, {eff, used, T}, e_gate);
+    emit_f32("ffn_moe_up", layer, {eff, used, T}, e_up);
+    emit_f32("ffn_moe_swiglu", layer, {eff, used, T}, e_act);
+    emit_f32("ffn_moe_down", layer, {H, used, T}, e_down);
+
+    std::vector<float> weighted(T * used * H);
+    std::vector<float> moe_out(T * H);
+    for (std::size_t t = 0; t < T; ++t) {
+      for (std::uint32_t s = 0; s < used; ++s) {
+        const std::size_t slot = t * used + s;
+        for (std::size_t d = 0; d < H; ++d) {
+          weighted[slot * H + d] = e_down[slot * H + d] * scaled[slot];
+        }
+      }
+      // ggml sums the slots left to right in float.
+      for (std::size_t d = 0; d < H; ++d) {
+        float acc = weighted[(t * used) * H + d];
+        for (std::uint32_t s = 1; s < used; ++s) {
+          acc += weighted[(t * used + s) * H + d];
+        }
+        moe_out[t * H + d] = acc;
+      }
+    }
+    emit_f32("ffn_moe_weighted", layer, {H, used, T}, weighted);
+    emit_f32("ffn_moe_out", layer, {H, T, 1}, moe_out);
+
+    // Shared expert: plain SwiGLU, no gate.
+    const std::size_t sff = lw.ffn_gate_shexp.rows;
+    std::vector<float> su(T * sff);
+    std::vector<float> sg(T * sff);
+    MatMul(lw.ffn_up_shexp, 0, fn.data(), T, su.data(), options);
+    MatMul(lw.ffn_gate_shexp, 0, fn.data(), T, sg.data(), options);
+    std::vector<float> sa(T * sff);
+    for (std::size_t i = 0; i < T * sff; ++i) {
+      sa[i] = Silu(sg[i]) * su[i];
+    }
+    std::vector<float> shexp(T * H);
+    MatMul(lw.ffn_down_shexp, 0, sa.data(), T, shexp.data(), options);
+    emit_f32("ffn_shexp", layer, {H, T, 1}, shexp);
+    for (std::size_t i = 0; i < T * H; ++i) {
+      ffn_out[i] = moe_out[i] + shexp[i];
+    }
+  }
+  return ffn_out;
+}
+
 // ---- TapWriter ----
 
 TapWriter::TapWriter(std::filesystem::path directory,
@@ -707,149 +1036,8 @@ std::vector<float> Model::Forward(std::span<const std::int32_t> tokens,
     }
     emit_f32("ffn_norm", layer, {H, T, 1}, fn);
 
-    std::vector<float> ffn_out(T * H);
-    if (!lw.moe) {
-      const std::size_t ff = lw.ffn_gate.rows;
-      std::vector<float> up(T * ff);
-      std::vector<float> gt(T * ff);
-      MatMul(lw.ffn_up, 0, fn.data(), T, up.data(), options_);
-      MatMul(lw.ffn_gate, 0, fn.data(), T, gt.data(), options_);
-      emit_f32("ffn_up", layer, {ff, T, 1}, up);
-      emit_f32("ffn_gate", layer, {ff, T, 1}, gt);
-      std::vector<float> act(T * ff);
-      for (std::size_t i = 0; i < T * ff; ++i) {
-        act[i] = Silu(gt[i]) * up[i];
-      }
-      emit_f32("ffn_swiglu", layer, {ff, T, 1}, act);
-      MatMul(lw.ffn_down, 0, act.data(), T, ffn_out.data(), options_);
-      emit_f32("ffn_down", layer, {H, T, 1}, ffn_out);
-    } else {
-      const std::uint32_t E = c.num_experts;
-      const std::uint32_t used = c.num_experts_used;
-      const std::size_t eff = c.expert_ff;
-      std::vector<float> logits(T * E);
-      MatMul(lw.ffn_gate_inp, 0, fn.data(), T, logits.data(), options_);
-      emit_f32("ffn_moe_logits", layer, {E, T, 1}, logits);
-      const std::vector<float> bias = LoadF32(lw.ffn_exp_probs_b);
-
-      std::vector<float> probs(T * E);
-      std::vector<float> biased(T * E);
-      std::vector<std::int32_t> topk(T * used);
-      std::vector<float> sel_probs(T * used);
-      std::vector<float> sums(T);
-      std::vector<float> clamped(T);
-      std::vector<float> normed(T * used);
-      std::vector<float> scaled(T * used);
-      std::vector<std::vector<std::pair<std::size_t, std::uint32_t>>> by_expert(
-          E);
-      for (std::size_t t = 0; t < T; ++t) {
-        for (std::uint32_t e = 0; e < E; ++e) {
-          probs[t * E + e] = Sigmoid(logits[t * E + e]);
-          biased[t * E + e] = probs[t * E + e] + bias[e];
-        }
-        const Routing r = Route(logits.data() + t * E, bias.data(), E, used,
-                                c.expert_weights_norm, c.expert_weights_scale,
-                                options_.router_denominator);
-        sums[t] = r.sum;
-        clamped[t] = r.denominator;
-        for (std::uint32_t s = 0; s < used; ++s) {
-          topk[t * used + s] = static_cast<std::int32_t>(r.ids[s]);
-          sel_probs[t * used + s] = r.probs[s];
-          normed[t * used + s] =
-              c.expert_weights_norm ? r.probs[s] / r.denominator : r.probs[s];
-          scaled[t * used + s] = r.weights[s];
-          by_expert[r.ids[s]].emplace_back(t, s);
-        }
-      }
-      emit_f32("ffn_moe_probs", layer, {E, T, 1}, probs);
-      emit_f32("ffn_moe_probs_biased", layer, {E, T, 1}, biased);
-      emit("ffn_moe_topk", layer, TapType::kI32, {used, T, 1}, topk.data());
-      emit_f32("ffn_moe_weights", layer, {1, used, T}, sel_probs);
-      if (c.expert_weights_norm) {
-        emit_f32("ffn_moe_weights_sum", layer, {1, T, 1}, sums);
-        emit_f32("ffn_moe_weights_sum_clamped", layer, {1, T, 1}, clamped);
-        emit_f32("ffn_moe_weights_norm", layer, {used, T, 1}, normed);
-      }
-      if (c.expert_weights_scale != 0.0F && c.expert_weights_scale != 1.0F) {
-        emit_f32("ffn_moe_weights_scaled", layer, {1, used, T}, scaled);
-      }
-
-      // Routed experts, grouped by expert so each is dequantized once.
-      std::vector<float> e_gate(T * used * eff);
-      std::vector<float> e_up(T * used * eff);
-      std::vector<float> e_act(T * used * eff);
-      std::vector<float> e_down(T * used * H);
-      for (std::uint32_t e = 0; e < E; ++e) {
-        const auto& list = by_expert[e];
-        if (list.empty()) {
-          continue;
-        }
-        const std::size_t m = list.size();
-        std::vector<float> xin(m * H);
-        for (std::size_t i = 0; i < m; ++i) {
-          std::copy_n(fn.data() + list[i].first * H, H, xin.data() + i * H);
-        }
-        std::vector<float> g(m * eff);
-        std::vector<float> u(m * eff);
-        MatMul(lw.ffn_gate_exps, e, xin.data(), m, g.data(), options_);
-        MatMul(lw.ffn_up_exps, e, xin.data(), m, u.data(), options_);
-        std::vector<float> a(m * eff);
-        for (std::size_t i = 0; i < m * eff; ++i) {
-          a[i] = Silu(g[i]) * u[i];
-        }
-        std::vector<float> d(m * H);
-        MatMul(lw.ffn_down_exps, e, a.data(), m, d.data(), options_);
-        for (std::size_t i = 0; i < m; ++i) {
-          const std::size_t slot = list[i].first * used + list[i].second;
-          std::copy_n(g.data() + i * eff, eff, e_gate.data() + slot * eff);
-          std::copy_n(u.data() + i * eff, eff, e_up.data() + slot * eff);
-          std::copy_n(a.data() + i * eff, eff, e_act.data() + slot * eff);
-          std::copy_n(d.data() + i * H, H, e_down.data() + slot * H);
-        }
-      }
-      emit_f32("ffn_moe_gate", layer, {eff, used, T}, e_gate);
-      emit_f32("ffn_moe_up", layer, {eff, used, T}, e_up);
-      emit_f32("ffn_moe_swiglu", layer, {eff, used, T}, e_act);
-      emit_f32("ffn_moe_down", layer, {H, used, T}, e_down);
-
-      std::vector<float> weighted(T * used * H);
-      std::vector<float> moe_out(T * H);
-      for (std::size_t t = 0; t < T; ++t) {
-        for (std::uint32_t s = 0; s < used; ++s) {
-          const std::size_t slot = t * used + s;
-          for (std::size_t d = 0; d < H; ++d) {
-            weighted[slot * H + d] = e_down[slot * H + d] * scaled[slot];
-          }
-        }
-        // ggml sums the slots left to right in float.
-        for (std::size_t d = 0; d < H; ++d) {
-          float acc = weighted[(t * used) * H + d];
-          for (std::uint32_t s = 1; s < used; ++s) {
-            acc += weighted[(t * used + s) * H + d];
-          }
-          moe_out[t * H + d] = acc;
-        }
-      }
-      emit_f32("ffn_moe_weighted", layer, {H, used, T}, weighted);
-      emit_f32("ffn_moe_out", layer, {H, T, 1}, moe_out);
-
-      // Shared expert: plain SwiGLU, no gate.
-      const std::size_t sff = lw.ffn_gate_shexp.rows;
-      std::vector<float> su(T * sff);
-      std::vector<float> sg(T * sff);
-      MatMul(lw.ffn_up_shexp, 0, fn.data(), T, su.data(), options_);
-      MatMul(lw.ffn_gate_shexp, 0, fn.data(), T, sg.data(), options_);
-      std::vector<float> sa(T * sff);
-      for (std::size_t i = 0; i < T * sff; ++i) {
-        sa[i] = Silu(sg[i]) * su[i];
-      }
-      std::vector<float> shexp(T * H);
-      MatMul(lw.ffn_down_shexp, 0, sa.data(), T, shexp.data(), options_);
-      emit_f32("ffn_shexp", layer, {H, T, 1}, shexp);
-      for (std::size_t i = 0; i < T * H; ++i) {
-        ffn_out[i] = moe_out[i] + shexp[i];
-      }
-    }
+    const std::vector<float> ffn_out =
+        FfnForward(c, lw, fn.data(), T, options_, tap, layer);
     emit_f32("ffn_out", layer, {H, T, 1}, ffn_out);
 
     for (std::size_t i = 0; i < T * H; ++i) {
