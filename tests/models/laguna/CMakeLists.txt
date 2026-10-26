@@ -90,6 +90,20 @@ if (ENGINE_ENABLE_HIP)
   # the drafter, commit, failure rules, batched-decode exclusion, two
   # threads). Nothing is skipped.
   add_laguna_test(dflash_target gufo_laguna "hip;gpu;gfx1151")
+  # The same on the real target (68.6 GiB on the device) and drafter: taps
+  # captured on the device against the CPU oracle's l_out taps (the 9-token
+  # fixture and a 700-token real context), drafts from both tap sets, and four
+  # speculative steps. Without the files it exits 77 and CTest reports a skip,
+  # which verifies nothing.
+  add_laguna_test(dflash_target_real gufo_laguna
+    "hip;gpu;gfx1151;external-model")
+  set_tests_properties(laguna.dflash_target_real PROPERTIES SKIP_RETURN_CODE 77
+    TIMEOUT 3600)
+  # CLI: the drafter's per-pass wall time (DFLASH 6d item 6). Not a test: it
+  # needs the real drafter and the target's head.
+  add_executable(laguna_dflash_cost dflash_cost_cli.cpp)
+  target_link_libraries(laguna_dflash_cost PRIVATE gufo_laguna)
+  add_dependencies(laguna_tests laguna_dflash_cost)
 
   # Full-model GPU executor (phase 4) on random tiny models: the oracle match,
   # chunk-split and decode bit-identity, reset, untapped reruns and the
