@@ -73,8 +73,9 @@ llama.cpp-named taps diffed against `llama-eval-callback` dumps.
    (6a, CPU), the CPU oracle checked against Poolside's fork (6b, 6b-ref),
    the verify-cost decision data (6b-0), the drafter's GPU operators with
    a composed drafter forward (6c) and the target side: tap capture, per-call
-   verify path, rewind, failure rules and the drafter's measured cost (6d).
-   Next: end to end (6e, 6f).
+   verify path, rewind, failure rules and the drafter's measured cost (6d),
+   and the greedy speculative loop with serve and prompt wiring, exact against
+   plain greedy decode (6e). Next: acceptance and speed against the fork (6f).
 
 Lessons source: codexms #965 review of #ai-dev-gufo 12015-16101,
 `/server/staging/laguna/codexms-965-RESULT.txt`. Reference build:
@@ -154,8 +155,11 @@ Decisions and limits:
   `--context` (and keep `--sessions` small) unless that is what you want:
   weights plus the sessions must stay below the free device memory minus the
   4 GiB driver reserve, or the load fails with the budget in its message.
-- **Not supported:** images, speculative decoding (phase 6), disk caches,
-  `gufo prompt` and `gufo chat` (refused with a message).
+- **Speculative decoding** (phase 6e, DFLASH.md): `--speculative dflash2
+  --dflash-model <laguna-s-2.1-DFlash GGUF>`, greedy and other deterministic
+  requests only; sampled requests decode plainly.
+- **Not supported:** images, disk caches, `gufo chat` (refused with a
+  message). `gufo prompt` runs Laguna since 6e.
 
 Tests: `ctest -R '^laguna\.'` (chat template goldens, token goldens, engine,
 serving, bench, functional wiring). `laguna.functional` runs the shared

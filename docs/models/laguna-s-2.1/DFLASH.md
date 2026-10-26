@@ -6,8 +6,10 @@ the drafter's GPU operators with a composed GPU drafter forward (6c, see
 "What phase 6c added"; `src/models/laguna/kernels/dflash_ops.*`, tests
 `laguna.dflash_ops` and `laguna.dflash_gpu_real`) and the target side (6d,
 see "What phase 6d added"; `kernels/dflash_session.*`, tests
-`laguna.dflash_target` and `laguna.dflash_target_real`). End to end (6e, 6f)
-is not done; its items below are proposals. Target
+`laguna.dflash_target` and `laguna.dflash_target_real`) and the speculative decode loop with serve and
+prompt wiring (6e, see "What phase 6e added"; `speculative.*`, tests
+`laguna.speculative`, `laguna.speculative_real`, `laguna.serving`).
+Acceptance and speed tuning against the fork (6f) is not done. Target
 phases 1 to 5 are complete (PLAN.md); this document is the "own feature-layer
 and mask verification" that PLAN.md item 6 asks for.
 
@@ -628,3 +630,193 @@ Open after 6d:
 3. `LagunaSpeculativeTarget` (`ISpeculativeTargetExecutor` adapter with a
    rewind commit), sampling, serve wiring: 6e.
 
+## What phase 6e added (2026-10-26, GPU)
+
+Code (commits cffc548b, 495b5c15, d9d3b9d1, 43a44330):
+
+- `src/models/laguna/speculative.{hpp,cpp}`: `LagunaSpeculativeTarget`, the
+  `ISpeculativeTargetExecutor` adapter over one `DFlashSession` (verify on the
+  pinned vector path; target predictions are the greedy sampler's own argmax
+  of each row, so ties break as plain decode breaks them; the commit of a
+  partly rejected chunk is `DFlashSession::Commit`, a rewind of target and
+  drafter, never a replay; a verify at another position than the session's or
+  a commit that is not a prefix of the rows just verified is refused with
+  nothing touched). `LagunaDraftBackend` (the drafter's block, batched path;
+  a dropped or suspended drafter proposes nothing and the step is
+  target-only). `SpeculativeDecoder` (the shared `SpeculativeVerifier`,
+  batched verification, adaptive length off, block of 2..16 rows, default 4).
+- A step selects the frontier token with a copy of the request's sampler,
+  verifies it with up to B - 1 drafts and emits it plus the accepted drafts,
+  all consumed by the target. The correction token is not emitted: its logit
+  row becomes the session's frontier, so the next step (or a plain decode, a
+  snapshot, a cancelled request, a reused prefix) selects it again exactly as
+  plain decode would. The session state after a step is the state plain
+  decode reaches after the same tokens; serve needed no pending-token or
+  rollback machinery.
+- Engine: `Model::AttachDrafter` (pairing, memory check against the device,
+  upload), sessions with a `DFlashSession` and decoder, the vector path warmed
+  for a verify of B rows at session creation (6d open item 2),
+  `Session::DecodeSpeculative`, `SuspendDrafter`. `DFlashSession` gained
+  Suspend/Resume (a sampled request clears the executor's taps so
+  `EvaluateBatch`/`DecodeBatch` take it; resuming restarts the ring cold at
+  the position), SaveDrafter/RestoreDrafter (`DrafterKv::Export/Import`, the
+  whole 544-row ring, 13,369,344 bytes) and a prefill `following` hint (a
+  prompt chunk injects only rows a block at the prompt's end can read).
+- Snapshots carry the drafter ring (decision 1 of 6d: preferred over a cold
+  drafter). A snapshot taken while the drafter is out of step or suspended
+  has no ring; restoring it starts the ring empty at the restored position
+  (cold, documented fallback), never with the rows the session held before.
+- Batched decode (rule 6): a session whose executor has taps decodes alone;
+  `EvaluateBatch` routes it to `Evaluate`. In serve, a request speculates
+  only while it decodes alone (`DecodeStep`); when the scheduler has several
+  requests ready (`DecodeBatch`) all of them, greedy included, are suspended
+  and decode plainly in shared passes, and a greedy request resumes
+  speculation with a cold ring afterwards. A first version that verified the
+  speculating requests one after another next to a batched pass of the
+  sampled ones failed the functional `batch` suite (a greedy and a sampled
+  request in flight together must report physical width 2), which passes
+  without speculation on the same binary.
+- Sampling: greedy only. The lossless rejection-sampling verifier was not
+  wired: it needs the drafter's sampled proposal distribution and a published
+  correction token (the frontier design above re-selects it, which is exact
+  only for deterministic requests). A request that samples at random
+  (`uses_random_sampling()`: temperature > 0 and top_k != 1) decodes plainly
+  on a suspended session; deterministic requests that are not plain argmax
+  (grammars, penalties, reasoning budgets, top_k 1) speculate, with the
+  sampler run through the draft prefix by the verifier. Shared change for
+  that: `SpeculativeOptions::draft_deterministic_sampled` (opt-in, default
+  off; Qwen backends unchanged).
+- Serve: `gufo serve llm --speculative dflash2 --dflash-model
+  <laguna-s-2.1-DFlash-Q4_K.gguf>`; `--draft-tokens N` sets B = N + 1 (1..15),
+  else B = 4; `--draft-policy`/`--min-draft-tokens` do not apply. The runner
+  advertises multi-token and batched multi-token decode only with a drafter;
+  resource claims include the drafter and per-session drafter buffers. A
+  drafter model served without `--speculative` is refused. `gufo prompt` got a
+  Laguna path (with or without the drafter; `gufo chat` still refuses).
+  Shared serve/prompt changes: `TextSpeculativeConfig::max_draft_tokens_supplied`
+  (set from `--draft-tokens`), `PromptOptions::draft_tokens_supplied`, help text.
+
+Tests (`ctest -R '^laguna\.(speculative|speculative_real|serving)$'`, under the
+GPU lock):
+
+- `laguna.speculative` (tiny models, nothing skipped): every run equals plain
+  greedy decode on a second model of the same weights without a drafter
+  (tokens, stop, position, frontier logits bit for bit). 105 runs over prompts
+  of 9, 509..515, 600, 2048, 8192 and chat prompts with thinking on/off, with
+  the random tiny drafter, an oracle (all accepted) and a corrupted oracle
+  (partial), blocks 4/8/16; EOS 2 and EOT 24 made greedy winners by aliased
+  head rows, drafted through, stop_at_eos on and off (16 runs); max_tokens 1,
+  2, 3, 5, 9 inside a block of 8; a Laguna tool-call grammar (with and without
+  reasoning), repeat penalty and top_k 1 through the draft prefix (oracle
+  drafts accepted, so constrained requests really speculate); snapshot and
+  restore with the ring (drafts after restore equal bit for bit) and without
+  it (cold, not stale); negative checks (wrong anchor position, commit past /
+  off / from elsewhere, random sampling refused, a target failure inside a
+  step resets the session and re-arms the drafter, the drafter on a poisoned
+  target is dropped and refuses to draft, a drafter failure mid-request
+  continues target-only and exact); `EvaluateBatch` with drafting and
+  suspended sessions; 2 and 8 concurrent sessions (speculating greedy and
+  plain sampled mixed) equal their solo runs; chunk 16 with block 16.
+- `laguna.serving` gained a speculative server: greedy chat equals the plain
+  model (thinking on/off) and drafts; a required tool call equals the plain
+  server and drafts; a sampled request does not speculate and equals the
+  plain server; then the whole existing suite (chat, snapshots and prefix
+  reuse, cancellation queued and mid-decode with retry, multi-session,
+  batched greedy+sampled with a peer cancelled and a device error in a shared
+  step, failure injection in prefill/decode/restored requests, tool prompts,
+  context limit) on it.
+- `laguna.speculative_real` (real target and drafter): exact on every run, no
+  divergence anywhere. Per run (steps, accepted/drafted, smallest plain top-2
+  logit gap decoded through):
+
+  | Prompt | B | tokens | accepted/drafted | accepted/step | min gap |
+  | --- | --- | --- | --- | --- | --- |
+  | code 509..515 (7 prompts) | 4 | 40 each | 25..26 / 40..42 | 1.67..1.86 | 0.098 |
+  | code 512 | 8 / 16 | 40 | 29/76, 29/142 | 2.64 | 0.216 |
+  | code 2048 | 4 / 8 / 16 | 48 | 34/39, 40/45, 41/78 | 2.43, 5.00, 5.86 | 1.85 |
+  | code 8192 | 4 | 48 | 33/40 | 2.20 | 0.084 |
+  | code 32768 (`--long`) | 4 | 48 | 32/45 | 2.00 | 0.250 |
+  | chat code, think | 4 / 8 | 96 | 67/87, 78/119 | 2.31, 4.33 | 0.640 |
+  | chat chat, think | 4 / 8 | 96 | 47/141, 47/321 | 0.96 | 0.045 |
+  | chat code, no think | 4 / 8 | 96 | 68/81, 80/106 | 2.43, 5.00 | 0.073 |
+  | chat chat, no think | 4 / 8 | 96 | 53/126, 57/270 | 1.23, 1.46 | 0.011 |
+  | tool grammar, no think / think | 4, 8 | 38 / 39, stop | 17/63..154 | 0.77..0.81 | 1.76 |
+  | short answers ending on EOT (3 prompts) | 4/8/16 | 1..5, stop | | | 0.155 |
+  | ignore_eos short answer | 8 | 24 | 5/112 | 0.26 | 0.155 |
+  | max_tokens 1, 2, 3, 6, 11 | 8 | as asked | 0/0 .. 8/10 | | 2.0 |
+
+  The smallest gap decoded through exactly was 0.0107 (chat, no think). The
+  real drafter never proposed EOS or EOT in any watched block (tool calls,
+  three short answers, ignore_eos): stop tokens inside a draft are covered by
+  the tiny test only. Snapshot/restore at 700 + 20 tokens: drafts after
+  restore bit-identical, 40 more tokens accepted 25/43 on both. 2 and 8
+  sessions on threads (half speculating greedy, half sampled at temperature
+  1.0 / top_k 20 on suspended sessions) each equal their solo runs.
+
+Smoke A/B (not the 6f verdict): `laguna_speculative_real_test --ab --rounds 5
+--tokens 160`, one process loads the model and runs plain, B = 4 and B = 8 on
+reused sessions, the mode order reversed every other round and prompt, round
+0 dropped, decode wall time only (prefill excluded), unprofiled; run twice
+(two loads) back to back in one lock hold (13:14:51 to 13:37:01 EDT).
+Greedy, 160 tokens, chat template; every speculative output equal to plain.
+Median tok/s (load 1 / load 2), speedup and mean accepted drafts per step:
+
+| prompt (prompt tokens) | plain | B = 4 | B = 8 |
+| --- | --- | --- | --- |
+| code, no think (71) | 27.17 / 27.18 | 35.48 / 35.51 (1.31x, 1.91) | 28.19 / 28.20 (1.04x, 2.90) |
+| prose summary, no think (2237) | 22.24 / 22.22 | 24.27 / 24.29 (1.09x, 1.16) | 15.54 / 15.55 (0.70x, 1.25) |
+| chat, think (67) | 27.23 / 27.23 | 29.25 / 29.30 (1.07x, 1.32) | 19.82 / 19.83 (0.73x, 1.67) |
+| code explanation, no think (1580) | 22.90 / 22.88 | 24.04 / 24.07 (1.05x, 1.13) | 15.00 / 15.00 (0.66x, 1.19) |
+
+B = 4 wins on all four (1.05x to 1.31x); B = 8 only breaks even on code and
+loses 27 to 34 percent elsewhere, as the 6b-0 tables predict at short
+context (a step costs about the 6b-0 verify time plus 9 to 11 ms of drafter
+and injection: code B = 4 is 55 steps in 4.52 s, 82 ms per step against
+77 + 9 estimated). The two loads agree within 0.2 percent. Data:
+`/server/staging/laguna/dflash-6e/ab.log`, `ab-load{1,2}.csv`.
+
+Functional suites with `--speculative dflash2 --dflash-model ...` (per-suite
+impact.json configurations, `build/gpu-test-tools/gufo`, under the lock;
+`/server/staging/laguna/dflash-6e/functional-spec-{core2,cache2,tools2}`):
+core 15 of 16 (reasoning-budget fails), cache 7 of 7, tools 6 of 7 (`tools`
+fails in auto-tools). The same binary without speculation fails the same two
+the same way (identical text; `functional-plain-failing/`): the
+reasoning-budget control request gets no reasoning from Laguna, and with
+tool_choice auto it declines to call the tool; both also failed in the phase
+5 runs. `batch` failed with the first serve policy (see Batched decode) and
+passes now. Not run at the final commit: the full `ctest -R '^laguna\.'`
+(GPU handed to Hindsight; see `dflash-6e/PAUSED.md`).
+
+GPU use: 2026-10-26, one process at a time under the admission lock
+(`dflash-6e/gpu-windows.log`): 12:27 to 12:39 (tiny tests, the real matrix
+12:30 to 12:39), 12:59 to 13:14 (matrix with 32k), 13:14 to 13:37 (A/B),
+13:38 to 13:41 (shared regressions), 13:41 to 14:31 (functional), 15:05 to
+15:08 (plain rerun of the failing suites), 15:09 to 16:02 (functional on the
+final binary). Waits for Flash-Next holding the lock: 12:41 to 12:59 and
+14:31 to 15:05; builds waited 11:51 to 12:24 for host memory.
+
+Open after 6e (6f):
+
+1. Acceptance against the fork on the same prompts and the per-position
+   acceptance curve; the drafter's acceptance on chat (about 1 accepted per
+   step at B = 4) is far below code (2 to 2.4).
+2. Block length: B = 4 is the right default at short context; an adaptive
+   controller priced on the measured verify table (6b-0 c) and this step cost
+   (verify + about 10 ms) could move to B = 8 for code and deep contexts and
+   back to plain decode when acceptance stays near zero (chat think runs
+   accepted 0.96 per step: a B = 4 step then costs more than it saves).
+3. Sampled requests (the default preset, temperature 1.0 / top_k 20) do not
+   speculate: the lossless sampled verifier needs the drafter's sampled
+   proposal rows and a published correction token.
+4. Drafter cost per step (9 to 11 ms with the injections) is a quarter of a
+   decode token; a fused drafter block and a cheaper verify for 4 to 8 rows
+   (6b-0: the vector MoE path is 30 to 100 ms over its bandwidth floor at 8
+   to 16 rows) are the speed levers.
+5. Concurrent requests do not speculate (serve suspends every session of a
+   batched decode step). Speculating under concurrency needs a ragged
+   multi-session verify pass with per-row tap capture (rule 6's later item);
+   whether it beats plain batched decode on this MoE is unmeasured.
+6. A suspended drafter resumes cold (an empty ring at the resume position),
+   after a sampled request on the same session or after a period of
+   concurrent decoding; acceptance right after a resume is unmeasured, and a
+   short plain warm-up with capture may be worth it.
