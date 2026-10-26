@@ -295,6 +295,9 @@ public:
   /// tap stage names; empty disables), whether or not a tap is set. Used to
   /// exercise failures after the K/V append.
   void SetFailAfterStage(std::string stage) { fail_after_ = std::move(stage); }
+  [[nodiscard]] const std::string& FailAfterStage() const {
+    return fail_after_;
+  }
 
 private:
   /// One device scratch buffer; grows by allocate-then-swap.

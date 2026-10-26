@@ -417,6 +417,43 @@ void Failure(const ml::Model& model) {
             << std::size(stages) << " stages)\n";
 }
 
+// A pass wider than one group runs as several groups (17 rows at chunk 16:
+// 16 + 1). An injected session fault fails only the group holding that
+// session; the other group completes and matches its solo twins (codexms
+// #977: the hook used to be applied to the overall first executor only).
+void SplitGroupFailure(const ml::Model& model) {
+  constexpr std::size_t kRows = 17;
+  for (const std::size_t faulty : {std::size_t{16}, std::size_t{3}}) {
+    std::vector<std::size_t> starts(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+      starts[i] = 1 + (i * 7) % 45;
+    }
+    Group g = MakeGroup(model, starts, 6000 + faulty);
+    const Tokens t = RandomTokens(model, kRows, 6100 + faulty);
+    g.batch[faulty]->InjectFailureForTesting("attn");
+    std::vector<ml::Session::BatchItem> items(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+      items[i] = {g.batch[i].get(), t[i], false, {}};
+    }
+    ml::Session::EvaluateBatch(items);
+    const bool second_group = faulty >= 16;
+    for (std::size_t i = 0; i < kRows; ++i) {
+      const bool in_failed_group = (i >= 16) == second_group;
+      if (in_failed_group) {
+        Require(!items[i].completed && g.batch[i]->failures() == 1,
+                "the group holding the faulty session fails");
+      } else {
+        std::string error;
+        Require(items[i].completed && g.batch[i]->failures() == 0 &&
+                    g.solo[i]->Evaluate(t[i], &error) &&
+                    Same(g.batch[i]->Logits(), g.solo[i]->Logits()),
+                "the other group completes and matches its solo twin");
+      }
+    }
+  }
+  std::cout << "split-group failure ok (fault in the second and first group)\n";
+}
+
 // ---- untapped, tapped, threads ------------------------------------------
 
 std::vector<std::vector<float>> RunScript(const ml::Model& model, bool tapped,
@@ -515,6 +552,7 @@ int main() {
     Membership(*fixture.model);
     Rejection(*fixture.model);
     Failure(*fixture.model);
+    SplitGroupFailure(*fixture.model);
     UntappedAndTapped(*fixture.model);
     Threads(*fixture.model);
   } catch (const std::exception& e) {

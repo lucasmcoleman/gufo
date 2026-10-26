@@ -78,6 +78,9 @@ struct DecodeItem {
   std::int32_t token{0};
   /// Receives the [vocab] logits of the token, as Forward(kLast) would.
   float* logits{nullptr};
+  /// Test hook: an attention stage after which this row's pass fails.
+  /// DecodeBatch applies the first one in each group to that group only.
+  std::string fail_stage;
   /// Outputs. `completed` means the token was appended and `logits` filled;
   /// otherwise `error` says why (see DecodeBatch for what was touched).
   bool completed{false};

@@ -577,6 +577,16 @@ void Executor::DecodeBatch(std::span<DecodeItem> items) {
       }
     }
     pending = std::move(rest);
+    // A group runs on its first executor's attention ops, so an injected
+    // fault must be applied there, and only for a group that carries one.
+    AttnOps& ops = group.front()->executor->attention_ops();
+    const std::string previous = ops.FailAfterStage();
+    for (const DecodeItem* item : group) {
+      if (!item->fail_stage.empty()) {
+        ops.SetFailAfterStage(item->fail_stage);
+        break;
+      }
+    }
     if (group.size() == 1) {
       DecodeItem* item = group.front();
       const std::int32_t token = item->token;
@@ -586,6 +596,7 @@ void Executor::DecodeBatch(std::span<DecodeItem> items) {
     } else {
       RunGroup(group);
     }
+    ops.SetFailAfterStage(previous);
   }
 }
 

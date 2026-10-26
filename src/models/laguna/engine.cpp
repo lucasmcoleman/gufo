@@ -360,20 +360,11 @@ void Session::EvaluateBatch(std::span<BatchItem> items) {
   }
   Session* lead = accepted.front()->session;
   const Model& model = *lead->model_;
-  // One pass, one injected fault: a pending model-wide fault, else the first
-  // session that carries its own. It fails the pass for every participant,
-  // as a device error in a shared pass would.
-  std::string stage;
-  bool have_stage = model.TakeInjectedFailure(&stage);
-  for (const BatchItem* item : accepted) {
-    if (!have_stage && item->session->injected_) {
-      stage = item->session->inject_stage_;
-      have_stage = true;
-    }
-  }
-  if (have_stage) {
-    lead->executor_->attention_ops().SetFailAfterStage(stage);
-  }
+  // Injected faults: a pending model-wide fault applies to every row, else
+  // each session carries its own. DecodeBatch fails each group that holds
+  // one, as a device error in that shared pass would, and no other group.
+  std::string model_stage;
+  const bool model_fault = model.TakeInjectedFailure(&model_stage);
   std::vector<rocm::DecodeItem> work(accepted.size());
   for (std::size_t i = 0; i < accepted.size(); ++i) {
     Session& session = *accepted[i]->session;
@@ -381,12 +372,13 @@ void Session::EvaluateBatch(std::span<BatchItem> items) {
     work[i].executor = session.executor_.get();
     work[i].token = accepted[i]->token;
     work[i].logits = session.logits_.data();
+    if (model_fault) {
+      work[i].fail_stage = model_stage;
+    } else if (session.injected_) {
+      work[i].fail_stage = session.inject_stage_;
+    }
   }
   rocm::Executor::DecodeBatch(work);
-  if (have_stage) {
-    lead->executor_->attention_ops().SetFailAfterStage(
-        lead->injected_ ? lead->inject_stage_ : std::string());
-  }
   for (std::size_t i = 0; i < accepted.size(); ++i) {
     BatchItem& item = *accepted[i];
     if (work[i].completed) {
