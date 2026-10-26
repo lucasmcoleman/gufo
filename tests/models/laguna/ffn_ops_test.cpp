@@ -204,6 +204,43 @@ void TestCheckerRejects() {
                   ok.quant.first + ok.first);
     }
   }
+  // codexms #971: equal magnitudes of opposite sign (+0.5, -0.5) with codes
+  // +1 and 0. Each code alone is a legitimate rounding of a .5 boundary, but
+  // roundf with one positive multiplier gives q(-x) = -q(x). Every layout.
+  {
+    auto xs = x;
+    xs[1] = 0.5F;
+    xs[2] = -0.5F;
+    auto qs = q;
+    qs[1] = 1;
+    ExpectRejected(
+        "opposite-sign equal magnitudes with asymmetric codes (+0.5, -0.5 -> "
+        "+1, 0)",
+        CheckFabricated(xs, qs, 1.0F, 128.0F, {1, 2}, {1.0F, 0.0F}), true);
+    for (const int layout : {QFN_MMQ_ACT_MMQ_D4, QFN_MMQ_ACT_MMQ_DS4}) {
+      const QuantStats st =
+          ValidateQuantRows(Fabricate(layout, qs, 1.0F, 128.0F), xs, 1);
+      ExpectRejected(std::string("asymmetric opposite-sign codes in ") +
+                         LayoutName(layout),
+                     Rejection(st), true);
+    }
+    // A code with the opposite sign of its input.
+    auto qn = q;
+    qn[1] = -1;
+    ExpectRejected("a code with the opposite sign of its input (+0.5 -> -1)",
+                   CheckFabricated(xs, qn, 1.0F, 126.0F, {1}, {-1.0F}), true);
+    // Symmetric codes either way are fine: (+1, -1) and (0, 0).
+    for (const std::int8_t c : {0, 1}) {
+      auto qc = q;
+      qc[1] = c;
+      qc[2] = static_cast<std::int8_t>(-c);
+      const auto ok =
+          CheckFabricated(xs, qc, 1.0F, 127.0F, {1, 2}, {float(c), float(-c)});
+      Require(ok.quant.violations == 0 && ok.unexplained == 0,
+              "checker rejected symmetric codes for opposite-sign inputs: " +
+                  ok.quant.first + ok.first);
+    }
+  }
   // A single wrong code far from any boundary: 40.2 -> 41.
   {
     auto xw = x;

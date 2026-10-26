@@ -791,6 +791,35 @@ inline void ValidateBlock(const float* x, const std::int8_t* q, float d,
       return;
     }
   }
+  // roundf of x * m with one positive m is odd-symmetric: q(-x) = -q(x). So a
+  // code never has the opposite sign of its input, and equal magnitudes get
+  // equal code magnitudes (larger magnitudes no smaller ones).
+  for (int j = 0; j < 32; ++j) {
+    if ((x[j] > 0.0F && q[j] < 0) || (x[j] < 0.0F && q[j] > 0) ||
+        (x[j] == 0.0F && q[j] != 0)) {
+      why << "element " << j << " x=" << x[j] << " has code " << int{q[j]}
+          << " of the opposite sign";
+      Violation(st, why.str());
+      return;
+    }
+  }
+  std::sort(order.begin(), order.end(),
+            [&](int a, int c) { return std::fabs(x[a]) < std::fabs(x[c]); });
+  for (int i = 1; i < 32; ++i) {
+    const int a = order[i - 1];
+    const int c = order[i];
+    const int qa = std::abs(int{q[a]});
+    const int qc = std::abs(int{q[c]});
+    const float xa = std::fabs(x[a]);
+    const float xc = std::fabs(x[c]);
+    if ((xa == xc && qa != qc) || (xa < xc && qa > qc)) {
+      why << "elements " << a << " and " << c << " (x=" << x[a] << ", " << x[c]
+          << ") have codes " << int{q[a]} << ", " << int{q[c]}
+          << ": rounding with one positive multiplier is odd-symmetric";
+      Violation(st, why.str());
+      return;
+    }
+  }
   if (rho_lo > rho_hi) {
     why << "no single multiplier within " << b.multiplier / u
         << "u of 127/amax reproduces every code of the block";
