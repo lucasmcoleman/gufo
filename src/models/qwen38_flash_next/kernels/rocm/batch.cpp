@@ -60,6 +60,9 @@ Executor::Scratch Executor::RowScratch(const Scratch& b,
   auto s = b;
   s.tokens += r;
   s.res += r * c.HcDim();
+  if (s.res_h != nullptr) {
+    s.res_h += r * c.HcDim();
+  }
   s.xn += r * c.HcDim();
   s.xn_half += r * c.HcDim();
   s.lo += r * c.hc_low_rank;

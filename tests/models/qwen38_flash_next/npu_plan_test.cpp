@@ -220,6 +220,112 @@ void CheckRuntimeMkStreams(const std::string& npu_dir) {
           "runtime_mk 4096x2560 stream now exists: update NPU-ROUND notes");
 }
 
+/// Two-bank split (mikealanni/gufo 58fac455): whole 4096-token groups, bank
+/// A takes the extra group of an odd count, bank B fits max_batch / 2.
+void CheckTwoBankSplit() {
+  constexpr std::uint32_t kTile16k = 16384 + 128;  // PrefillThroughCapacity
+  struct Case {
+    std::size_t n;
+    std::uint32_t max_batch;
+    bool relaxed;
+    bool ok;
+    std::uint32_t a;
+    std::uint32_t b;
+  };
+  const Case cases[] = {
+      {8192, kTile16k, false, true, 4096, 4096},
+      {12288, kTile16k, false, true, 8192, 4096},
+      {16384, kTile16k, false, true, 8192, 8192},
+      {24576, 24576 + 128, false, true, 12288, 12288},
+      {20480, 24576 + 128, false, true, 12288, 8192},
+      // Too short, not whole groups, wider than the batch, bank B too wide.
+      {4096, kTile16k, false, false, 0, 0},
+      {8191, kTile16k, false, false, 0, 0},
+      {10000, kTile16k, false, false, 0, 0},
+      {20480, kTile16k, false, false, 0, 0},
+      {8192, 8192 + 128, false, true, 4096, 4096},
+      // Bank A (8192) would exceed the 8192 + 128 batch's bank B limit only
+      // for B; here B = 4096 fits, so 12288 rows are accepted.
+      {12288, 12288 + 128, false, true, 8192, 4096},
+      // Bank B (relaxed remainder) wider than half the batch.
+      {12000, 12100, true, false, 0, 0},
+      // The ordinary 4096-token tile never qualifies.
+      {4096 + 128, 4096 + 128, false, false, 0, 0},
+      // Relaxed: bank B takes the remainder.
+      {10000, kTile16k, true, true, 4096, 5904},
+      {12000, kTile16k, true, true, 4096, 7904},
+  };
+  for (const Case& c : cases) {
+    const auto split = qfn::PlanTwoBank(c.n, c.max_batch, c.relaxed);
+    const std::string where = "PlanTwoBank(" + std::to_string(c.n) + ", " +
+                              std::to_string(c.max_batch) + ")";
+    if (!c.ok) {
+      Require(!split.has_value(), where + " accepted");
+      continue;
+    }
+    Require(split.has_value(), where + " rejected");
+    Require(split->a == c.a && split->b == c.b,
+            where + " split " + std::to_string(split->a) + "+" +
+                std::to_string(split->b));
+    Require(split->a + split->b == c.n, where + " lost tokens");
+  }
+}
+
+void CheckTwoBankChunking() {
+  Require(qfn::TwoBankChunk(16384) == 16384, "16384 rounded");
+  Require(qfn::TwoBankChunk(16384 + 128) == 16384, "16512 not rounded down");
+  Require(qfn::TwoBankChunk(12288) == 8192, "12288 not rounded down");
+  Require(qfn::TwoBankChunk(8192) == 8192, "8192 rounded");
+  Require(qfn::TwoBankChunk(4096) == 4096, "4096 rounded");
+  Require(qfn::TwoBankChunk(3000) == 3000, "a short chunk rounded");
+  Require(qfn::WholeGroupsPerBank(16384 + 128, 4096) == 2,
+          "16K tile: two whole groups per bank");
+  Require(qfn::WholeGroupsPerBank(24576 + 128, 4096) == 3,
+          "24K tile: three whole groups per bank");
+  Require(qfn::WholeGroupsPerBank(65536 + 128, 4096) == 3,
+          "whole groups per bank not capped at three");
+  Require(qfn::WholeGroupsPerBank(4096 + 128, 4096) == 0,
+          "the 4096 tile gets whole groups");
+  Require(qfn::WholeGroupsPerBank(16384, 0) == 0, "zero group size");
+  // Up to a 24576 tile every bank PlanTwoBank produces from an engine chunk
+  // fits the staged NPU groups; a wider tile's 16384-row banks do not, and
+  // ForwardPair then runs lock-step without the whole-projection mode.
+  for (const std::uint32_t tile : {8192U, 16384U, 24576U}) {
+    const std::uint32_t max_batch = tile + 128;
+    const std::uint32_t groups = qfn::WholeGroupsPerBank(max_batch, 4096);
+    for (std::size_t n = 8192; n <= max_batch; n += 4096) {
+      const auto split =
+          qfn::PlanTwoBank(qfn::TwoBankChunk(n), max_batch, false);
+      if (split) {
+        Require(split->a / 4096 <= groups && split->b / 4096 <= groups,
+                "tile " + std::to_string(tile) + ": bank wider than the " +
+                    "staged NPU groups at n=" + std::to_string(n));
+      }
+    }
+  }
+}
+
+void CheckWideTileFallsBack() {
+  const std::uint32_t max_batch = 32768 + 128;
+  const auto split = qfn::PlanTwoBank(32768, max_batch, false);
+  Require(split.has_value() && split->a == 16384, "32768 split");
+  Require(split->a / 4096 > qfn::WholeGroupsPerBank(max_batch, 4096),
+          "a 16384-row bank now fits the staged groups: update the notes");
+}
+
+void CheckPrefillTile() {
+  Require(qfn::ParsePrefillTile(nullptr, 4096) == 4096, "unset tile");
+  Require(qfn::ParsePrefillTile("", 4096) == 4096, "empty tile");
+  Require(qfn::ParsePrefillTile("16384", 4096) == 16384, "16384 rejected");
+  Require(qfn::ParsePrefillTile("128", 4096) == 128, "128 rejected");
+  Require(qfn::ParsePrefillTile("65536", 4096) == 65536, "65536 rejected");
+  for (const char* bad :
+       {"127", "65537", "16k", "-1", "1e4", " 8192", "99999999999999999999"}) {
+    Require(qfn::ParsePrefillTile(bad, 4096) == 4096,
+            std::string("accepted tile ") + bad);
+  }
+}
+
 void CheckFixedPair(const std::string& npu_dir) {
   const auto files =
       qfn::NpuProgramPaths(npu_dir, qfn::NpuProgram::kFixed, 4096, 2560);
@@ -239,6 +345,10 @@ int main() {
     CheckFixedPair(npu_dir);
     CheckRuntimeKStreams(npu_dir);
     CheckRuntimeMkStreams(npu_dir);
+    CheckTwoBankSplit();
+    CheckTwoBankChunking();
+    CheckWideTileFallsBack();
+    CheckPrefillTile();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "npu_plan_test: %s\n", e.what());
     return 1;

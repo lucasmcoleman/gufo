@@ -94,6 +94,14 @@ bool NpuGemm::Wait(hipStream_t /*stream*/) {
   return false;
 }
 
+bool NpuGemm::Wait(hipStream_t /*stream*/, std::uint64_t /*ticket*/) {
+  return false;
+}
+
+std::uint64_t NpuGemm::Ticket() const noexcept {
+  return 0;
+}
+
 bool NpuGemm::Healthy() const noexcept {
   return false;
 }

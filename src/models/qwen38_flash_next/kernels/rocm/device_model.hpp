@@ -53,6 +53,11 @@ struct DeviceLayer {
   /// in 1024-row slices with the unused rows left unwritten); empty when
   /// unused.
   std::vector<int> npu_shexp;
+  /// NPU buffer ids of all 16 slices of ssm_in and all 13 of attn_qkv,
+  /// staged only for the two-bank whole-projection prefill
+  /// (GUFO_TWO_BANK=1 GUFO_NPU_WHOLE=1); empty otherwise.
+  std::vector<int> npu_ssm_all;
+  std::vector<int> npu_qkv_all;
   /// alpha and beta rows stacked: [hidden -> 2 * v_heads] F16.
   DeviceTensor ssm_alpha_beta;
   DeviceTensor attn_q, attn_k, attn_v, attn_out, attn_q_norm, attn_k_norm,

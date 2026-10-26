@@ -35,6 +35,23 @@ hold it before starting. The clock and power mode reset at boot.
 | `GUFO_NPU_SHEXP` | on | `0` keeps the shared-expert gate and up projections on the GPU. |
 | `GUFO_NPU_LAYERS` | all | Limit how many linear-attention layers use the NPU. |
 
+### Two-bank prefill and the F16 residual (experimental, default off)
+
+Ported from mikealanni/gufo (MIT, Mike Alani). All four switches stay off
+until the hardware A/B; none changes a default path.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `GUFO_PREFILL_TILE` | `4096` | Prefill chunk in tokens (128 to 65536). The two-bank prefill needs at least 8192; the fork runs 16384. Scratch grows with it (about 9 GiB at 16384, plus about 4.5 GiB for bank B). |
+| `GUFO_TWO_BANK` | unset | `1` splits a prefill chunk of 8192 tokens or more (whole 4096-token groups) into two banks that advance layer by layer. Without `GUFO_NPU_WHOLE` the banks run the ordinary layer code in lock-step (expected to match the one-bank result). `2` also accepts chunks that are not a multiple of 4096. Checkpoint passes and image prompts keep the one-bank path. |
+| `GUFO_NPU_WHOLE` | unset | With `GUFO_TWO_BANK=1`: the complete `ssm_in` (16 slices) and `attn_qkv` (13 slices) projections run on the NPU one bank ahead, and the GPU reads them straight from the NPU streams (convolution, gated norm, query/gate preparation). Not bit-identical (block-float projections). About 3.3 GiB more NPU weight buffers. |
+| `GUFO_NPU_WHOLE_CHUNKED` | on within `GUFO_NPU_WHOLE` | The whole-projection linear layers use F16 convolution rows and the chunked (WY-form) gated delta rule, about 6e-4 relative against the row-split scan. `0` keeps F32 rows and the row-split scan, to separate its cost in an A/B. |
+| `GUFO_F16_RESIDUAL` | unset | `1` keeps the prefill residual in F16 between the combines of large wide-prefill chunks (1024 rows or more), with or without the NPU. The fork measured +0.5% perplexity and +1.5% prefill with the NPU. Independent of `GUFO_TWO_BANK`. |
+
+The fork's two-bank code restored the primary scratch only on success, and its
+draft block skipped the pair (last row of bank A, first token of bank B),
+shifting bank B's draft-cache positions by one; both are fixed here.
+
 ### Reliability and diagnostics
 
 | Variable | Default | Effect |

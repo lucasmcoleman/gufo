@@ -804,9 +804,35 @@ __device__ __forceinline__ void HcInjectPart(
 /// between the two passes, reduces the four stream norms in one block
 /// reduction, and quantizes each 32-wide block over its eight lanes with a
 /// four-code store. Rows of four streams up to 2,560 wide.
-template<typename XnT, bool kDefer = false, bool kInject = false>
+/// Residual rows are float4 groups in F32, or (GUFO_F16_RESIDUAL, large
+/// wide-prefill chunks) the same four elements stored as F16. F16 stores
+/// saturate at the F16 range instead of overflowing to infinity. Ported from
+/// mikealanni/gufo e98c06cb (MIT, Mike Alani).
+__device__ __forceinline__ float4 LoadResRow(const float* p) {
+  return *reinterpret_cast<const float4*>(p);
+}
+__device__ __forceinline__ float4 LoadResRow(const __half* p) {
+  const float2 a = __half22float2(*reinterpret_cast<const __half2*>(p));
+  const float2 b = __half22float2(*reinterpret_cast<const __half2*>(p + 2));
+  return float4{a.x, a.y, b.x, b.y};
+}
+__device__ __forceinline__ float SaturateHalf(float x) {
+  return x != x ? x : fminf(fmaxf(x, -65504.0F), 65504.0F);
+}
+__device__ __forceinline__ void StoreResRow(float* p, float4 v) {
+  *reinterpret_cast<float4*>(p) = v;
+}
+__device__ __forceinline__ void StoreResRow(__half* p, float4 v) {
+  *reinterpret_cast<__half2*>(p) =
+      __floats2half2_rn(SaturateHalf(v.x), SaturateHalf(v.y));
+  *reinterpret_cast<__half2*>(p + 2) =
+      __floats2half2_rn(SaturateHalf(v.z), SaturateHalf(v.w));
+}
+
+template<typename XnT, bool kDefer = false, bool kInject = false,
+         typename ResT = float>
 __global__ void HcCombineVec4Kernel(
-    float* res, const float* block_out, const float* inject,
+    ResT* res, const float* block_out, const float* inject,
     std::uint32_t inject_parts, const float* gamma, XnT* xn, void* xn_q8,
     std::uint32_t hidden, float eps, float* defer_w,
     const float* inject_w = nullptr, float* inject_out = nullptr) {
@@ -836,7 +862,7 @@ __global__ void HcCombineVec4Kernel(
           w[threadIdx.x];
     }
   }
-  float* dst = res + static_cast<std::size_t>(t) * hc_dim;
+  ResT* dst = res + static_cast<std::size_t>(t) * hc_dim;
   const float* src = block_out + static_cast<std::size_t>(t) * hidden;
   const std::uint32_t chunks = static_cast<std::uint32_t>(hc_dim / 4);
   float4 v[kMaxChunks];
@@ -849,12 +875,12 @@ __global__ void HcCombineVec4Kernel(
       const std::uint32_t s = e / hidden;
       const std::uint32_t i = e - (s * hidden);
       const float ws = w[s];
-      const float4 r = *reinterpret_cast<const float4*>(dst + e);
+      const float4 r = LoadResRow(dst + e);
       const float4 b = *reinterpret_cast<const float4*>(src + i);
       v[c] = float4{r.x + b.x * ws, r.y + b.y * ws, r.z + b.z * ws,
                     r.w + b.w * ws};
       if constexpr (!kDefer) {
-        *reinterpret_cast<float4*>(dst + e) = v[c];
+        StoreResRow(dst + e, v[c]);
       }
       const float sq =
           v[c].x * v[c].x + v[c].y * v[c].y + v[c].z * v[c].z + v[c].w * v[c].w;
@@ -975,9 +1001,10 @@ __global__ void HcCombineVec4Kernel(
 /// their weights and the gated shared expert (MoeEpilogueVec4Kernel), so the
 /// block output never round-trips memory. Threads own hidden lanes (up to
 /// three float4 each) across the four streams.
-template<bool kNormalize, bool kPrior = false, bool kInject = false>
+template<bool kNormalize, bool kPrior = false, bool kInject = false,
+         typename ResT = float>
 __global__ void HcCombineMoeF16Kernel(
-    float* res, const __half* expert_out, const float* weights,
+    ResT* res, const __half* expert_out, const float* weights,
     const float* shared_out, const float* gate, std::uint32_t gate_stride,
     std::uint32_t used, const float* inject, std::uint32_t inject_parts,
     const float* gamma, __half* xn, void* xn_q8, std::uint32_t hidden,
@@ -999,7 +1026,7 @@ __global__ void HcCombineMoeF16Kernel(
     }
     w[s] = 2.0f * SigmoidF(logit / static_cast<float>(kStreams));
   }
-  float* dst = res + static_cast<std::size_t>(t) * hc_dim;
+  ResT* dst = res + static_cast<std::size_t>(t) * hc_dim;
   // The block output: sum of the weighted expert rows plus the gated shared
   // expert, per hidden chunk.
   const float g = SigmoidF(gate[static_cast<std::size_t>(t) * gate_stride]);
@@ -1037,7 +1064,7 @@ __global__ void HcCombineMoeF16Kernel(
       v[s][c] = float4{0.0F, 0.0F, 0.0F, 0.0F};
       if (i < hidden) {
         const std::size_t e = (static_cast<std::size_t>(s) * hidden) + i;
-        float4 r = *reinterpret_cast<const float4*>(dst + e);
+        float4 r = LoadResRow(dst + e);
         if constexpr (kPrior) {
           const float pw = prior_w[static_cast<std::size_t>(t) * kStreams + s];
           r = float4{__fmaf_rn(prior.x, pw, r.x), __fmaf_rn(prior.y, pw, r.y),
@@ -1048,7 +1075,7 @@ __global__ void HcCombineMoeF16Kernel(
         }
         v[s][c] = float4{r.x + b.x * w[s], r.y + b.y * w[s], r.z + b.z * w[s],
                          r.w + b.w * w[s]};
-        *reinterpret_cast<float4*>(dst + e) = v[s][c];
+        StoreResRow(dst + e, v[s][c]);
         if constexpr (kPrior) {
           // Keep the existing compiled square-accumulation order when the
           // preceding residual FMA stays in registers instead of memory.
@@ -2078,9 +2105,32 @@ __device__ inline float NpuStreamValue(const std::uint8_t* stream,
          (ldexpf(1.0F, static_cast<int>(p[0]) - 127) / 64.0F);
 }
 
-template<bool kBatch>
+/// Decodes rows [row0, row0 + rows) of NPU C streams laid out as a
+/// [group][stream_stride] table (stream_tokens tokens and 1024 columns each)
+/// into F32 rows of `out`.
+/// Ported from mikealanni/gufo fa68ad48 and 05903d68 (MIT, Mike Alani).
+__global__ void NpuDecodeStreamRowsKernel(
+    const std::uint8_t* const* __restrict__ streams,
+    std::uint32_t stream_stride, std::uint32_t stream_tokens,
+    float* __restrict__ out, std::uint32_t row0, std::uint32_t rows,
+    std::uint32_t cols, std::size_t out_pitch, std::uint32_t col0) {
+  const std::uint32_t row = blockIdx.y;
+  const std::uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows || col >= cols) {
+    return;
+  }
+  const std::uint32_t gt = row0 + row;
+  const std::uint32_t slice = col / 1024;
+  const std::uint8_t* stream =
+      streams[static_cast<std::size_t>(gt / stream_tokens) * stream_stride +
+              slice];
+  out[static_cast<std::size_t>(row) * out_pitch + col0 + col] =
+      NpuStreamValue(stream, gt % stream_tokens, col % 1024);
+}
+
+template<bool kBatch, bool kRawHalf = false>
 __global__ void GdnEpilogueKernel(
-    const float* raw, const float* z, std::uint32_t z_stride,
+    const void* raw_in, const float* z, std::uint32_t z_stride,
     const float* norm_w, float* out, void* out_q8, __half* out_half,
     std::uint32_t n_rows, std::uint32_t v_heads, float eps,
     const GdnBatchItem* batch, std::uint32_t active, void* out_q8_1,
@@ -2088,6 +2138,9 @@ __global__ void GdnEpilogueKernel(
     const std::uint8_t* const* z_streams = nullptr,
     std::uint32_t z_stream_stride = 0, std::uint32_t z_tokens = 0,
     std::uint32_t z_gpu_cols = 0) {
+  // kRawHalf: the chunked recurrence (whole-projection NPU prefill) leaves
+  // its raw output as F16.
+  const float* raw = static_cast<const float*>(raw_in);
   if constexpr (kBatch) {
     if ((active & (1U << blockIdx.z)) == 0)
       return;
@@ -2123,12 +2176,16 @@ __global__ void GdnEpilogueKernel(
         static_cast<std::uint32_t>(t % z_tokens), ncol % 1024);
   };
   const std::uint32_t per_lane = d / warpSize;
-  const float* src = raw + row * d;
   float v[d / 32];
   float ss = 0.0f;
 #pragma unroll
   for (std::uint32_t r = 0; r < per_lane; ++r) {
-    v[r] = src[r * warpSize + lane];
+    if constexpr (kRawHalf) {
+      v[r] = __half2float(
+          static_cast<const __half*>(raw_in)[row * d + r * warpSize + lane]);
+    } else {
+      v[r] = raw[row * d + r * warpSize + lane];
+    }
     ss += v[r] * v[r];
   }
   const float scale = rsqrtf(WaveSum(ss) / static_cast<float>(d) + eps);
@@ -2299,6 +2356,212 @@ __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
   }
 }
 
+/// The SSM convolution reading its input straight from the NPU C streams of
+/// a whole-projection pass.
+/// Ported from mikealanni/gufo fa68ad48 and 05903d68 (MIT, Mike Alani).
+__global__ void SsmConv4StreamsKernel(
+    const std::uint8_t* const* __restrict__ streams,
+    std::uint32_t stream_stride, std::uint32_t stream_tokens,
+    const float* __restrict__ w, float* __restrict__ conv_state,
+    float* __restrict__ out, std::uint32_t n_tokens, std::uint32_t channels) {
+  const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= channels) {
+    return;
+  }
+  const std::uint32_t slice = c / 1024;
+  const std::uint32_t col = c % 1024;
+  const std::uint32_t t0 = blockIdx.y * kSsmConvTokensPerThread;
+  const float4 taps = *reinterpret_cast<const float4*>(w + c * kSsmConvTaps);
+
+  float window[kSsmConvTaps - 1];
+#pragma unroll
+  for (std::uint32_t i = 0; i < kSsmConvTaps - 1; ++i) {
+    const std::int32_t src_t =
+        static_cast<std::int32_t>(t0) - 3 + static_cast<std::int32_t>(i);
+    if (src_t >= 0) {
+      const std::uint32_t gt = static_cast<std::uint32_t>(src_t);
+      const std::uint8_t* stream =
+          streams[static_cast<std::size_t>(gt / stream_tokens) * stream_stride +
+                  slice];
+      window[i] = NpuStreamValue(stream, gt % stream_tokens, col);
+    } else {
+      window[i] =
+          conv_state[static_cast<std::size_t>(kSsmConvTaps - 1 + src_t) *
+                         channels +
+                     c];
+    }
+  }
+
+#pragma unroll
+  for (std::uint32_t i = 0; i < kSsmConvTokensPerThread; ++i) {
+    const std::uint32_t t = t0 + i;
+    if (t >= n_tokens) {
+      break;
+    }
+    const std::uint8_t* stream =
+        streams[static_cast<std::size_t>(t / stream_tokens) * stream_stride +
+                slice];
+    const float v = NpuStreamValue(stream, t % stream_tokens, col);
+    const float acc = taps.x * window[0] + taps.y * window[1] +
+                      taps.z * window[2] + taps.w * v;
+    out[static_cast<std::size_t>(t) * channels + c] = SiluF(acc);
+    window[0] = window[1];
+    window[1] = window[2];
+    window[2] = v;
+  }
+}
+
+// One thread convolves eight adjacent channels (one C-stream group) over
+// kRunsPerThread runs of 16 tokens. A run's eight tokens of a group are
+// consecutive 9-byte groups, so they load as nine aligned 64-bit words.
+constexpr std::uint32_t kStreamConvRuns = 2;
+constexpr std::uint32_t kStreamConvTokens = 16 * kStreamConvRuns;
+
+struct StreamRunWords {
+  unsigned long long w[9];
+};
+
+__device__ inline StreamRunWords LoadStreamWords(const std::uint8_t* stream,
+                                                 std::uint32_t tl,
+                                                 std::uint32_t cc) {
+  constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
+  constexpr std::uint32_t kTilesN = 1024 / kNpuTileN;
+  const std::uint32_t tile_row = tl / kNpuTileRowsC;
+  const std::uint32_t r = tl % kNpuTileRowsC;
+  const std::uint32_t tile_col = cc / kNpuTileN;
+  const std::uint32_t c = cc % kNpuTileN;
+  const std::uint32_t br = (r >> 3) & 1;
+  const std::uint32_t sr = r >> 4;
+  const std::uint32_t bc = (c >> 3) & 1;
+  const std::uint32_t sc = c >> 4;
+  const std::uint32_t gi = (bc << 3) | (br << 4) | (sc << 5) | (sr << 8);
+  const auto* p = reinterpret_cast<const unsigned long long*>(
+      stream +
+      (std::size_t{tile_row * kTilesN + tile_col} * kGroupsPerTile + gi) * 9);
+  StreamRunWords words;
+#pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    words.w[i] = p[i];
+  }
+  return words;
+}
+
+__device__ inline void DecodeStreamWords(const StreamRunWords& words,
+                                         float (&v)[8][8]) {
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const auto byte_at = [&](int j) {
+      return static_cast<std::uint32_t>((words.w[j >> 3] >> ((j & 7) * 8)) &
+                                        0xFFU);
+    };
+    const float scale =
+        ldexpf(1.0F, static_cast<int>(byte_at(9 * i)) - 127) / 64.0F;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      v[i][k] =
+          static_cast<float>(static_cast<std::int8_t>(byte_at(9 * i + 1 + k))) *
+          scale;
+    }
+  }
+}
+
+template<bool kHalfOut = false>
+__global__ void SsmConv4StreamsV2Kernel(
+    const std::uint8_t* const* __restrict__ streams,
+    std::uint32_t stream_stride, std::uint32_t stream_tokens,
+    const float* __restrict__ w, const float* __restrict__ conv_state,
+    void* __restrict__ out_raw, std::uint32_t n_tokens,
+    std::uint32_t channels) {
+  float* const out = static_cast<float*>(out_raw);
+  __half* const out_h = static_cast<__half*>(out_raw);
+  const std::uint32_t cg = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t c0 = cg * 8;
+  if (c0 >= channels) {
+    return;
+  }
+  const std::uint32_t slice = c0 / 1024;
+  const std::uint32_t col0 = c0 % 1024;
+  const std::uint32_t t0 = blockIdx.y * kStreamConvTokens;
+  constexpr std::uint32_t kRuns = 2 * kStreamConvRuns;
+  // The tile's tokens never straddle two stream sets (stream_tokens is a
+  // multiple of kStreamConvTokens), so one table lookup serves the thread.
+  const std::uint8_t* const tile_stream =
+      streams[static_cast<std::size_t>(t0 / stream_tokens) * stream_stride +
+              slice];
+  const std::uint32_t tl0 = t0 % stream_tokens;
+  StreamRunWords cur = LoadStreamWords(tile_stream, tl0, col0);
+  float4 taps[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    taps[k] = *reinterpret_cast<const float4*>(w + (c0 + k) * kSsmConvTaps);
+  }
+  float win[8][3];
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const std::int32_t src_t =
+        static_cast<std::int32_t>(t0) - 3 + static_cast<std::int32_t>(i);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      if (src_t >= 0) {
+        const std::uint32_t gt = static_cast<std::uint32_t>(src_t);
+        win[k][i] = NpuStreamValue(
+            streams[static_cast<std::size_t>(gt / stream_tokens) *
+                        stream_stride +
+                    slice],
+            gt % stream_tokens, col0 + k);
+      } else {
+        win[k][i] =
+            conv_state[static_cast<std::size_t>(kSsmConvTaps - 1 + src_t) *
+                           channels +
+                       c0 + k];
+      }
+    }
+  }
+#pragma unroll 1
+  for (std::uint32_t run = 0; run < kRuns; ++run) {
+    const std::uint32_t tb = t0 + run * 8;
+    if (tb >= n_tokens) {
+      break;
+    }
+    StreamRunWords next = cur;
+    if (run + 1 < kRuns && tb + 8 < n_tokens) {
+      next = LoadStreamWords(tile_stream, tl0 + (run + 1) * 8, col0);
+    }
+    float v[8][8];
+    DecodeStreamWords(cur, v);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      float res[8];
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const float x = v[i][k];
+        const float acc = taps[k].x * win[k][0] + taps[k].y * win[k][1] +
+                          taps[k].z * win[k][2] + taps[k].w * x;
+        res[k] = SiluF(acc);
+        win[k][0] = win[k][1];
+        win[k][1] = win[k][2];
+        win[k][2] = x;
+      }
+      if constexpr (kHalfOut) {
+        __half2 packed[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          packed[k] = __floats2half2_rn(res[2 * k], res[2 * k + 1]);
+        }
+        *reinterpret_cast<uint4*>(
+            out_h + static_cast<std::size_t>(tb + i) * channels + c0) =
+            *reinterpret_cast<const uint4*>(packed);
+      } else {
+        float4* dst = reinterpret_cast<float4*>(
+            out + static_cast<std::size_t>(tb + i) * channels + c0);
+        dst[0] = make_float4(res[0], res[1], res[2], res[3]);
+        dst[1] = make_float4(res[4], res[5], res[6], res[7]);
+      }
+    }
+    cur = next;
+  }
+}
+
 __global__ void UnpackQGateKernel(const float* qg, std::uint32_t qg_stride,
                                   float* q, float* gate, float* k, float* v,
                                   std::uint32_t heads, std::uint32_t d,
@@ -2334,10 +2597,14 @@ __global__ void PrepareAttentionKernel(
     float eps, const qwen::vision::DeviceRope* rope,
     std::uint32_t q_only_heads = 0,
     const std::uint8_t* const* streams = nullptr,
-    std::uint32_t stream_stride = 0, std::uint32_t stream_tokens = 0) {
+    std::uint32_t stream_stride = 0, std::uint32_t stream_tokens = 0,
+    std::uint32_t head_block0 = 0) {
   __shared__ float partial[kHeadsPerBlock][8];
   __shared__ float norm[kHeadsPerBlock][256];
-  const std::uint32_t t = blockIdx.x, first = blockIdx.y * kHeadsPerBlock,
+  // head_block0 skips leading blocks of heads (PrepareKvHeads starts at the
+  // first key head).
+  const std::uint32_t t = blockIdx.x,
+                      first = (blockIdx.y + head_block0) * kHeadsPerBlock,
                       tid = threadIdx.x;
   const std::uint32_t lane = tid % 32, wave = tid / 32;
   // q_only_heads: only the first heads' query and gate rows (the rest of the
@@ -5491,11 +5758,27 @@ bool HcCombineMoeF16(float* res, const __half* expert_out, const float* weights,
                      std::uint32_t n_tokens, std::uint32_t hidden,
                      std::uint32_t streams, float eps, hipStream_t stream,
                      const float* prior_out, const float* prior_w,
-                     float* inject_out, const float* inject_w) {
+                     float* inject_out, const float* inject_w,
+                     __half* res_half) {
   if (streams != 4 || hidden % 128 != 0 || hidden > 3 * 4 * kThreads ||
       (gamma != nullptr && xn_q8 == nullptr) ||
       (inject_w != nullptr && (gamma == nullptr || prior_out == nullptr))) {
     return false;
+  }
+  if (res_half != nullptr) {
+    const auto combine =
+        inject_w != nullptr ? HcCombineMoeF16Kernel<true, true, true, __half>
+        : prior_out != nullptr
+            ? (gamma ? HcCombineMoeF16Kernel<true, true, false, __half>
+                     : HcCombineMoeF16Kernel<false, true, false, __half>)
+            : (gamma ? HcCombineMoeF16Kernel<true, false, false, __half>
+                     : HcCombineMoeF16Kernel<false, false, false, __half>);
+    hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream,
+                       res_half, expert_out, weights, shared_out, gate,
+                       gate_stride, used, inject, inject_parts, gamma, xn,
+                       xn_q8, hidden, eps, prior_out, prior_w, inject_w,
+                       inject_out);
+    return true;
   }
   const auto combine =
       inject_w != nullptr    ? HcCombineMoeF16Kernel<true, true, true>
@@ -5512,39 +5795,97 @@ bool HcCombineMoeF16(float* res, const __half* expert_out, const float* weights,
 
 /// res[t][s][i] += block_out[t][i] * w[t][s], the update a deferring
 /// HcCombineVec4Kernel left out, in the same expression.
-__global__ void HcApplyDeferredKernel(float* res, const float* block_out,
+template<typename ResT = float>
+__global__ void HcApplyDeferredKernel(ResT* res, const float* block_out,
                                       const float* w, std::uint32_t hidden) {
   constexpr std::uint32_t kStreams = 4;
   const std::uint32_t t = blockIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
-  float* dst = res + static_cast<std::size_t>(t) * hc_dim;
+  ResT* dst = res + static_cast<std::size_t>(t) * hc_dim;
   const float* src = block_out + static_cast<std::size_t>(t) * hidden;
   for (std::uint32_t e = threadIdx.x * 4; e < hc_dim; e += kThreads * 4) {
     const std::uint32_t s = e / hidden;
     const std::uint32_t i = e - (s * hidden);
     const float ws = w[static_cast<std::size_t>(t) * kStreams + s];
-    const float4 r = *reinterpret_cast<const float4*>(dst + e);
+    const float4 r = LoadResRow(dst + e);
     const float4 b = *reinterpret_cast<const float4*>(src + i);
-    *reinterpret_cast<float4*>(dst + e) =
-        float4{__fmaf_rn(b.x, ws, r.x), __fmaf_rn(b.y, ws, r.y),
-               __fmaf_rn(b.z, ws, r.z), __fmaf_rn(b.w, ws, r.w)};
+    StoreResRow(dst + e,
+                float4{__fmaf_rn(b.x, ws, r.x), __fmaf_rn(b.y, ws, r.y),
+                       __fmaf_rn(b.z, ws, r.z), __fmaf_rn(b.w, ws, r.w)});
   }
 }
 
 void HcApplyDeferred(float* res, const float* block_out, const float* w,
                      std::uint32_t n_tokens, std::uint32_t hidden,
+                     hipStream_t stream, __half* res_half) {
+  if (res_half != nullptr) {
+    hipLaunchKernelGGL(HcApplyDeferredKernel<__half>, dim3(n_tokens),
+                       dim3(kThreads), 0, stream, res_half, block_out, w,
+                       hidden);
+    return;
+  }
+  hipLaunchKernelGGL(HcApplyDeferredKernel<float>, dim3(n_tokens),
+                     dim3(kThreads), 0, stream, res, block_out, w, hidden);
+}
+
+namespace {
+__global__ void ResidualToHalfKernel(const float* __restrict__ src,
+                                     __half* __restrict__ dst,
+                                     std::size_t groups) {
+  const std::size_t g =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g < groups) {
+    StoreResRow(dst + g * 4, LoadResRow(src + g * 4));
+  }
+}
+__global__ void ResidualToFloatKernel(const __half* __restrict__ src,
+                                      float* __restrict__ dst,
+                                      std::size_t groups) {
+  const std::size_t g =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g < groups) {
+    StoreResRow(dst + g * 4, LoadResRow(src + g * 4));
+  }
+}
+}  // namespace
+
+void ResidualToHalf(const float* src, __half* dst, std::size_t count,
+                    hipStream_t stream) {
+  const std::size_t groups = count / 4;
+  hipLaunchKernelGGL(ResidualToHalfKernel, dim3(Blocks(groups)), dim3(kThreads),
+                     0, stream, src, dst, groups);
+}
+
+void ResidualToFloat(const __half* src, float* dst, std::size_t count,
                      hipStream_t stream) {
-  hipLaunchKernelGGL(HcApplyDeferredKernel, dim3(n_tokens), dim3(kThreads), 0,
-                     stream, res, block_out, w, hidden);
+  const std::size_t groups = count / 4;
+  hipLaunchKernelGGL(ResidualToFloatKernel, dim3(Blocks(groups)),
+                     dim3(kThreads), 0, stream, src, dst, groups);
 }
 
 bool HcCombineF16(float* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                   std::uint32_t streams, float eps, hipStream_t stream,
-                  float* defer_w, float* inject_out, const float* inject_w) {
+                  float* defer_w, float* inject_out, const float* inject_w,
+                  __half* res_half) {
   // F16 prefill keeps the same reduction even for a one-token tail.
   if (streams == 4 && hidden % 128 == 0 && hidden <= 2560) {
+    if (res_half != nullptr) {
+      const bool fuse_inject =
+          inject_w != nullptr && defer_w != nullptr && gamma != nullptr;
+      const auto combine =
+          fuse_inject ? HcCombineVec4Kernel<__half, true, true, __half>
+          : defer_w != nullptr
+              ? HcCombineVec4Kernel<__half, true, false, __half>
+              : HcCombineVec4Kernel<__half, false, false, __half>;
+      hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream,
+                         res_half, block_out, inject, inject_parts, gamma, xn,
+                         xn_q8, hidden, eps, defer_w,
+                         fuse_inject ? inject_w : nullptr,
+                         fuse_inject ? inject_out : nullptr);
+      return defer_w != nullptr;
+    }
     if (inject_w != nullptr && defer_w != nullptr && gamma != nullptr) {
       // The inject partials may replace the logits this combine reads;
       // every thread reads them before its first barrier.
@@ -7160,6 +7501,52 @@ void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      out_pitch, col0, accumulate, valid_cols);
 }
 
+void NpuDecodeStreamRows(const std::uint8_t* const* streams,
+                         std::uint32_t stream_stride,
+                         std::uint32_t stream_tokens, float* out,
+                         std::uint32_t row0, std::uint32_t rows,
+                         std::uint32_t cols, std::size_t out_pitch,
+                         std::uint32_t col0, hipStream_t stream) {
+  if (streams == nullptr || stream_stride == 0 || stream_tokens == 0 ||
+      rows == 0 || cols == 0) {
+    return;
+  }
+  hipLaunchKernelGGL(NpuDecodeStreamRowsKernel, dim3(Blocks(cols), rows),
+                     dim3(kThreads), 0, stream, streams, stream_stride,
+                     stream_tokens, out, row0, rows, cols, out_pitch, col0);
+}
+
+void SsmConv4Streams(const std::uint8_t* const* streams,
+                     std::uint32_t stream_stride, std::uint32_t stream_tokens,
+                     const float* w, float* conv_state, void* out,
+                     std::uint32_t n_tokens, std::uint32_t channels,
+                     hipStream_t stream, bool half_out) {
+  if (streams == nullptr || stream_stride == 0 || stream_tokens == 0 ||
+      n_tokens == 0 || channels == 0) {
+    return;
+  }
+  if (n_tokens % kStreamConvTokens == 0 && channels % 8 == 0 &&
+      stream_tokens % kStreamConvTokens == 0) {
+    const dim3 grid(Blocks(channels / 8), n_tokens / kStreamConvTokens);
+    if (half_out) {
+      hipLaunchKernelGGL(SsmConv4StreamsV2Kernel<true>, grid, dim3(kThreads), 0,
+                         stream, streams, stream_stride, stream_tokens, w,
+                         conv_state, out, n_tokens, channels);
+    } else {
+      hipLaunchKernelGGL(SsmConv4StreamsV2Kernel<false>, grid, dim3(kThreads),
+                         0, stream, streams, stream_stride, stream_tokens, w,
+                         conv_state, out, n_tokens, channels);
+    }
+    return;
+  }
+  hipLaunchKernelGGL(
+      SsmConv4StreamsKernel,
+      dim3(Blocks(channels),
+           (n_tokens + kSsmConvTokensPerThread - 1) / kSsmConvTokensPerThread),
+      dim3(kThreads), 0, stream, streams, stream_stride, stream_tokens, w,
+      conv_state, static_cast<float*>(out), n_tokens, channels);
+}
+
 bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      const float* history, float* qkvz, float* convolved,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
@@ -7326,7 +7713,446 @@ void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,
                      destination, tokens, channels, history_rows);
 }
 
-void GatedDeltaNet(
+// ---------------------------------------------------------------------------
+// Chunked (WY form) gated delta rule for the whole-projection prefill: the
+// state-independent products of every 64-token chunk (K K^T, Q K^T and the
+// inverse of the unit lower-triangular system) are computed for all chunks
+// in parallel, then one sequential kernel per head group runs matrix
+// products per chunk. S <- g S (I - b k k^T) + b v k^T, o = S q. The F16
+// operands give about 6e-4 relative error against the exact recurrence.
+// Ported from mikealanni/gufo fafe2318 (MIT, Mike Alani).
+constexpr int kGd = 128;
+constexpr int kGkh = 16;
+constexpr int kGh = 48;
+constexpr int kGc = 64;
+constexpr int kGch = 2 * kGkh * kGd + kGh * kGd;  // 10240 channels
+
+constexpr std::size_t GdnChunkScratchBytes(std::size_t n_tokens) {
+  const std::size_t chunks = n_tokens / kGc;
+  return chunks * (std::size_t{kGkh} * 3 * kGc * kGd * 2 +  // K, Q, K^T
+                   std::size_t{kGkh} * 2 * kGc * kGc * 2 +  // KK, QK
+                   std::size_t{kGh} * 2 * kGc * kGc * 2 +   // X, M
+                   std::size_t{kGh} * 2 * kGc * 4);         // G, w
+}
+
+std::size_t GdnChunkScratchBytesFor(std::size_t n_tokens) {
+  return GdnChunkScratchBytes(n_tokens);
+}
+
+__global__ __launch_bounds__(256) void GdnChunkNormKernel(
+    const __half* __restrict__ conv, float eps, __half* __restrict__ khat,
+    __half* __restrict__ khat_t, __half* __restrict__ qhat,
+    __half* __restrict__ kkmat, __half* __restrict__ qkmat) {
+  __shared__ __attribute__((aligned(16))) __half tile[kGc][kGd + 8];
+  __shared__ __attribute__((aligned(16))) __half qtile[kGc][kGd + 8];
+  __shared__ float s_scale[kGc][2];
+  const int kh = blockIdx.x;
+  const int chunk = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5, lane = tid & 31;
+  const size_t base = (static_cast<size_t>(chunk) * kGkh + kh);
+  // Raw K and Q rows of the chunk into LDS.
+  for (int idx = tid; idx < kGc * (kGd / 8); idx += 256) {
+    const int c = idx / (kGd / 8), i8 = (idx % (kGd / 8)) * 8;
+    const std::size_t row = static_cast<std::size_t>(chunk) * kGc + c;
+    *reinterpret_cast<uint4*>(&tile[c][i8]) = *reinterpret_cast<const uint4*>(
+        conv + row * kGch + (kGkh + kh) * kGd + i8);
+    *reinterpret_cast<uint4*>(&qtile[c][i8]) =
+        *reinterpret_cast<const uint4*>(conv + row * kGch + kh * kGd + i8);
+  }
+  __syncthreads();
+  // inv_k and q_scale per token (the GdnPrepKq arithmetic): wave w takes
+  // tokens w, w + 8, ...
+  for (int c = wave; c < kGc; c += 8) {
+    float ks = 0.f, qs = 0.f;
+    for (int i = lane; i < kGd; i += 32) {
+      const float k = __half2float(tile[c][i]);
+      const float q = __half2float(qtile[c][i]);
+      ks += k * k;
+      qs += q * q;
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+      ks += __shfl_xor(ks, o);
+      qs += __shfl_xor(qs, o);
+    }
+    if (lane == 0) {
+      s_scale[c][0] = rsqrtf(ks + eps);
+      s_scale[c][1] = rsqrtf(qs + eps) * rsqrtf(static_cast<float>(kGd));
+    }
+  }
+  __syncthreads();
+  for (int idx = tid; idx < kGc * (kGd / 8); idx += 256) {
+    const int c = idx / (kGd / 8), i8 = (idx % (kGd / 8)) * 8;
+    const float sk = s_scale[c][0], sq = s_scale[c][1];
+    __half ko[8], qo[8];
+    for (int e = 0; e < 8; ++e) {
+      ko[e] = __float2half_rn(__half2float(tile[c][i8 + e]) * sk);
+      qo[e] = __float2half_rn(__half2float(qtile[c][i8 + e]) * sq);
+    }
+    *reinterpret_cast<uint4*>(&tile[c][i8]) =
+        *reinterpret_cast<const uint4*>(ko);
+    *reinterpret_cast<uint4*>(&qtile[c][i8]) =
+        *reinterpret_cast<const uint4*>(qo);
+    *reinterpret_cast<uint4*>(khat + base * kGc * kGd + c * kGd + i8) =
+        *reinterpret_cast<const uint4*>(ko);
+    *reinterpret_cast<uint4*>(qhat + base * kGc * kGd + c * kGd + i8) =
+        *reinterpret_cast<const uint4*>(qo);
+  }
+  __syncthreads();
+  // K^T rows for the state update.
+  for (int idx = tid; idx < kGd * (kGc / 8); idx += 256) {
+    const int i = idx % kGd, c8 = (idx / kGd) * 8;
+    __half out[8];
+    for (int e = 0; e < 8; ++e)
+      out[e] = tile[c8 + e][i];
+    *reinterpret_cast<uint4*>(khat_t + base * kGc * kGd + i * kGc + c8) =
+        *reinterpret_cast<const uint4*>(out);
+  }
+  // Raw products KK = K K^T and QK = Q K^T (F16), 16 tiles over 8 waves.
+  for (int tl = wave; tl < 16; tl += 8) {
+    const int ta = tl / 4, tb = tl % 4;
+    v8f kk = {}, qk = {};
+#pragma unroll
+    for (int it = 0; it < kGd / 16; ++it) {
+      v16h fa =
+          *reinterpret_cast<const v16h*>(&tile[ta * 16 + (lane & 15)][it * 16]);
+      v16h fq = *reinterpret_cast<const v16h*>(
+          &qtile[ta * 16 + (lane & 15)][it * 16]);
+      v16h fb =
+          *reinterpret_cast<const v16h*>(&tile[tb * 16 + (lane & 15)][it * 16]);
+      kk = Wmma(fa, fb, kk);
+      qk = Wmma(fq, fb, qk);
+    }
+    for (int r = 0; r < 8; ++r) {
+      const int a = ta * 16 + 2 * r + (lane >> 4);
+      const int b = tb * 16 + (lane & 15);
+      kkmat[(base * kGc + a) * kGc + b] = __float2half_rn(kk[r]);
+      qkmat[(base * kGc + a) * kGc + b] = __float2half_rn(qk[r]);
+    }
+  }
+}
+
+// P1
+__global__ __launch_bounds__(256) void GdnChunkPrepKernel(
+    const __half* __restrict__ kkmat, const __half* __restrict__ qkmat,
+    const float* __restrict__ ab, __half* __restrict__ xmat,
+    __half* __restrict__ mmat, float* __restrict__ gvec,
+    float* __restrict__ wvec) {
+  __shared__ float s_a[kGc][kGc + 1];
+  __shared__ float s_y[kGc][kGc + 1];
+  __shared__ float s_lg[kGc];
+  __shared__ float s_beta[kGc];
+  const int h = blockIdx.x;
+  const int chunk = blockIdx.y;
+  const int kh = h % kGkh;
+  const int tid = threadIdx.x;
+  const size_t kq_base = (static_cast<size_t>(chunk) * kGkh + kh) * kGc * kGc;
+  const size_t out_base = (static_cast<size_t>(chunk) * kGh + h);
+
+  if (tid < kGc) {
+    const int t = chunk * kGc + tid;
+    const float* p = ab + (static_cast<size_t>(t) * kGh + h) * 2;
+    s_lg[tid] = logf(fmaxf(p[0], 1e-30f));
+    s_beta[tid] = p[1];
+  }
+  __syncthreads();
+  if (tid < 32) {  // inclusive scan of the 64 log decays by one wave
+    float v0 = s_lg[tid], v1 = s_lg[tid + 32];
+    for (int o = 1; o < 32; o <<= 1) {
+      const float n0 = __shfl_up(v0, o), n1 = __shfl_up(v1, o);
+      if (tid >= o) {
+        v0 += n0;
+        v1 += n1;
+      }
+    }
+    const float tail = __shfl(v0, 31);
+    s_lg[tid] = v0;
+    s_lg[tid + 32] = v1 + tail;
+  }
+  __syncthreads();
+  if (tid < kGc) {
+    gvec[out_base * kGc + tid] = expf(s_lg[tid]);
+    wvec[out_base * kGc + tid] = expf(s_lg[kGc - 1] - s_lg[tid]);
+  }
+  // Decay-weighted A (strictly lower) and M (lower) from the raw products,
+  // eight consecutive columns per thread.
+  for (int idx = tid; idx < kGc * (kGc / 8); idx += 256) {
+    const int a = idx / (kGc / 8), b8 = (idx % (kGc / 8)) * 8;
+    const uint4 kk4 =
+        *reinterpret_cast<const uint4*>(kkmat + kq_base + a * kGc + b8);
+    const uint4 qk4 =
+        *reinterpret_cast<const uint4*>(qkmat + kq_base + a * kGc + b8);
+    const __half* kk = reinterpret_cast<const __half*>(&kk4);
+    const __half* qk = reinterpret_cast<const __half*>(&qk4);
+    __half mo[8];
+    for (int e = 0; e < 8; ++e) {
+      const int b = b8 + e;
+      const float dij = b <= a ? expf(s_lg[a] - s_lg[b]) : 0.f;
+      s_a[a][b] = b < a ? s_beta[a] * __half2float(kk[e]) * dij : 0.f;
+      mo[e] = __float2half_rn(__half2float(qk[e]) * dij);
+    }
+    *reinterpret_cast<uint4*>(mmat + (out_base * kGc + a) * kGc + b8) =
+        *reinterpret_cast<const uint4*>(mo);
+  }
+  __syncthreads();
+  // Y = (I + A)^-1 by 16x16 blocks. L = I + A lives in s_a (identity added),
+  // Y in s_y (zero above the diagonal blocks).
+  for (int idx = tid; idx < kGc * kGc; idx += 256) {
+    const int i = idx / kGc, c = idx % kGc;
+    if (i == c)
+      s_a[i][c] += 1.f;
+    s_y[i][c] = 0.f;
+  }
+  __syncthreads();
+  if (tid < kGc) {  // diagonal blocks: thread = column within block
+    const int b = tid / 16, cc = tid % 16, o = b * 16;
+    float y[16];
+    for (int i = 0; i < 16; ++i) {
+      float acc = i == cc ? 1.f : 0.f;
+      if (i > cc) {
+        float sum = 0.f;
+        for (int m = cc; m < i; ++m)
+          sum += s_a[o + i][o + m] * y[m];
+        acc = -sum;
+      } else if (i < cc) {
+        acc = 0.f;
+      }
+      y[i] = acc;
+      s_y[o + i][o + cc] = acc;
+    }
+  }
+  __syncthreads();
+  __shared__ float s_z[3][16][16];
+  for (int d = 1; d < 4; ++d) {
+    const int pairs = 4 - d;
+    // Z_ij = sum_{m=j}^{i-1} L_im Y_mj, one element per thread and pair.
+    for (int e = tid; e < pairs * 256; e += 256) {
+      const int pr = e / 256, r = (e / 16) % 16, c = e % 16;
+      const int j = pr, i = pr + d;
+      float sum = 0.f;
+      for (int m = j; m < i; ++m)
+        for (int k = 0; k < 16; ++k)
+          sum += s_a[i * 16 + r][m * 16 + k] * s_y[m * 16 + k][j * 16 + c];
+      s_z[pr][r][c] = sum;
+    }
+    __syncthreads();
+    for (int e = tid; e < pairs * 256; e += 256) {
+      const int pr = e / 256, r = (e / 16) % 16, c = e % 16;
+      const int j = pr, i = pr + d;
+      float sum = 0.f;
+      for (int k = 0; k < 16; ++k)
+        sum += s_y[i * 16 + r][i * 16 + k] * s_z[pr][k][c];
+      s_y[i * 16 + r][j * 16 + c] = -sum;
+    }
+    __syncthreads();
+  }
+  for (int idx = tid; idx < kGc * kGc; idx += 256) {
+    const int i = idx / kGc, c = idx % kGc;
+    xmat[(out_base * kGc + i) * kGc + c] =
+        __float2half_rn(s_y[i][c] * s_beta[c]);
+  }
+}
+
+// P2
+template<int JG>
+__global__ __launch_bounds__(256) void GdnChunkScanKernel(
+    const __half* __restrict__ conv, const __half* __restrict__ khat,
+    const __half* __restrict__ khat_t, const __half* __restrict__ qhat,
+    const __half* __restrict__ xmat, const __half* __restrict__ mmat,
+    const float* __restrict__ gvec, const float* __restrict__ wvec,
+    float* __restrict__ state, __half* __restrict__ raw, int n_chunks) {
+  static_assert(JG == 32 || JG == 64 || JG == 128);
+  constexpr int kJT = JG / 16;   // row tiles
+  constexpr int kJTH = kJT / 2;  // row tiles per wave in steps 1-4
+  constexpr int kCT = kGc / 16;  // token tiles (4)
+  constexpr int kIT = kGd / 16;  // key tiles (8)
+  // Region A: S (F16 [j][i]) during step 1, then U^T [j][c].
+  // Region B: rhs^T during step 3, then the F16 output stage.
+  constexpr int kASt = kGd + 8, kBSt = kGc + 8, kOSt = JG + 8;
+  constexpr int kABytes =
+      JG * kASt * 2 > JG * kBSt * 2 ? JG * kASt * 2 : JG * kBSt * 2;
+  constexpr int kBBytes =
+      JG * kBSt * 2 > kGc * kOSt * 2 ? JG * kBSt * 2 : kGc * kOSt * 2;
+  __shared__ __attribute__((aligned(16))) std::uint8_t s_region_a[kABytes];
+  __shared__ __attribute__((aligned(16))) std::uint8_t s_region_b[kBBytes];
+  __shared__ float s_w[kGc];
+  auto* s_s = reinterpret_cast<__half*>(s_region_a);   // [JG][kASt]
+  auto* s_ut = reinterpret_cast<__half*>(s_region_a);  // [JG][kBSt]
+  auto* s_rt = reinterpret_cast<__half*>(s_region_b);  // [JG][kBSt]
+  auto* s_os = reinterpret_cast<__half*>(s_region_b);  // [kGc][kOSt]
+  const int h = blockIdx.x;
+  const int j0 = blockIdx.y * JG;
+  const int kh = h % kGkh;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5, lane = tid & 31;
+  const int l16 = lane & 15, hf = lane >> 4;
+  const int ct = wave & 3;               // token tile of steps 1-4
+  const int jbase = (wave >> 2) * kJTH;  // first row tile of steps 1-4
+  const int c_tok = ct * 16 + l16;       // this lane's token within the chunk
+
+  v8f sacc[kJT];
+  for (int jt = 0; jt < kJT; ++jt) {
+    for (int r = 0; r < 8; ++r) {
+      const int j = jt * 16 + 2 * r + hf;
+      sacc[jt][r] = state[(static_cast<size_t>(h) * kGd + j0 + j) * kGd +
+                          wave * 16 + l16];
+    }
+  }
+
+  for (int chunk = 0; chunk < n_chunks; ++chunk) {
+    const size_t kq_base = (static_cast<size_t>(chunk) * kGkh + kh) * kGc * kGd;
+    const size_t xm_base = (static_cast<size_t>(chunk) * kGh + h) * kGc * kGc;
+    const size_t g_base = (static_cast<size_t>(chunk) * kGh + h) * kGc;
+    const size_t trow = static_cast<size_t>(chunk) * kGc + c_tok;
+    // Operands independent of the state, requested before anything waits.
+    v16h fx[kCT], fm[kCT];
+#pragma unroll
+    for (int cs = 0; cs < kCT; ++cs) {
+      if (cs <= ct) {
+        fx[cs] = *reinterpret_cast<const v16h*>(xmat + xm_base + c_tok * kGc +
+                                                cs * 16);
+        fm[cs] = *reinterpret_cast<const v16h*>(mmat + xm_base + c_tok * kGc +
+                                                cs * 16);
+      }
+    }
+    __half vv[kJTH][8];
+#pragma unroll
+    for (int tj = 0; tj < kJTH; ++tj)
+      for (int r = 0; r < 8; ++r)
+        vv[tj][r] = conv[trow * kGch + 2 * kGkh * kGd + h * kGd + j0 +
+                         (jbase + tj) * 16 + 2 * r + hf];
+    const float g = gvec[g_base + c_tok];
+    if (tid < kGc)
+      s_w[tid] = wvec[g_base + tid];
+    for (int jt = 0; jt < kJT; ++jt) {
+      for (int r = 0; r < 8; ++r) {
+        s_s[(jt * 16 + 2 * r + hf) * kASt + wave * 16 + l16] =
+            __float2half_rn(sacc[jt][r]);
+      }
+    }
+    __syncthreads();
+    if (chunk > 0) {
+      for (int idx = tid; idx < kGc * (JG / 8); idx += 256) {
+        const int c = idx / (JG / 8), j8 = (idx % (JG / 8)) * 8;
+        *reinterpret_cast<uint4*>(
+            raw + (static_cast<size_t>(chunk - 1) * kGc + c) * kGh * kGd +
+            h * kGd + j0 + j8) =
+            *reinterpret_cast<const uint4*>(&s_os[c * kOSt + j8]);
+      }
+    }
+
+    // Step 1: P = S K^T, Q' = S Q^T for this wave's token tile and row tiles.
+    v8f pt[kJTH], qa[kJTH];
+    for (int tj = 0; tj < kJTH; ++tj) {
+      pt[tj] = v8f{};
+      qa[tj] = v8f{};
+    }
+#pragma unroll
+    for (int it = 0; it < kIT; ++it) {
+      v16h fk = *reinterpret_cast<const v16h*>(khat + kq_base + c_tok * kGd +
+                                               it * 16);
+      v16h fq = *reinterpret_cast<const v16h*>(qhat + kq_base + c_tok * kGd +
+                                               it * 16);
+#pragma unroll
+      for (int tj = 0; tj < kJTH; ++tj) {
+        v16h fs = *reinterpret_cast<const v16h*>(
+            &s_s[((jbase + tj) * 16 + l16) * kASt + it * 16]);
+        pt[tj] = Wmma(fs, fk, pt[tj]);
+        qa[tj] = Wmma(fs, fq, qa[tj]);
+      }
+    }
+    __syncthreads();  // S is dead from here: region A is reused by U^T.
+    for (int tj = 0; tj < kJTH; ++tj) {
+      for (int r = 0; r < 8; ++r) {
+        const int j = (jbase + tj) * 16 + 2 * r + hf;
+        qa[tj][r] *= g;
+        s_rt[j * kBSt + c_tok] =
+            __float2half_rn(__half2float(vv[tj][r]) - g * pt[tj][r]);
+      }
+    }
+    __syncthreads();
+    // Step 3: U^T = rhs^T X^T.
+    v8f u[kJTH];
+    for (int tj = 0; tj < kJTH; ++tj)
+      u[tj] = v8f{};
+#pragma unroll
+    for (int cs = 0; cs < kCT; ++cs) {
+      if (cs <= ct) {
+#pragma unroll
+        for (int tj = 0; tj < kJTH; ++tj) {
+          v16h fa = *reinterpret_cast<const v16h*>(
+              &s_rt[((jbase + tj) * 16 + l16) * kBSt + cs * 16]);
+          u[tj] = Wmma(fa, fx[cs], u[tj]);
+        }
+      }
+    }
+    for (int tj = 0; tj < kJTH; ++tj) {
+      for (int r = 0; r < 8; ++r) {
+        s_ut[((jbase + tj) * 16 + 2 * r + hf) * kBSt + c_tok] =
+            __float2half_rn(u[tj][r]);
+      }
+    }
+    __syncthreads();
+    // Step 4: O^T = G Q' + U^T M^T. The output stage overwrites rhs^T (dead).
+#pragma unroll
+    for (int cs = 0; cs < kCT; ++cs) {
+      if (cs <= ct) {
+#pragma unroll
+        for (int tj = 0; tj < kJTH; ++tj) {
+          v16h fa = *reinterpret_cast<const v16h*>(
+              &s_ut[((jbase + tj) * 16 + l16) * kBSt + cs * 16]);
+          qa[tj] = Wmma(fa, fm[cs], qa[tj]);
+        }
+      }
+    }
+    for (int tj = 0; tj < kJTH; ++tj) {
+      for (int r = 0; r < 8; ++r) {
+        s_os[c_tok * kOSt + (jbase + tj) * 16 + 2 * r + hf] =
+            __float2half_rn(qa[tj][r]);
+      }
+    }
+    // Step 5: S = Gc S + (w U)^T K, wave w owns key tile w and every row tile.
+    const float gc = gvec[g_base + kGc - 1];
+    v16h fkt[kGc / 16];
+#pragma unroll
+    for (int cs = 0; cs < kGc / 16; ++cs) {
+      fkt[cs] = *reinterpret_cast<const v16h*>(
+          khat_t + kq_base + (wave * 16 + l16) * kGc + cs * 16);
+#pragma unroll
+      for (int e = 0; e < 16; ++e)
+        fkt[cs][e] = static_cast<_Float16>(static_cast<float>(fkt[cs][e]) *
+                                           s_w[cs * 16 + e]);
+    }
+#pragma unroll
+    for (int jt = 0; jt < kJT; ++jt) {
+      for (int r = 0; r < 8; ++r)
+        sacc[jt][r] *= gc;
+#pragma unroll
+      for (int cs = 0; cs < kGc / 16; ++cs) {
+        v16h fa = *reinterpret_cast<const v16h*>(
+            &s_ut[(jt * 16 + l16) * kBSt + cs * 16]);
+        sacc[jt] = Wmma(fa, fkt[cs], sacc[jt]);
+      }
+    }
+    __syncthreads();
+  }
+  for (int idx = tid; idx < kGc * (JG / 8); idx += 256) {
+    const int c = idx / (JG / 8), j8 = (idx % (JG / 8)) * 8;
+    *reinterpret_cast<uint4*>(
+        raw + (static_cast<size_t>(n_chunks - 1) * kGc + c) * kGh * kGd +
+        h * kGd + j0 + j8) =
+        *reinterpret_cast<const uint4*>(&s_os[c * kOSt + j8]);
+  }
+  for (int jt = 0; jt < kJT; ++jt) {
+    for (int r = 0; r < 8; ++r) {
+      const int j = jt * 16 + 2 * r + hf;
+      state[(static_cast<size_t>(h) * kGd + j0 + j) * kGd + wave * 16 + l16] =
+          sacc[jt][r];
+    }
+  }
+}
+
+bool GatedDeltaNet(
     const float* qkv, std::uint32_t qkv_stride, const float* z,
     std::uint32_t z_stride, const float* alpha_beta, const float* conv_w,
     const float* a, const float* dt, const float* norm_w, float* conv_state,
@@ -7338,8 +8164,21 @@ void GatedDeltaNet(
     __half* out_half, GdnCheckpoint checkpoint, std::uint32_t out_half_stride,
     void* out_q8_1, void (*before_epilogue)(void*), void* before_epilogue_arg,
     const std::uint8_t* const* z_streams, std::uint32_t z_stream_stride,
-    std::uint32_t z_tokens, std::uint32_t z_gpu_cols) {
+    std::uint32_t z_tokens, std::uint32_t z_gpu_cols, bool conv_half,
+    void* chunk_scratch, std::size_t chunk_scratch_bytes) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
+  // conv_half: the convolution rows in conv_scratch are F16 (whole-projection
+  // NPU prefill), which only the chunked recurrence reads; the caller checks
+  // GdnChunkedEligible and the scratch size before asking for them.
+  const bool chunked = conv_half && convolved && row_split &&
+                       GdnChunkedEligible(n_tokens, k_heads, v_heads, d) &&
+                       state_snapshots.rows[0] == nullptr &&
+                       checkpoint.state == nullptr &&
+                       chunk_scratch != nullptr &&
+                       chunk_scratch_bytes >= GdnChunkScratchBytes(n_tokens);
+  if (conv_half && !chunked) {
+    return false;
+  }
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   const bool saved_history = !convolved && kernel == kSsmConvTaps &&
                              n_tokens <= kSsmConvTokensPerThread;
@@ -7384,7 +8223,48 @@ void GatedDeltaNet(
                        stream, conv_scratch + count, conv_state, hist_count);
   }
   const unsigned waves = kThreads / 32;
-  if (row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr) {
+  if (chunked) {
+    const std::size_t chunks = n_tokens / kGc;
+    auto* base = static_cast<std::uint8_t*>(chunk_scratch);
+    const auto take = [&](std::size_t bytes) {
+      auto* p = base;
+      base += bytes;
+      return p;
+    };
+    auto* khat = reinterpret_cast<__half*>(
+        take(chunks * kGkh * kGc * kGd * sizeof(__half)));
+    auto* khat_t = reinterpret_cast<__half*>(
+        take(chunks * kGkh * kGc * kGd * sizeof(__half)));
+    auto* qhat = reinterpret_cast<__half*>(
+        take(chunks * kGkh * kGc * kGd * sizeof(__half)));
+    auto* kkmat = reinterpret_cast<__half*>(
+        take(chunks * kGkh * kGc * kGc * sizeof(__half)));
+    auto* qkmat = reinterpret_cast<__half*>(
+        take(chunks * kGkh * kGc * kGc * sizeof(__half)));
+    auto* xmat = reinterpret_cast<__half*>(
+        take(chunks * kGh * kGc * kGc * sizeof(__half)));
+    auto* mmat = reinterpret_cast<__half*>(
+        take(chunks * kGh * kGc * kGc * sizeof(__half)));
+    auto* gvec =
+        reinterpret_cast<float*>(take(chunks * kGh * kGc * sizeof(float)));
+    auto* wvec =
+        reinterpret_cast<float*>(take(chunks * kGh * kGc * sizeof(float)));
+    hipLaunchKernelGGL(
+        GdnPrepAbKernel,
+        dim3(Blocks(static_cast<std::size_t>(n_tokens) * v_heads)),
+        dim3(kThreads), 0, stream, alpha_beta, a, dt, kn,
+        static_cast<std::size_t>(n_tokens) * v_heads, v_heads);
+    hipLaunchKernelGGL(GdnChunkNormKernel, dim3(kGkh, chunks), dim3(256), 0,
+                       stream, reinterpret_cast<const __half*>(conv_scratch),
+                       eps, khat, khat_t, qhat, kkmat, qkmat);
+    hipLaunchKernelGGL(GdnChunkPrepKernel, dim3(kGh, chunks), dim3(256), 0,
+                       stream, kkmat, qkmat, kn, xmat, mmat, gvec, wvec);
+    hipLaunchKernelGGL((GdnChunkScanKernel<64>), dim3(kGh, kGd / 64), dim3(256),
+                       0, stream, reinterpret_cast<const __half*>(conv_scratch),
+                       khat, khat_t, qhat, xmat, mmat, gvec, wvec, state,
+                       reinterpret_cast<__half*>(raw),
+                       static_cast<int>(chunks));
+  } else if (row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr) {
     hipLaunchKernelGGL(GdnPrepKqKernel, dim3(k_heads, n_tokens), dim3(32), 0,
                        stream, conv_scratch, qn, n_tokens, k_heads, channels,
                        eps);
@@ -7413,13 +8293,23 @@ void GatedDeltaNet(
   if (before_epilogue != nullptr) {
     before_epilogue(before_epilogue_arg);
   }
+  const auto epilogue = chunked ? GdnEpilogueKernel<false, true>
+                                : GdnEpilogueKernel<false, false>;
   hipLaunchKernelGGL(
-      GdnEpilogueKernel<false>, dim3((n_tokens * v_heads + waves - 1) / waves),
-      dim3(kThreads), 0, stream, raw, z, z_stride, norm_w, out, out_q8,
-      out_half, n_tokens * v_heads, v_heads, eps, nullptr, 0,
+      epilogue, dim3((n_tokens * v_heads + waves - 1) / waves), dim3(kThreads),
+      0, stream, raw, z, z_stride, norm_w, out, out_q8, out_half,
+      n_tokens * v_heads, v_heads, eps, nullptr, 0,
       out_q8 == nullptr && out_half == nullptr && d == kGdnDim ? out_q8_1
                                                                : nullptr,
       out_half_stride, z_streams, z_stream_stride, z_tokens, z_gpu_cols);
+  return true;
+}
+
+bool GdnChunkedEligible(std::uint32_t n_tokens, std::uint32_t k_heads,
+                        std::uint32_t v_heads, std::uint32_t d) {
+  return d == kGdnDim && k_heads == static_cast<std::uint32_t>(kGkh) &&
+         v_heads == static_cast<std::uint32_t>(kGh) && n_tokens != 0 &&
+         n_tokens % kGc == 0;
 }
 
 bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
@@ -7447,7 +8337,7 @@ bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
       dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, nullptr, nullptr, nullptr,
       nullptr, a, dt, nullptr, nullptr, RollbackRows{}, max_tokens, k_heads,
       v_heads, items, active, GdnCheckpoint{});
-  hipLaunchKernelGGL(GdnEpilogueKernel<true>,
+  hipLaunchKernelGGL((GdnEpilogueKernel<true, false>),
                      dim3((max_tokens * v_heads + waves - 1) / waves, 1, count),
                      dim3(kThreads), 0, stream, nullptr, nullptr, z_stride,
                      norm_w, nullptr, nullptr, nullptr, max_tokens * v_heads,
@@ -7506,6 +8396,25 @@ void PrepareQueryHeadsStreams(
                      stream, nullptr, 0, q_gamma, nullptr, q, gate, nullptr,
                      nullptr, heads, kv_heads, d, rotary_dim, start_pos, theta,
                      eps, rope, q_heads, streams, stream_stride, stream_tokens);
+}
+
+bool PrepareKvHeads(const float* packed, std::uint32_t stride,
+                    const float* k_gamma, __half* k_cache, __half* v_cache,
+                    std::uint32_t n_tokens, std::uint32_t heads,
+                    std::uint32_t kv_heads, std::uint32_t d,
+                    std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+                    float theta, float eps, hipStream_t stream,
+                    const qwen::vision::DeviceRope* rope) {
+  if (d == 0 || d > 256 || rotary_dim == 0 || rotary_dim > d ||
+      rotary_dim % 2 != 0 || kv_heads == 0 || heads % 4 != 0) {
+    return false;
+  }
+  hipLaunchKernelGGL(
+      (PrepareAttentionKernel<4>), dim3(n_tokens, (kv_heads + 3) / 4),
+      dim3(kThreads), 0, stream, packed, stride, nullptr, k_gamma, nullptr,
+      nullptr, k_cache, v_cache, heads, kv_heads, d, rotary_dim, start_pos,
+      theta, eps, rope, 0U, nullptr, 0U, 0U, heads / 4);
+  return true;
 }
 
 void PrepareQueryHeads(const float* packed, std::uint32_t stride,

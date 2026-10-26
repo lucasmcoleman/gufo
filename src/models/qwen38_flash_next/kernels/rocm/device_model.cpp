@@ -588,6 +588,53 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       if (shexp_layers != 0) {
         std::fprintf(stderr, "NPU: shared expert of %u layers\n", shexp_layers);
       }
+      // GUFO_TWO_BANK=1 with GUFO_NPU_WHOLE=1 (both experimental, default off)
+      // also stages the complete ssm_in (16 slices) and attn_qkv (13 slices)
+      // for the two-bank whole-projection prefill, about 3.3 GiB more.
+      // Ported from mikealanni/gufo 05903d68 (MIT, Mike Alani).
+      std::uint32_t whole_layers = 0;
+      if (EnvSwitchOn(std::getenv("GUFO_TWO_BANK")) &&
+          EnvSwitchOn(std::getenv("GUFO_NPU_WHOLE"))) {
+        const auto stage_whole = [&](const DeviceTensor& w,
+                                     std::uint32_t slices) {
+          std::vector<int> ids;
+          if (w.data == nullptr || w.type != core::GgmlType::kQ8_0 ||
+              w.rows != slices * npu->n() || w.cols != npu->k()) {
+            return ids;
+          }
+          for (std::uint32_t i = 0; i < slices; ++i) {
+            const int id = npu->NewBuffer(npu->BBytes(), &npu_error);
+            if (id < 0) {
+              break;
+            }
+            NpuEncodeWeights(w.data, w.cols, i * npu->n(), npu->n(), npu->k(),
+                             0, npu->k(), npu->Device(id), nullptr);
+            ids.push_back(id);
+            staged += npu->BBytes();
+          }
+          if (hipDeviceSynchronize() != hipSuccess) {
+            ids.clear();
+          }
+          for (int id : ids) {
+            npu->FinalizeWeights(id);
+          }
+          if (ids.size() != slices) {
+            ids.clear();
+          }
+          return ids;
+        };
+        for (auto& l : m->layers_) {
+          if (l.linear) {
+            l.npu_ssm_all = stage_whole(l.ssm_in, 16);
+            whole_layers += l.npu_ssm_all.empty() ? 0 : 1;
+          } else if (!l.attn_qkv.empty()) {
+            l.npu_qkv_all = stage_whole(l.attn_qkv, 13);
+            whole_layers += l.npu_qkv_all.empty() ? 0 : 1;
+          }
+        }
+        std::fprintf(stderr, "NPU: whole projections of %u layers\n",
+                     whole_layers);
+      }
       if (hipDeviceSynchronize() != hipSuccess) {
         if (error_msg != nullptr) {
           *error_msg = "NPU weight staging failed";
@@ -597,7 +644,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       std::fprintf(stderr, "NPU: z projection of %u layers, %.2f GiB staged\n",
                    layers_on,
                    static_cast<double>(staged) / (1024.0 * 1024.0 * 1024.0));
-      if (layers_on != 0) {
+      if (layers_on != 0 || whole_layers != 0) {
         m->npu_ = std::move(npu);
       }
     }

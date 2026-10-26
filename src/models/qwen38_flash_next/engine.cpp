@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -16,6 +17,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/npu_plan.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -27,6 +29,15 @@ namespace {
 // Prefill logits do not depend on the chunk size
 // (pre-budget queries always take the dense attention tiles).
 constexpr std::uint32_t kPrefillChunkTokens = 4096;
+// GUFO_PREFILL_TILE (128 to 65536, experimental, default unset) overrides
+// the chunk. The two-bank NPU prefill (GUFO_TWO_BANK) needs chunks of at
+// least 8192 tokens; scratch grows with the tile (mikealanni/gufo f4502187,
+// MIT, Mike Alani: about 3 GiB at 8192 and 9 GiB at 16384).
+std::uint32_t PrefillChunkTokens() {
+  static const std::uint32_t tokens =
+      ParsePrefillTile(std::getenv("GUFO_PREFILL_TILE"), kPrefillChunkTokens);
+  return tokens;
+}
 // A prompt ending this close past a chunk finishes in that chunk: a separate
 // tail pass costs about as much as this many more chunk rows.
 constexpr std::uint32_t kPrefillTailTokens = 128;
@@ -202,11 +213,11 @@ std::uint32_t Model::VocabSize() const noexcept {
 }
 
 std::uint32_t Model::PrefillCapacity() const noexcept {
-  return std::min(kPrefillChunkTokens, options_.max_context);
+  return std::min(PrefillChunkTokens(), options_.max_context);
 }
 
 std::uint32_t Model::PrefillThroughCapacity() const noexcept {
-  return std::min(kPrefillChunkTokens + kPrefillTailTokens,
+  return std::min(PrefillChunkTokens() + kPrefillTailTokens,
                   options_.max_context);
 }
 
@@ -605,7 +616,20 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     const auto capacity = remaining <= exec.max_batch()
                               ? exec.max_batch()
                               : model_->PrefillCapacity();
-    const std::size_t n = std::min<std::size_t>(capacity, remaining);
+    std::size_t n = std::min<std::size_t>(capacity, remaining);
+    // The two-bank prefill (GUFO_TWO_BANK) wants equal banks: feed the
+    // largest multiple of 8192 tokens now and the rest as its own chunk,
+    // unless a checkpoint boundary falls in this chunk.
+    if (prefill && TwoBankChunk(n) != n) {
+      const std::size_t rounded = TwoBankChunk(n);
+      const bool boundary_inside = (checkpoint || consume) &&
+                                   boundary > tokens_.size() &&
+                                   boundary <= tokens_.size() + n;
+      if (!boundary_inside &&
+          exec.CanForwardPair(*session_, rounded, 1, nullptr, nullptr)) {
+        n = rounded;
+      }
+    }
     const auto chunk = tokens.subspan(off, n);
     if (MtpEnabled() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], false, error_msg)) {
@@ -628,8 +652,14 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
         rest.size() <= exec.max_batch() ? exec.max_batch()
                                         : model_->PrefillCapacity(),
         rest.size()));
-    if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
-                      capture.get(), next)) {
+    // A checkpoint pass keeps the ordinary path.
+    if (prefill && capture == nullptr &&
+        exec.CanForwardPair(*session_, n, 1, nullptr, nullptr)) {
+      if (!exec.ForwardPair(*session_, chunk, 1, logits_.data(), error_msg)) {
+        return false;
+      }
+    } else if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode,
+                             error_msg, capture.get(), next)) {
       return false;
     }
     const auto kept = capture && capture->tokens < n ? n - capture->tokens : n;

@@ -120,11 +120,21 @@ bool HcCombineF16(float* res, const float* block_out, const float* inject,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                   std::uint32_t streams, float eps, hipStream_t stream,
                   float* defer_w = nullptr, float* inject_out = nullptr,
-                  const float* inject_w = nullptr);
+                  const float* inject_w = nullptr, __half* res_half = nullptr);
 /// Applies the residual update a deferring HcCombineF16 left out (four
 /// streams), with the same arithmetic.
 void HcApplyDeferred(float* res, const float* block_out, const float* w,
                      std::uint32_t n_tokens, std::uint32_t hidden,
+                     hipStream_t stream, __half* res_half = nullptr);
+/// A non-null `res_half` (GUFO_F16_RESIDUAL) makes HcCombineF16,
+/// HcApplyDeferred and HcCombineMoeF16 read and write that F16 residual
+/// instead of `res` (four streams up to 2,560 wide, the vec4 geometry only);
+/// F16 stores saturate. ResidualToHalf / ResidualToFloat convert `count`
+/// elements (a multiple of four) between the two forms. Ported from
+/// mikealanni/gufo e98c06cb (MIT, Mike Alani).
+void ResidualToHalf(const float* src, __half* dst, std::size_t count,
+                    hipStream_t stream);
+void ResidualToFloat(const __half* src, float* dst, std::size_t count,
                      hipStream_t stream);
 /// HcCombineF16 with the MoE epilogue fused in: the block output is
 /// MoeEpilogueVec4F16's result over `expert_out` ([tokens][used][hidden]
@@ -144,7 +154,8 @@ bool HcCombineMoeF16(
     const float* gamma, __half* xn, void* xn_q8, std::uint32_t n_tokens,
     std::uint32_t hidden, std::uint32_t streams, float eps, hipStream_t stream,
     const float* prior_out = nullptr, const float* prior_w = nullptr,
-    float* inject_out = nullptr, const float* inject_w = nullptr);
+    float* inject_out = nullptr, const float* inject_w = nullptr,
+    __half* res_half = nullptr);
 
 /// x[i] = silu(x[i] * scale), in place over `count` floats.
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
@@ -265,6 +276,25 @@ void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      std::uint32_t cols, std::size_t out_pitch,
                      std::uint32_t col0, bool accumulate, hipStream_t stream,
                      std::uint32_t valid_cols = 0);
+/// Rows [row0, row0 + rows) x `cols` columns straight from NPU C streams
+/// given as a device table [group * stream_stride + slice] (stream_tokens
+/// tokens and 1024 columns per stream), written to out (pitch out_pitch)
+/// from column col0.
+void NpuDecodeStreamRows(const std::uint8_t* const* streams,
+                         std::uint32_t stream_stride,
+                         std::uint32_t stream_tokens, float* out,
+                         std::uint32_t row0, std::uint32_t rows,
+                         std::uint32_t cols, std::size_t out_pitch,
+                         std::uint32_t col0, hipStream_t stream);
+/// The four-tap SSM convolution with SiLU over the first `channels` columns of
+/// a whole projection still in NPU C streams (table as above), continuing
+/// from `conv_state` ((taps - 1) x channels, not updated). Writes n_tokens x
+/// channels rows to `out`, F16 with half_out.
+void SsmConv4Streams(const std::uint8_t* const* streams,
+                     std::uint32_t stream_stride, std::uint32_t stream_tokens,
+                     const float* w, float* conv_state, void* out,
+                     std::uint32_t n_tokens, std::uint32_t channels,
+                     hipStream_t stream, bool half_out = false);
 /// BF16 weight rows [m][k] times BF16 activation rows [batch][k] with one
 /// F32 K16 chain per output. Token t's chain starts ((t / 32) % 4) * 128
 /// elements into K and wraps: hipBLASLt's MT32x32x64 order (BlasLt::Gemm).
@@ -390,8 +420,13 @@ struct GdnCheckpoint {
 /// `out_q8_1` also receives the rows' unpadded Q8_1 rows (as
 /// qfn_mmq_quantize_q8_1 writes them; d == 128). `convolved` consumes
 /// convolution rows already in conv_scratch; it requires null speculative
-/// snapshots.
-void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
+/// snapshots. With `conv_half` those rows are F16 (SsmConv4Streams' half
+/// output) and the chunked WY-form recurrence runs in `chunk_scratch`
+/// (GdnChunkScratchBytesFor(n_tokens) bytes); that F16-operand path is not
+/// bit-identical to the row-split scan (about 6e-4 relative). It needs
+/// GdnChunkedEligible and convolved rows; otherwise nothing is launched and
+/// false is returned. Returns true when the work was enqueued.
+bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
                    const float* norm_w, float* conv_state, float* conv_scratch,
@@ -407,7 +442,15 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    void* before_epilogue_arg = nullptr,
                    const std::uint8_t* const* z_streams = nullptr,
                    std::uint32_t z_stream_stride = 0,
-                   std::uint32_t z_tokens = 0, std::uint32_t z_gpu_cols = 0);
+                   std::uint32_t z_tokens = 0, std::uint32_t z_gpu_cols = 0,
+                   bool conv_half = false, void* chunk_scratch = nullptr,
+                   std::size_t chunk_scratch_bytes = 0);
+/// Whether the chunked recurrence covers this geometry (Flash-Next's 16 key
+/// and 48 value heads of 128, whole 64-token chunks).
+bool GdnChunkedEligible(std::uint32_t n_tokens, std::uint32_t k_heads,
+                        std::uint32_t v_heads, std::uint32_t d);
+/// Scratch bytes the chunked recurrence needs for `n_tokens` tokens.
+std::size_t GdnChunkScratchBytesFor(std::size_t n_tokens);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.
@@ -445,6 +488,17 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
                  std::uint32_t heads, std::uint32_t d, std::uint32_t kv_width,
                  hipStream_t stream);
 
+/// Keys and values of the packed rows ([heads x (query, gate)], then k, then
+/// v; row pitch `stride`) into the caches: the key/value heads' part of
+/// PrepareAttention only. Ported from mikealanni/gufo 05903d68 (MIT, Mike
+/// Alani).
+bool PrepareKvHeads(const float* packed, std::uint32_t stride,
+                    const float* k_gamma, __half* k_cache, __half* v_cache,
+                    std::uint32_t n_tokens, std::uint32_t heads,
+                    std::uint32_t kv_heads, std::uint32_t d,
+                    std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+                    float theta, float eps, hipStream_t stream,
+                    const qwen::vision::DeviceRope* rope);
 /// Unpacks a stacked Q/gate/K/V projection, normalizes and rotates Q/K,
 /// and writes the F16 caches. Returns false for heads wider than 256.
 /// With zero query heads, packed contains only K/V and q/gate may be null.

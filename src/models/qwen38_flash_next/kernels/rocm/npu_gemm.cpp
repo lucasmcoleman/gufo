@@ -205,6 +205,10 @@ struct NpuGemm::Impl {
   std::condition_variable queue_idle;
   std::deque<Call> queue;
   std::uint64_t enqueued{0};
+  /// Submissions whose stream callback was launched (host thread only); the
+  /// i-th one is the i-th call the worker completes, since one stream
+  /// orders them. Ported from mikealanni/gufo d7e140d5 (MIT, Mike Alani).
+  std::uint64_t submitted{0};
   std::uint64_t completed{0};
   bool worker_stop{false};
   std::atomic<bool> failed{false};
@@ -468,12 +472,20 @@ struct NpuGemm::Impl {
     Trace("process_end", call.a_id);
   }
 
-  void WaitNow() {
-    Trace("wait_begin");
+  /// Waits for every enqueued call, or with `ticket` only for the first
+  /// `ticket` submissions. A poisoned engine (a failed launch never enqueues
+  /// its call) stops waiting once the queue is idle.
+  void WaitNow(std::uint64_t ticket = 0) {
+    Trace("wait_begin", static_cast<long>(ticket));
     const auto t0 = std::chrono::steady_clock::now();
     {
       std::unique_lock lock(queue_mutex);
-      queue_idle.wait(lock, [this] { return completed == enqueued; });
+      queue_idle.wait(lock, [this, ticket] {
+        if (completed == enqueued && (ticket == 0 || failed)) {
+          return true;
+        }
+        return ticket != 0 && completed >= ticket;
+      });
     }
     wait_us += std::chrono::duration<double, std::micro>(
                    std::chrono::steady_clock::now() - t0)
@@ -717,6 +729,31 @@ bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
   if (status != hipSuccess) {
     delete call;
     impl_->FailLaunch("NPU submit could not be enqueued on the stream");
+    return false;
+  }
+  ++impl_->submitted;
+  return true;
+}
+
+std::uint64_t NpuGemm::Ticket() const noexcept {
+  return impl_->submitted;
+}
+
+bool NpuGemm::Wait(hipStream_t stream, std::uint64_t ticket) {
+  struct Request {
+    Impl* impl;
+    std::uint64_t ticket;
+  };
+  auto* request = new Request{impl_.get(), ticket};
+  if (hipLaunchHostFunc(
+          stream,
+          [](void* data) {
+            std::unique_ptr<Request> r(static_cast<Request*>(data));
+            r->impl->WaitNow(r->ticket);
+          },
+          request) != hipSuccess) {
+    delete request;
+    impl_->FailLaunch("NPU wait could not be enqueued on the stream");
     return false;
   }
   return true;

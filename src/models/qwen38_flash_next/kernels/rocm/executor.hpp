@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -274,6 +275,23 @@ public:
                              PrefillCheckpoint* checkpoint = nullptr,
                              std::span<const std::int32_t> next = {}) const;
 
+  /// Two-bank prefill (GUFO_TWO_BANK=1, experimental, default off): splits a
+  /// prefill chunk into two banks of whole 4096-token groups that advance
+  /// layer by layer, so with GUFO_NPU_WHOLE=1 the NPU projects one bank's
+  /// next layer while the GPU runs the other bank. Without GUFO_NPU_WHOLE the
+  /// banks run the ordinary layer code in lock-step. Ported from
+  /// mikealanni/gufo 58fac455, 05903d68, fa68ad48 and cb43f6fa (MIT, Mike
+  /// Alani). CanForwardPair says whether a chunk of `n` tokens qualifies and
+  /// how it splits; ForwardPair is then a prefill Forward of those tokens
+  /// (no checkpoint, no next-chunk hint).
+  [[nodiscard]] bool CanForwardPair(const Session& session, std::size_t n,
+                                    std::uint32_t n_logits, std::uint32_t* nA,
+                                    std::uint32_t* nB) const;
+  [[nodiscard]] bool ForwardPair(Session& session,
+                                 std::span<const std::int32_t> tokens,
+                                 std::uint32_t n_logits, float* logits,
+                                 std::string* error_msg);
+
   struct BatchItem {
     Session* session;
     std::span<const std::int32_t> tokens;
@@ -410,6 +428,38 @@ private:
   static std::uint64_t WalkSnapshot(const SnapshotHeader& h,
                                     const Session* session, Visit&& visit);
 
+  /// A whole-projection NPU pass queued for one bank's next layer (two-bank
+  /// prefill): which projection, its submission ticket and C buffers.
+  struct PreparedNpu {
+    bool valid{false};
+    bool linear{false};
+    std::uint64_t ticket{0};
+    std::uint32_t groups{0};
+    std::uint32_t slices{0};
+    int bank{0};
+    const int* c_ids{nullptr};
+  };
+  /// How ForwardBodyRange enters and leaves a layer range.
+  struct BodyRange {
+    /// xn already holds the first mixer's grouped norm (the previous range's
+    /// last combine produced it).
+    bool initial_normed{false};
+    /// Upload the control block even though first_layer > 0 (each bank of a
+    /// two-bank pass shares the session's device control block).
+    bool upload_control{false};
+    /// Receives whether xn holds the next mixer's norm at the end.
+    bool* out_normed{nullptr};
+    /// The first layer's projection was queued on the NPU by the two-bank
+    /// prefetch (which also ran its mixer).
+    const PreparedNpu* prepared{nullptr};
+    /// GUFO_F16_RESIDUAL: the residual enters in s_.res_h, may stay there
+    /// when the range ends before the last layer, and its final form is
+    /// reported.
+    bool initial_res_half{false};
+    bool keep_res_half{false};
+    bool* out_res_half{nullptr};
+  };
+
   /// An activation batch quantized once for the decode GEMVs; `data` is
   /// null when the batch is wide enough for the tiled path.
   struct Q8Input {
@@ -472,8 +522,11 @@ private:
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
   /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
   /// partials in s_.inject (inject_fused_).
+  /// A non-null `res_half` is the residual instead of `res`, as F16
+  /// (GUFO_F16_RESIDUAL; wide route only).
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-               const float* inject_w = nullptr) const;
+               const float* inject_w = nullptr,
+               __half* res_half = nullptr) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -526,6 +579,21 @@ private:
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg,
                    PrefillCheckpoint* checkpoint = nullptr) const;
+  /// ForwardBody over [first_layer, end_layer) with the entry and exit state
+  /// a two-bank pass threads between its ranges.
+  bool ForwardBodyRange(Session& session, std::uint32_t n,
+                        std::uint32_t n_logits, bool download_logits,
+                        bool speculative, bool sparse, std::uint32_t start_pos,
+                        std::uint32_t pool_grid, std::uint32_t first_layer,
+                        std::uint32_t end_layer, std::string* error_msg,
+                        PrefillCheckpoint* checkpoint,
+                        const BodyRange& range) const;
+  /// Runs one layer whose projection the NPU already computed (`prepared`):
+  /// waits for its ticket, then hands the attention code the C streams.
+  bool PreparedLayer(Session& session, std::uint32_t il, std::uint32_t n,
+                     std::uint32_t start_pos, std::uint32_t pool_grid,
+                     bool sparse, bool last_attention,
+                     const PreparedNpu& prepared, std::string* error_msg) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
                const float* hidden_source, MtpTrace* trace, bool kv_only) const;
@@ -562,6 +630,9 @@ private:
     void* ctx_q8_1;  ///< by the attention output gate (attn_out's input)
     void* x_q8t;     ///< tiled Q8 activations of a wide batch (W8A8 route)
     float* res;
+    /// F16 residual of large wide-prefill chunks (GUFO_F16_RESIDUAL; null
+    /// when that switch is off). See ForwardBodyRange.
+    __half* res_h;
     float* xn;
     __half* xn_half;  ///< xn as F16 on the F16 mixer input route
     void* xn_q8t;     ///< xn as tiled Q8 for the W8A8 mixer down projection
@@ -640,6 +711,12 @@ private:
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;
+  /// Allocates the per-batch scratch for `rows` token rows. With `primary`
+  /// it is the executor's own scratch (Create); otherwise a second bank's,
+  /// which shares the pinned n-gram rows of `base`.
+  [[nodiscard]] bool AllocateScratch(std::size_t rows, Scratch* out,
+                                     const Scratch* base,
+                                     std::string* error_msg);
   bool DenseBatch(const DeviceTensor& w, const float* x, float* out,
                   std::uint32_t rows, std::string* error_msg) const;
   bool GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
@@ -751,6 +828,64 @@ private:
   };
   mutable ReadyRows xn_q8_ready_;
   mutable ReadyRows mixed_q8_ready_;
+
+  // ---- Two-bank prefill (GUFO_TWO_BANK) --------------------------------
+  /// The per-batch caches above that carry from one layer to the next. A
+  /// two-bank pass keeps one set per bank and swaps them with the scratch.
+  struct BankCache {
+    const float* q8t_src{nullptr};
+    std::uint32_t q8t_rows{0};
+    std::size_t q8t_cols{0};
+    const float* half_src{nullptr};
+    std::uint32_t half_rows{0};
+    std::size_t half_cols{0};
+    bool half_bf16{false};
+    bool xn_half{false};
+    std::uint32_t inject_parts{1};
+    const float* inject_fused{nullptr};
+    unsigned q8_slot{0};
+    ReadyRows xn_q8_ready{};
+    ReadyRows mixed_q8_ready{};
+    bool moe_pending{false};
+    bool defer_residual{false};
+    bool res_deferred{false};
+    bool shexp_half_ready{false};
+    bool normed{false};    ///< xn holds the next mixer's norm
+    bool res_half{false};  ///< the residual is in s_.res_h
+  };
+  void SaveCache(BankCache* cache) const;
+  void LoadCache(const BankCache& cache) const;
+  /// Points the executor at one bank: its scratch, pinned control block and
+  /// token rows, and its layer caches.
+  void UseBank(const Scratch& scratch, Session::Control* control,
+               std::int32_t* tokens, const BankCache& cache);
+  /// Allocates bank B (half the batch rows) and, for the whole-projection
+  /// mode, the chunked recurrence scratch, on first use.
+  [[nodiscard]] bool EnsureBankB(std::string* error_msg);
+  Scratch bank_b_scratch_{};
+  bool bank_b_allocated_{false};
+  Session::Control* bank_b_control_host_{nullptr};
+  std::int32_t* bank_b_tokens_host_{nullptr};
+  /// Whole-projection NPU staging per bank: one A buffer and 16 C buffers per
+  /// 4096-token group, and the device table of the C streams' GPU pointers
+  /// ([group * 16 + slice]) the stream kernels read.
+  std::array<std::vector<int>, 2> npu_whole_a_{};
+  std::array<std::vector<int>, 2> npu_whole_c_{};
+  std::array<const std::uint8_t**, 2> npu_whole_table_{};
+  std::uint32_t npu_whole_groups_{0};
+  bool npu_whole_enabled_{false};
+  /// Set while a prepared whole-projection layer runs: its projection is
+  /// read straight from these NPU streams.
+  struct WholeStreams {
+    const std::uint8_t* const* table{nullptr};
+    std::uint32_t stride{0};  ///< streams per group
+    std::uint32_t groups{0};
+    std::uint32_t group_tokens{0};
+  };
+  mutable WholeStreams whole_streams_{};
+  /// Chunked gated-delta-rule scratch shared by every layer and bank.
+  void* gdn_chunk_scratch_{nullptr};
+  std::size_t gdn_chunk_scratch_bytes_{0};
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
