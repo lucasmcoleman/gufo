@@ -6,6 +6,7 @@ SKIP (exit 77) when the real GGUF is absent."""
 import contextlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -70,7 +71,7 @@ class LagunaSuitesTest(unittest.TestCase):
             self.assertNotIn("run.py", out)
             code, out, _ = run_main(argv, {"GUFO_LAGUNA_FUNCTIONAL": "1"})
             self.assertEqual(code, 0)
-            self.assertRegex(out, r"--output \S+/out-\d{8}-\d{6} ")
+            self.assertRegex(out, r"--output \S+/out-\d{8}-\d{6}/standard ")
 
     def test_environment_selects_the_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,7 +81,7 @@ class LagunaSuitesTest(unittest.TestCase):
         self.assertEqual(code, 77)
         self.assertIn("absent.gguf", out)
 
-    def test_command_runs_run_py_with_the_laguna_preset(self):
+    def dry_run(self, *argv):
         with tempfile.TemporaryDirectory() as tmp:
             model = Path(tmp) / "model.gguf"
             model.write_bytes(b"GGUF")
@@ -88,22 +89,59 @@ class LagunaSuitesTest(unittest.TestCase):
             binary.write_bytes(b"")
             code, out, _ = run_main(
                 ["--binary", str(binary), "--output", str(Path(tmp) / "out"),
-                 "--model", str(model), "--group", "core", "--suite", "cache-bridge",
-                 "--sessions", "2", "--context", "4096", "--dry-run",
-                 "--", "--think", "off"])
+                 "--model", str(model), "--dry-run", *argv])
         self.assertEqual(code, 0)
-        words = out.split()
-        self.assertIn("--record-baseline", words)
-        self.assertEqual(words[words.index("--sampling-preset") + 1], "laguna")
-        self.assertEqual(words[words.index("--expected-input-modalities") + 1], "text")
-        suites = [words[i + 1] for i, w in enumerate(words) if w == "--suite"]
-        self.assertEqual(suites, laguna_suites.GROUPS["core"] + ["cache-bridge"])
-        tail = words[words.index("--") + 1:]
-        self.assertEqual(tail[1:4], ["serve", "llm", "--model"])
-        self.assertEqual(tail[tail.index("--sessions") + 1], "2")
-        self.assertEqual(tail[tail.index("--context") + 1], "4096")
-        self.assertEqual(tail[-2:], ["--think", "off"])
-        self.assertNotIn("--cache-disk", words)
+        rows = []
+        for line in out.splitlines():
+            words = line.split()
+            tail = words[words.index("--") + 1:]
+            rows.append({
+                "words": words, "tail": tail,
+                "output": Path(words[words.index("--output") + 1]).name,
+                "suites": [words[i + 1] for i, w in enumerate(words) if w == "--suite"],
+                "sessions": tail[tail.index("--sessions") + 1],
+                "context": tail[tail.index("--context") + 1]})
+        return rows
+
+    def test_command_runs_run_py_with_the_laguna_preset(self):
+        rows = self.dry_run("--group", "core", "--suite", "cache-bridge",
+                            "--sessions", "2", "--context", "4096",
+                            "--", "--think", "off")
+        for row in rows:
+            words, tail = row["words"], row["tail"]
+            self.assertIn("--record-baseline", words)
+            self.assertEqual(words[words.index("--sampling-preset") + 1], "laguna")
+            self.assertEqual(words[words.index("--expected-input-modalities") + 1], "text")
+            self.assertEqual(tail[1:4], ["serve", "llm", "--model"])
+            # Explicit options override every configuration.
+            self.assertEqual((row["sessions"], row["context"]), ("2", "4096"))
+            self.assertEqual(tail[-2:], ["--think", "off"])
+            self.assertNotIn("--cache-disk", words)
+        selected = [suite for row in rows for suite in row["suites"]]
+        self.assertEqual(sorted(selected), sorted(laguna_suites.GROUPS["core"] + ["cache-bridge"]))
+        bridge = next(row for row in rows if "cache-bridge" in row["suites"])
+        self.assertEqual(bridge["output"], "cache-pressure")
+        self.assertIn("--cache-ram-bytes", bridge["tail"])
+
+    def test_each_suite_gets_its_impact_configuration(self):
+        manifest = json.loads((ROOT / "tests/functional/impact.json").read_text())
+        rows = self.dry_run("--group", "all")
+        self.assertEqual([row["output"] for row in rows], ["standard", "single-session"])
+        for row in rows:
+            settings = manifest["configurations"][row["output"]]
+            self.assertEqual((int(row["sessions"]), int(row["context"])),
+                             (settings["sessions"], settings["context"]))
+            for suite in row["suites"]:
+                self.assertEqual(manifest["suites"][suite]["configuration"], row["output"])
+        single = next(row for row in rows if row["output"] == "single-session")
+        self.assertEqual(single["suites"], ["long-context", "cache-depth", "cache-rotation"])
+        # Order within a configuration is the group order.
+        standard = rows[0]["suites"]
+        self.assertEqual(standard, [s for s in laguna_suites.GROUPS["all"] if s in standard])
+        # One configuration keeps the plain output directory.
+        only = self.dry_run("--group", "tools")
+        self.assertEqual(len(only), 1)
+        self.assertEqual(only[0]["output"], "out")
 
     def test_baseline_replaces_the_recording(self):
         with tempfile.TemporaryDirectory() as tmp:

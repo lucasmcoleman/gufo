@@ -11,6 +11,15 @@ no model unless the real GGUF exists. Without the file it prints a SKIP line
 and exits 77, the status CTest reports as skipped, so an absent model is
 never mistaken for a pass.
 
+Each suite runs under the server configuration impact.json assigns it, as
+for the other families: `standard` (--context 32768 --sessions 2) and
+`single-session` (--context 32768 --sessions 1; long-context, cache-depth,
+cache-rotation). The selected suites are grouped by configuration, keeping
+their order, and each group is one run.py invocation (one server) writing
+OUTPUT/<configuration>/. --context/--sessions override every group, for a
+deliberately different run. Two sessions at 32768 add 4.6 GiB to the
+68.6 GiB of weights.
+
 Suite groups (run.py names):
   core   discovery, token counting, responses, stops, conversation, structured
          output, sampling defaults and ranges, batching, long context, state
@@ -34,6 +43,7 @@ The server runs under whatever GPU window the caller holds, e.g.
       python3 tests/functional/laguna_suites.py ...
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -57,28 +67,48 @@ GROUPS = {
 }
 GROUPS["all"] = GROUPS["core"] + GROUPS["cache"]
 
+IMPACT = HERE / "impact.json"
+
+
+def configurations(suites, manifest=None):
+    """[(configuration, settings, suites)] in first-use order, from impact.json."""
+    manifest = manifest or json.loads(IMPACT.read_text())
+    groups = {}
+    for suite in suites:
+        name = manifest["suites"][suite]["configuration"]
+        groups.setdefault(name, []).append(suite)
+    return [(name, manifest["configurations"][name], members)
+            for name, members in groups.items()]
+
 
 def model_path(argument):
     return Path(argument or os.environ.get("GUFO_LAGUNA_GGUF") or DEFAULT_MODEL)
 
 
-def run_command(args, model, extra, suites):
+def run_command(args, model, extra, suites, settings=None, output=None,
+                baseline=None):
     """The run.py invocation for these suites; pure, so it is unit tested."""
+    settings = settings or {}
+    sessions = args.sessions or settings.get("sessions", 2)
+    context = args.context or settings.get("context", 32768)
+    baseline = baseline if baseline is not None else args.baseline
     command = [sys.executable, str(HERE / "run.py"),
-               "--output", str(args.output),
+               "--output", str(output or args.output),
                "--sampling-preset", "laguna",
                "--expected-input-modalities", "text",
                "--startup-timeout", str(args.startup_timeout),
                "--suite-timeout", str(args.suite_timeout),
                "--request-timeout", str(args.request_timeout)]
-    command += (["--baseline", str(args.baseline)] if args.baseline
+    command += (["--baseline", str(baseline)] if baseline
                 else ["--record-baseline"])
     if args.tier:
         command += ["--tier", args.tier]
     for suite in suites:
         command += ["--suite", suite]
     command += ["--", str(args.binary), "serve", "llm", "--model", str(model),
-                "--sessions", str(args.sessions), "--context", str(args.context)]
+                "--sessions", str(sessions), "--context", str(context)]
+    if settings.get("cache_ram_bytes"):
+        command += ["--cache-ram-bytes", str(settings["cache_ram_bytes"])]
     command += extra
     return command
 
@@ -94,15 +124,19 @@ def main(argv=None):
                         help="suite group (default: core and cache)")
     parser.add_argument("--suite", action="append", default=[],
                         help="extra run.py suite names, appended to the group")
-    parser.add_argument("--sessions", type=int, default=4)
-    parser.add_argument("--context", type=int, default=8192)
+    parser.add_argument("--sessions", type=int,
+                        help="override every group's impact.json sessions")
+    parser.add_argument("--context", type=int,
+                        help="override every group's impact.json context")
     parser.add_argument("--startup-timeout", type=float, default=1200,
                         help="seconds for the 68.6 GiB upload (default 1200)")
     parser.add_argument("--suite-timeout", type=float, default=3600)
     parser.add_argument("--request-timeout", type=float, default=300)
     parser.add_argument("--tier", choices=("pr", "full"))
     parser.add_argument("--baseline", type=Path,
-                        help="matched previous run directory (default: record one)")
+                        help="matched previous laguna_suites.py output directory, "
+                             "with one subdirectory per configuration "
+                             "(default: record one)")
     parser.add_argument("--ctest", action="store_true",
                         help="CTest mode (laguna.functional): also needs "
                              "GUFO_LAGUNA_FUNCTIONAL=1, else it skips; the "
@@ -139,11 +173,28 @@ def main(argv=None):
     if not args.binary.is_file():
         parser.error(f"--binary {args.binary} does not exist")
     suites = list(dict.fromkeys(GROUPS[args.group] + args.suite))
-    command = run_command(args, model, extra, suites)
+    plan = configurations(suites)
+    commands = []
+    for name, settings, members in plan:
+        output = args.output / name if len(plan) > 1 else args.output
+        baseline = None
+        if args.baseline:
+            baseline = args.baseline / name if len(plan) > 1 else args.baseline
+        commands.append((name, run_command(args, model, extra, members, settings,
+                                           output, baseline)))
     if args.dry_run:
-        print(" ".join(command))
+        for _, command in commands:
+            print(" ".join(command))
         return 0
-    return subprocess.run(command).returncode
+    if len(commands) > 1:
+        args.output.mkdir(parents=True, exist_ok=False)
+    status = 0
+    for name, command in commands:
+        print(f"laguna_suites: configuration {name}: {' '.join(command)}", flush=True)
+        code = subprocess.run(command).returncode
+        print(f"laguna_suites: configuration {name} exited {code}", flush=True)
+        status = status or code
+    return status
 
 
 if __name__ == "__main__":
