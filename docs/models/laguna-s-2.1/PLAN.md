@@ -50,6 +50,13 @@ llama.cpp-named taps diffed against `llama-eval-callback` dumps.
    `/server/staging/glm53-quality/score.py` (fixed GLM paths, so adapt them),
    and the method in docs/models/ornith-1.5-122b/QUALITY.md. Never loosen a
    tolerance to hide an unexplained mismatch.
+   Measured floor (codexms #969, #16169, llama.cpp d854d98 ubatch 256 vs 8,
+   64 x 256 positions, BOS 2): mean KL 0.024172, p99 0.296198, max 12.60,
+   top-1 94.78%, PPL ratio CI95 0.9920-1.0020; tool-text subset mean KL
+   0.0612. Data in `/server/staging/laguna-codexms-reference/full-20261025/`.
+   These are inherited GLM-framed texts, so this is reference variability, not
+   native chat qualification. gufo is compared against the ubatch 256 arm,
+   including the category and tail checks.
 5. Serve runner, sessions, snapshots, functional suites, benchmarks. Run
    untapped resume, cancel, retry, multi-session and load/unload checks, since
    taps synchronize streams and hide races (Ornith #14879-15027). Keep
