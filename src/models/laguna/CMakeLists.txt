@@ -2,7 +2,8 @@
 # F32/Q8-aware reference forward (the oracle) and, with HIP, the GPU FFN
 # operators (phase 3a), the attention operator (phase 3b), the
 # full-model executor (phase 4), the serving engine (phase 5) and the DFlash
-# drafter's GPU operators (phase 6c) and its target side (phase 6d).
+# drafter's GPU operators (phase 6c), its target side (phase 6d) and the
+# speculative decode loop (phase 6e).
 # The BPE engine comes from the Qwen tokenizer in gufo_core.
 add_library(gufo_laguna STATIC
   budget.cpp
@@ -28,7 +29,8 @@ if (ENGINE_ENABLE_HIP)
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/dflash_session.hip.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/device_model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/executor.hip.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/engine.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/speculative.cpp)
   target_sources(gufo_laguna PRIVATE ${LAGUNA_HIP_SOURCES})
   set_source_files_properties(${LAGUNA_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
   target_compile_options(gufo_laguna PRIVATE

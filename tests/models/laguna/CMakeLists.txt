@@ -99,6 +99,14 @@ if (ENGINE_ENABLE_HIP)
     "hip;gpu;gfx1151;external-model")
   set_tests_properties(laguna.dflash_target_real PROPERTIES SKIP_RETURN_CODE 77
     TIMEOUT 3600)
+  # Speculative decoding (phase 6e) on tiny random models: speculative output
+  # equals plain greedy output token for token (prompts across the window,
+  # 2k, 8k, thinking on/off, stop tokens and max_tokens inside drafts, tool
+  # grammar through the draft prefix), snapshots with the drafter ring, the
+  # negative and failure rules, mixed batched decode and 2/8 concurrent
+  # sessions. Nothing is skipped.
+  add_laguna_test(speculative gufo_laguna "hip;gpu;gfx1151")
+  set_tests_properties(laguna.speculative PROPERTIES TIMEOUT 1800)
   # CLI: the drafter's per-pass wall time (DFLASH 6d item 6). Not a test: it
   # needs the real drafter and the target's head.
   add_executable(laguna_dflash_cost dflash_cost_cli.cpp)

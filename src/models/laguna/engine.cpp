@@ -8,11 +8,19 @@
 #include <utility>
 
 #include "src/core/hip/heap_placement.hpp"
+#include "src/models/laguna/kernels/dflash_session.hpp"
+#include "src/models/laguna/speculative.hpp"
 
 namespace gufo::models::laguna {
 namespace {
 
 constexpr std::uint32_t kMaxPrefillChunk = 2048;
+/// Rows of a drafter injection (DFlashSession's vector-path limit); the ring
+/// holds the window plus this many positions.
+constexpr std::uint64_t kDrafterInjectRows = 32;
+/// Drafter scratch of one session, measured at about 20 MiB for a block of
+/// 16 on the real drafter; bounded generously.
+constexpr std::uint64_t kDrafterScratchBound = std::uint64_t{96} << 20;
 
 void Assign(std::string* out, std::string message) {
   if (out != nullptr) {
@@ -145,7 +153,112 @@ std::shared_ptr<Model> Model::FromParts(
   model->name_ = std::move(name);
   model->context_ = context;
   model->chunk_ = chunk;
+  model->sessions_ = options.session_count;
   return model;
+}
+
+bool Model::AttachDrafter(std::shared_ptr<const core::GgufReader> reader,
+                          const DrafterOptions& options,
+                          std::string* error_msg) {
+  if (reader == nullptr) {
+    Assign(error_msg, "laguna: no drafter GGUF reader");
+    return false;
+  }
+  std::string error;
+  const auto weights = DFlashWeights::Bind(*reader, &error);
+  if (!weights.has_value()) {
+    Assign(error_msg, "Laguna DFlash drafter: " + error);
+    return false;
+  }
+  return AttachDrafterWeights(*weights, options, error_msg);
+}
+
+std::size_t Model::DrafterBytes() const noexcept {
+  return drafter_ != nullptr ? drafter_->device_bytes() : 0;
+}
+
+std::size_t Model::DrafterSessionBytes() const noexcept {
+  if (drafter_ == nullptr) {
+    return 0;
+  }
+  const rocm::DrafterWeights& w = drafter_->weights();
+  const std::uint64_t capture =
+      std::uint64_t{chunk_} * w.taps * w.hidden * sizeof(float);
+  const std::uint64_t ring =
+      2ULL * w.layers.size() *
+      (w.window + std::max<std::uint64_t>(kDrafterInjectRows, w.block_size)) *
+      w.kv_heads * w.head_dim * 2;
+  return static_cast<std::size_t>(capture + ring + kDrafterScratchBound);
+}
+
+bool Model::AttachDrafterWeights(const DFlashWeights& weights,
+                                 const DrafterOptions& options,
+                                 std::string* error_msg) {
+  if (drafter_ != nullptr) {
+    Assign(error_msg, "laguna: a drafter is already attached");
+    return false;
+  }
+  if (options.block_rows < 2 || options.block_rows > 16 ||
+      options.block_rows > weights.config.block_size) {
+    Assign(error_msg, "laguna: draft block of " +
+                          std::to_string(options.block_rows) +
+                          " rows is outside 2.." +
+                          std::to_string(std::min<std::uint32_t>(
+                              16, weights.config.block_size)));
+    return false;
+  }
+  // A verify of block_rows must fit one Forward chunk, and every rewind of a
+  // rejected verify must stay within the rings' spare rows (DFLASH 6d).
+  if (chunk_ < options.block_rows) {
+    Assign(error_msg, "laguna: prefill chunk " + std::to_string(chunk_) +
+                          " is smaller than the draft block");
+    return false;
+  }
+  std::string error;
+  if (!weights.config.ValidateAgainstTarget(weights_->config, &error)) {
+    Assign(error_msg,
+           "Laguna DFlash drafter does not fit the target: " + error);
+    return false;
+  }
+  // The drafter's weights plus every session's drafter buffers must fit the
+  // device memory the target left free. Checked before the upload.
+  const std::uint64_t ring =
+      2ULL * weights.config.num_layers *
+      (weights.config.sliding_window +
+       std::max<std::uint64_t>(kDrafterInjectRows, weights.config.block_size)) *
+      weights.config.num_kv_heads * weights.config.head_dim * 2;
+  const std::uint64_t per_session =
+      std::uint64_t{chunk_} * weights.config.tap_count() *
+          weights.config.hidden_size * sizeof(float) +
+      ring + kDrafterScratchBound;
+  const std::uint64_t need = weights.total_bytes + per_session * sessions_;
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess &&
+      !hip::HeapFitsAboveReserve(free_bytes, need)) {
+    Assign(error_msg, "Laguna DFlash drafter (" +
+                          std::to_string(weights.total_bytes) +
+                          " bytes) plus " + std::to_string(sessions_) +
+                          " session(s) of drafter buffers (" +
+                          std::to_string(per_session) + " bytes each) need " +
+                          std::to_string(need) + " bytes but the device has " +
+                          std::to_string(free_bytes) + " free");
+    return false;
+  }
+  auto uploaded = rocm::DeviceDrafter::Upload(weights, &error);
+  if (!uploaded.has_value()) {
+    Assign(error_msg, "Laguna DFlash drafter upload: " + error);
+    return false;
+  }
+  std::vector<std::uint32_t> taps;
+  for (std::size_t k = 0; k < weights.config.tap_count(); ++k) {
+    taps.push_back(weights.config.tap_layer(k));
+  }
+  drafter_ = std::make_unique<rocm::DeviceDrafter>(std::move(*uploaded));
+  drafter_taps_ = std::move(taps);
+  drafter_mask_ = static_cast<std::int32_t>(weights.config.mask_token_id);
+  draft_rows_ = options.block_rows;
+  return true;
 }
 
 MemoryBudget Model::SessionBudget() const {
@@ -212,7 +325,8 @@ bool Model::TakeInjectedFailure(std::string* stage) const {
   return true;
 }
 
-std::unique_ptr<Session> Model::CreateSession(std::string* error_msg) const {
+std::unique_ptr<Session> Model::CreateSession(std::string* error_msg,
+                                              bool with_drafter) const {
   rocm::ExecutorOptions options;
   options.context = context_;
   options.max_chunk = chunk_;
@@ -220,8 +334,26 @@ std::unique_ptr<Session> Model::CreateSession(std::string* error_msg) const {
   if (executor == nullptr) {
     return nullptr;
   }
-  return std::unique_ptr<Session>(
+  std::unique_ptr<Session> session(
       new Session(shared_from_this(), std::move(executor)));
+  if (drafter_ != nullptr && with_drafter) {
+    session->dflash_ =
+        rocm::DFlashSession::Create(*session->executor_, drafter_->weights(),
+                                    drafter_taps_, drafter_mask_, error_msg);
+    if (session->dflash_ == nullptr) {
+      return nullptr;
+    }
+    // The executor warmed up its batched path; a verify takes the vector
+    // path, whose scratch would otherwise grow on the first request.
+    std::string error;
+    if (!session->dflash_->Warmup(draft_rows_, draft_rows_, &error)) {
+      Assign(error_msg, "laguna drafter warm-up: " + error);
+      return nullptr;
+    }
+    session->decoder_ = std::make_unique<SpeculativeDecoder>(
+        *this, *session->dflash_, draft_rows_);
+  }
+  return session;
 }
 
 Session::Session(std::shared_ptr<const Model> model,
@@ -243,7 +375,38 @@ bool Session::Recover(std::string* error_msg) {
   logits_.clear();
   invalid_ = false;
   ++rebuilds_;
+  RearmDrafter();
   return true;
+}
+
+void Session::RearmDrafter() noexcept {
+  if (dflash_ == nullptr) {
+    return;
+  }
+  try {
+    // The executor is healthy here: Reset() clears it (a no-op at position 0)
+    // and restarts the drafter with an empty ring, resuming a suspended one.
+    std::string error;
+    (void)dflash_->Reset(&error);
+  } catch (...) {
+  }
+}
+
+bool Session::ResumeDrafter(std::string* error_msg) {
+  if (dflash_ == nullptr || !dflash_->suspended()) {
+    return true;
+  }
+  return dflash_->Resume(error_msg);
+}
+
+bool Session::drafting() const noexcept {
+  return dflash_ != nullptr && dflash_->capturing();
+}
+
+void Session::SuspendDrafter() noexcept {
+  if (dflash_ != nullptr) {
+    dflash_->Suspend();
+  }
 }
 
 bool Session::Fail(std::string* error_msg, const std::string& message) {
@@ -264,15 +427,27 @@ bool Session::Fail(std::string* error_msg, const std::string& message) {
 }
 
 bool Session::Forward(std::span<const std::int32_t> tokens,
-                      std::string* error_msg) {
+                      std::string* error_msg, std::uint32_t following) {
   logits_.resize(model_->VocabSize());
   std::string stage;
   if (model_->TakeInjectedFailure(&stage)) {
     InjectFailureForTesting(std::move(stage));
   }
   std::string error;
-  if (!executor_->Forward(tokens, rocm::LogitsRows::kLast, logits_.data(),
-                          &error)) {
+  bool ok = false;
+  if (dflash_ != nullptr && !dflash_->suspended()) {
+    // A single decode row is a one-row verify on the vector path, the path
+    // Forward takes for it, so the logits are those of plain decode; its taps
+    // reach the drafter. Prompt chunks keep the executor's own path.
+    ok = tokens.size() == 1
+             ? dflash_->Verify(tokens, logits_.data(), &error)
+             : dflash_->Prefill(tokens, rocm::LogitsRows::kLast, logits_.data(),
+                                &error, following);
+  } else {
+    ok = executor_->Forward(tokens, rocm::LogitsRows::kLast, logits_.data(),
+                            &error);
+  }
+  if (!ok) {
     return Fail(error_msg,
                 error.empty() ? "laguna forward pass failed" : error);
   }
@@ -280,12 +455,15 @@ bool Session::Forward(std::span<const std::int32_t> tokens,
 }
 
 bool Session::Prefill(std::span<const std::int32_t> tokens,
-                      std::string* error_msg) {
+                      std::string* error_msg, std::uint32_t following) {
   if (!Recover(error_msg)) {
     return false;
   }
   if (tokens.empty()) {
     return true;
+  }
+  if (tokens.size() > 1 && !ResumeDrafter(error_msg)) {
+    return false;
   }
   // Everything the pass could reject is checked before any work is enqueued,
   // so a rejection leaves the session untouched.
@@ -303,9 +481,11 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
   }
   const std::size_t chunk = model_->PrefillChunk();
   for (std::size_t offset = 0; offset < tokens.size(); offset += chunk) {
-    if (!Forward(
-            tokens.subspan(offset, std::min(chunk, tokens.size() - offset)),
-            error_msg)) {
+    const std::size_t n = std::min(chunk, tokens.size() - offset);
+    const std::uint64_t after = tokens.size() - offset - n + following;
+    if (!Forward(tokens.subspan(offset, n), error_msg,
+                 static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                     after, std::numeric_limits<std::uint32_t>::max())))) {
       return false;
     }
   }
@@ -346,6 +526,13 @@ void Session::EvaluateBatch(std::span<BatchItem> items) {
     if (std::uint64_t{session->Position()} + 1 > session->Context()) {
       item.error = "laguna: context of " + std::to_string(session->Context()) +
                    " tokens exhausted";
+      continue;
+    }
+    // A session whose executor carries the drafter's taps (any session with
+    // a drafter that is not suspended) decodes alone (DFLASH rule 6): the
+    // shared pass neither captures its row nor takes a tapped executor.
+    if (session->dflash_ != nullptr && !session->dflash_->suspended()) {
+      item.completed = session->Evaluate(item.token, &item.error);
       continue;
     }
     accepted.push_back(&item);
@@ -406,13 +593,17 @@ void Session::Invalidate() noexcept {
     if (was_invalid && !invalid_) {
       ++rebuilds_;
     }
+    if (!invalid_) {
+      RearmDrafter();
+    }
   } catch (...) {
     invalid_ = true;
   }
 }
 
 std::size_t Session::SnapshotBytes() const noexcept {
-  return executor_->snapshot_bytes() + model_->VocabSize() * sizeof(float);
+  return executor_->snapshot_bytes() + model_->VocabSize() * sizeof(float) +
+         (drafting() ? dflash_->drafter_image_bytes() : 0);
 }
 
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(std::string* error_msg) {
@@ -430,6 +621,14 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(std::string* error_msg) {
   snapshot->logits = logits_;
   snapshot->context = Context();
   snapshot->chunk = model_->PrefillChunk();
+  if (drafting()) {
+    // Without an image (a drafter out of step, or a copy failure, which
+    // drops it) a restore of this snapshot starts the drafter cold.
+    rocm::DrafterImage image;
+    if (dflash_->SaveDrafter(&image)) {
+      snapshot->drafter = std::move(image);
+    }
+  }
   return snapshot;
 }
 
@@ -451,6 +650,57 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
                 error.empty() ? "laguna snapshot restore failed" : error);
   }
   logits_ = snapshot.logits;
+  if (dflash_ != nullptr) {
+    // The ring of the snapshot, or an empty (cold) ring at its position;
+    // never the rows this session held before. A drafter that cannot take
+    // the image is dropped; the target state stands.
+    (void)dflash_->RestoreDrafter(
+        snapshot.drafter ? &*snapshot.drafter : nullptr, &error);
+  }
+  return true;
+}
+
+bool Session::DecodeSpeculative(sampling::SamplerState& sampler,
+                                std::uint32_t max_tokens,
+                                std::uint32_t context_limit, bool stop_at_eos,
+                                SpeculativeStepResult* out,
+                                std::string* error_msg) {
+  if (decoder_ == nullptr || out == nullptr) {
+    Assign(error_msg, "laguna: the session has no drafter");
+    return false;
+  }
+  if (sampler.config().uses_random_sampling() || max_tokens == 0) {
+    Assign(error_msg,
+           "laguna: speculative decoding takes deterministic requests and a "
+           "positive budget");
+    return false;
+  }
+  if (!Recover(error_msg)) {
+    return false;
+  }
+  if (logits_.size() != model_->VocabSize()) {
+    Assign(error_msg, "laguna: no frontier to decode from");
+    return false;
+  }
+  if (!ResumeDrafter(error_msg)) {
+    return false;
+  }
+  std::string stage;
+  if (model_->TakeInjectedFailure(&stage)) {
+    InjectFailureForTesting(std::move(stage));
+  }
+  std::vector<float> frontier;
+  try {
+    decoder_->Step(logits_, sampler, max_tokens, context_limit, stop_at_eos,
+                   out, &frontier);
+  } catch (const std::exception& e) {
+    // A target failure poisoned the executor; any other failure may have left
+    // the session between a verify and its commit. Start over either way.
+    return Fail(error_msg, e.what());
+  }
+  if (!out->stop) {
+    logits_ = std::move(frontier);
+  }
   return true;
 }
 

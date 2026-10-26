@@ -690,6 +690,84 @@ bool DrafterKv::RewindTo(std::uint32_t position, std::string* error_msg) {
   return true;
 }
 
+bool DrafterKv::Export(DrafterImage* image, hipStream_t stream,
+                       std::string* error_msg) const {
+  if (image == nullptr || !valid_ || k_.empty()) {
+    Assign(error_msg, "laguna dflash kv: nothing valid to export");
+    return false;
+  }
+  const std::size_t ring = std::size_t{capacity_} * row_bytes();
+  DrafterImage out;
+  out.layers = layers();
+  out.kv_heads = kv_heads_;
+  out.capacity = capacity_;
+  out.window = window_;
+  out.committed = committed_;
+  out.retained_begin = retained_begin_;
+  out.floor = floor_;
+  out.keys.resize(ring * k_.size());
+  out.values.resize(ring * v_.size());
+  // Ordered after every write queued on the ring's stream.
+  for (std::size_t il = 0; il < k_.size(); ++il) {
+    if (!CheckHip(hipMemcpyAsync(out.keys.data() + il * ring, k_[il], ring,
+                                 hipMemcpyDeviceToHost, stream),
+                  "drafter kv export", error_msg) ||
+        !CheckHip(hipMemcpyAsync(out.values.data() + il * ring, v_[il], ring,
+                                 hipMemcpyDeviceToHost, stream),
+                  "drafter kv export", error_msg)) {
+      (void)hipStreamSynchronize(stream);
+      return false;
+    }
+  }
+  if (!CheckHip(hipStreamSynchronize(stream), "drafter kv export sync",
+                error_msg)) {
+    return false;
+  }
+  *image = std::move(out);
+  return true;
+}
+
+bool DrafterKv::Import(const DrafterImage& image, hipStream_t stream,
+                       std::string* error_msg) {
+  const std::size_t ring = std::size_t{capacity_} * row_bytes();
+  if (k_.empty() || image.layers != layers() || image.kv_heads != kv_heads_ ||
+      image.capacity != capacity_ || image.window != window_ ||
+      image.keys.size() != ring * k_.size() ||
+      image.values.size() != ring * v_.size()) {
+    Assign(error_msg, "laguna dflash kv: image of another geometry");
+    return false;
+  }
+  if (image.floor > image.committed || image.retained_begin > image.committed ||
+      image.committed - image.retained_begin > capacity_) {
+    Assign(error_msg, "laguna dflash kv: image bookkeeping is inconsistent");
+    return false;
+  }
+  // From here on a failure leaves rings partly overwritten.
+  for (std::size_t il = 0; il < k_.size(); ++il) {
+    if (!CheckHip(hipMemcpyAsync(k_[il], image.keys.data() + il * ring, ring,
+                                 hipMemcpyHostToDevice, stream),
+                  "drafter kv import", error_msg) ||
+        !CheckHip(hipMemcpyAsync(v_[il], image.values.data() + il * ring, ring,
+                                 hipMemcpyHostToDevice, stream),
+                  "drafter kv import", error_msg)) {
+      (void)hipStreamSynchronize(stream);
+      valid_ = false;
+      return false;
+    }
+  }
+  // The host image must outlive the copies.
+  if (!CheckHip(hipStreamSynchronize(stream), "drafter kv import sync",
+                error_msg)) {
+    valid_ = false;
+    return false;
+  }
+  committed_ = image.committed;
+  retained_begin_ = image.retained_begin;
+  floor_ = image.floor;
+  valid_ = true;
+  return true;
+}
+
 std::optional<DrafterKv> DrafterKv::Create(const DrafterWeights& w,
                                            std::uint32_t max_rows,
                                            std::string* error_msg) {

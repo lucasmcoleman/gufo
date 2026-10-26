@@ -20,26 +20,44 @@
 // until a later reset succeeds; nothing ever continues on a poisoned cache.
 // Calls rejected up front (a token outside the vocabulary, a context overrun)
 // touch nothing and leave the session as it was.
+//
+// Speculative decoding (DFLASH.md phase 6e): a Model with an attached DFlash
+// drafter gives every session a rocm::DFlashSession over its executor and a
+// SpeculativeDecoder. Prefill and Evaluate then capture the drafter's taps;
+// DecodeSpeculative runs one greedy speculative step; snapshots carry the
+// drafter ring. A session that serves a request which samples at random is
+// suspended (SuspendDrafter) so it decodes plainly and can join
+// EvaluateBatch; it never speculates such a request.
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/sampling.hpp"
 #include "src/models/laguna/budget.hpp"
 #include "src/models/laguna/chat_template.hpp"
+#include "src/models/laguna/dflash.hpp"
 #include "src/models/laguna/kernels/device_model.hpp"
+#include "src/models/laguna/kernels/dflash_ops.hpp"
 #include "src/models/laguna/kernels/executor.hpp"
 #include "src/models/laguna/tokenizer.hpp"
 #include "src/models/laguna/weights.hpp"
 
 namespace gufo::models::laguna {
+
+namespace rocm {
+class DFlashSession;
+}
+class SpeculativeDecoder;
+struct SpeculativeStepResult;
 
 struct ModelOptions {
   /// Positions of every session (full-layer KV). Zero takes the GGUF's
@@ -52,15 +70,27 @@ struct ModelOptions {
   std::uint32_t session_count{1};
 };
 
+/// Speculative decoding with the DFlash drafter (Model::AttachDrafter).
+struct DrafterOptions {
+  /// Rows per verify: the anchor plus block_rows - 1 drafts, 2 to 16. The
+  /// measured default (DFLASH.md 6b-0 and 6d: a verify of 4 rows pays at every
+  /// context depth, 8 only from about 8k, 16 not at short context).
+  std::uint32_t block_rows{4};
+};
+
 /// Immutable host copy of a session's state at one position.
 struct SessionSnapshot {
   rocm::ExecutorSnapshot kv;
   std::vector<float> logits;  ///< The frontier logits at `kv.position`.
+  /// The drafter ring at `kv.position` when the session's drafter was in
+  /// step; without it a restored session's drafter starts cold.
+  std::optional<rocm::DrafterImage> drafter;
   std::uint32_t context{0};
   std::uint32_t chunk{0};
   [[nodiscard]] std::uint32_t position() const noexcept { return kv.position; }
   [[nodiscard]] std::size_t bytes() const noexcept {
-    return kv.bytes() + logits.size() * sizeof(float);
+    return kv.bytes() + logits.size() * sizeof(float) +
+           (drafter ? drafter->bytes() : 0);
   }
 };
 
@@ -133,9 +163,37 @@ public:
   [[nodiscard]] bool TakeInjectedFailure(std::string* stage) const;
 
   /// A fresh session (its own executor). Nullptr with a message when the
-  /// device cannot hold another one.
+  /// device cannot hold another one. With a drafter attached the session also
+  /// gets its DFlash session and decoder, warmed up for a verify of
+  /// block_rows on the vector path, unless `with_drafter` is false (a plain
+  /// session, as without a drafter).
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
-      std::string* error_msg = nullptr) const;
+      std::string* error_msg = nullptr, bool with_drafter = true) const;
+
+  /// Loads the DFlash drafter (`dflash` GGUF, decoder_arch laguna) for
+  /// speculative decoding: binds and checks it against this model, checks
+  /// that it and every session's drafter buffers fit the free device memory,
+  /// and uploads it. Sessions created afterwards speculate. Call before
+  /// creating sessions; refused when a drafter is already attached.
+  [[nodiscard]] bool AttachDrafter(
+      std::shared_ptr<const core::GgufReader> reader,
+      const DrafterOptions& options, std::string* error_msg = nullptr);
+  /// The same from bound weights (tests use synthetic drafters); the tensor
+  /// data must stay valid for the call (the upload copies it).
+  [[nodiscard]] bool AttachDrafterWeights(const DFlashWeights& weights,
+                                          const DrafterOptions& options,
+                                          std::string* error_msg = nullptr);
+  [[nodiscard]] bool has_drafter() const noexcept {
+    return drafter_ != nullptr;
+  }
+  [[nodiscard]] std::uint32_t draft_block_rows() const noexcept {
+    return draft_rows_;
+  }
+  /// Device bytes of the uploaded drafter (0 without one).
+  [[nodiscard]] std::size_t DrafterBytes() const noexcept;
+  /// Upper bound of what one session's drafter side takes on the device
+  /// (capture buffer, ring, scratch); 0 without a drafter.
+  [[nodiscard]] std::size_t DrafterSessionBytes() const noexcept;
 
 private:
   Model() = default;
@@ -147,6 +205,11 @@ private:
   std::string name_;
   std::uint32_t context_{0};
   std::uint32_t chunk_{0};
+  std::uint32_t sessions_{1};
+  std::unique_ptr<rocm::DeviceDrafter> drafter_;
+  std::vector<std::uint32_t> drafter_taps_;
+  std::int32_t drafter_mask_{0};
+  std::uint32_t draft_rows_{0};
   mutable std::atomic<std::int64_t> fault_countdown_{-1};
   mutable std::mutex fault_mutex_;
   mutable std::string fault_stage_;
@@ -160,8 +223,11 @@ public:
 
   /// Appends `tokens` (any number; run in chunks of Model::PrefillChunk) and
   /// leaves the frontier logits of the last one. Empty input is a no-op.
+  /// `following`: prompt tokens known to come after these in a later call
+  /// (the drafter skips rows no block can read).
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens,
-                             std::string* error_msg = nullptr);
+                             std::string* error_msg = nullptr,
+                             std::uint32_t following = 0);
   /// Appends one token (a decode step).
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
@@ -228,6 +294,32 @@ public:
   void InjectFailureForTesting(std::string stage);
   [[nodiscard]] rocm::Executor& executor() noexcept { return *executor_; }
 
+  // ---- speculative decoding (a Model with a drafter) ----------------------
+
+  /// True when the session has a drafter (the model had one at creation).
+  [[nodiscard]] bool speculative() const noexcept { return dflash_ != nullptr; }
+  /// True while the drafter captures and drafts (not suspended or dropped).
+  [[nodiscard]] bool drafting() const noexcept;
+  /// Plain decode for a request that samples at random: the executor's taps
+  /// are cleared so EvaluateBatch can take it. Undone by the next Prefill or
+  /// DecodeSpeculative (cold ring) and by a snapshot restore or reset.
+  void SuspendDrafter() noexcept;
+  /// One greedy speculative step (SpeculativeDecoder::Step) from the
+  /// frontier; `sampler` must not sample at random and is not advanced.
+  /// Emits at most `max_tokens` tokens; the position stays within
+  /// `context_limit`. A failure resets the session as a failed Evaluate does.
+  [[nodiscard]] bool DecodeSpeculative(sampling::SamplerState& sampler,
+                                       std::uint32_t max_tokens,
+                                       std::uint32_t context_limit,
+                                       bool stop_at_eos,
+                                       SpeculativeStepResult* out,
+                                       std::string* error_msg = nullptr);
+  /// The session's DFlash session and decoder (null without a drafter).
+  [[nodiscard]] rocm::DFlashSession* dflash() noexcept { return dflash_.get(); }
+  [[nodiscard]] SpeculativeDecoder* decoder() noexcept {
+    return decoder_.get();
+  }
+
 private:
   friend class Model;
   Session(std::shared_ptr<const Model> model,
@@ -235,10 +327,17 @@ private:
   [[nodiscard]] bool Recover(std::string* error_msg);
   bool Fail(std::string* error_msg, const std::string& message);
   [[nodiscard]] bool Forward(std::span<const std::int32_t> tokens,
-                             std::string* error_msg);
+                             std::string* error_msg,
+                             std::uint32_t following = 0);
+  /// Resets the drafter with the executor (after Recover or Invalidate).
+  void RearmDrafter() noexcept;
+  [[nodiscard]] bool ResumeDrafter(std::string* error_msg);
 
   std::shared_ptr<const Model> model_;
   std::unique_ptr<rocm::Executor> executor_;
+  // Declared after the executor they borrow, so they are destroyed first.
+  std::unique_ptr<rocm::DFlashSession> dflash_;
+  std::unique_ptr<SpeculativeDecoder> decoder_;
   std::vector<float> logits_;
   bool invalid_{false};
   std::uint32_t failures_{0};

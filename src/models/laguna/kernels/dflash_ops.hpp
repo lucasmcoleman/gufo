@@ -107,6 +107,25 @@ private:
   std::size_t bytes_{0};
 };
 
+/// Host copy of one session's drafter ring (DFLASH rule 5, a session
+/// snapshot's drafter half): every layer's whole ring and the bookkeeping.
+/// Importing it into a ring of the same geometry makes every later block and
+/// injection behave as they would have in the original ring.
+struct DrafterImage {
+  std::uint32_t layers{0};
+  std::uint32_t kv_heads{0};
+  std::uint32_t capacity{0};
+  std::uint32_t window{0};
+  std::uint32_t committed{0};
+  std::uint32_t retained_begin{0};
+  std::uint32_t floor{0};
+  std::vector<std::uint8_t> keys;    ///< [layers][capacity][kv_heads][128] F16
+  std::vector<std::uint8_t> values;  ///< same layout
+  [[nodiscard]] std::size_t bytes() const noexcept {
+    return keys.size() + values.size();
+  }
+};
+
 /// The drafter's K/V of one session: per layer an F16 ring of
 /// `window + max(max_rows, block_size)` positions (position p in slot
 /// p % capacity). It holds the injected context rows; a block pass writes its
@@ -172,6 +191,16 @@ public:
   /// RejectContinue(position) refuses.
   [[nodiscard]] bool RewindTo(std::uint32_t position,
                               std::string* error_msg = nullptr);
+  /// Copies the rings and bookkeeping to `image` after the work queued on
+  /// `stream` (which must be the stream that writes the ring) has finished.
+  /// Refused on an invalid ring.
+  [[nodiscard]] bool Export(DrafterImage* image, hipStream_t stream,
+                            std::string* error_msg = nullptr) const;
+  /// Replaces the rings and bookkeeping with `image`. Refused, touching
+  /// nothing, on another geometry or inconsistent bookkeeping; a copy that
+  /// fails part way invalidates the ring (Reset() it).
+  [[nodiscard]] bool Import(const DrafterImage& image, hipStream_t stream,
+                            std::string* error_msg = nullptr);
   /// Bytes of one position's K (or V) row of one layer.
   [[nodiscard]] std::size_t row_bytes() const noexcept {
     return std::size_t{kv_heads_} * 128 * 2;

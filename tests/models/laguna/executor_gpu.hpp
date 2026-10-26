@@ -148,6 +148,17 @@ public:
   [[nodiscard]] const ml::Config& config() const { return weights_.config; }
   [[nodiscard]] const ModelSpec& spec() const { return spec_; }
 
+  /// Makes head row `dst` a byte copy of row `src`, so logit `dst` equals
+  /// logit `src` bit for bit and greedy decode (first maximum) selects `dst`
+  /// wherever `src` would win when dst < src (tests force stop tokens this
+  /// way). Call before uploading.
+  void AliasHeadRow(std::uint32_t dst, std::uint32_t src) {
+    const std::size_t row = output_.bytes.size() / spec_.vocab;
+    Require(dst < spec_.vocab && src < spec_.vocab, "head row out of range");
+    std::copy_n(output_.bytes.data() + std::size_t{src} * row, row,
+                output_.bytes.data() + std::size_t{dst} * row);
+  }
+
   /// Uploads the model; never null (the test fails instead).
   [[nodiscard]] std::unique_ptr<exec::DeviceModel> Upload() const {
     std::string error;

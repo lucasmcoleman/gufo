@@ -40,10 +40,12 @@ DFlashSession::~DFlashSession() {
   if (capture_ != nullptr) {
     (void)hipStreamSynchronize(target_.stream());
     (void)hipFree(capture_);
-    (void)hipFree(nonfinite_);
-    // The executor decodes as a plain session again (DecodeBatch takes it).
-    (void)target_.SetFeatureTaps({});
   }
+  if (nonfinite_ != nullptr) {
+    (void)hipFree(nonfinite_);
+  }
+  // The executor decodes as a plain session again (DecodeBatch takes it).
+  (void)target_.SetFeatureTaps({});
 }
 
 std::unique_ptr<DFlashSession> DFlashSession::Create(
@@ -85,12 +87,16 @@ std::unique_ptr<DFlashSession> DFlashSession::Create(
           hipMalloc(reinterpret_cast<void**>(&s->nonfinite_), sizeof(int));
       e != hipSuccess ||
       hipMemset(s->nonfinite_, 0, sizeof(int)) != hipSuccess) {
+    if (e != hipSuccess) {
+      s->nonfinite_ = nullptr;
+    }
     Assign(error_msg, "laguna dflash session: flag allocation failed");
     return nullptr;
   }
   if (!target.SetFeatureTaps(tap_layers, error_msg)) {
     return nullptr;
   }
+  s->taps_.assign(tap_layers.begin(), tap_layers.end());
   s->drafter_->kv().Reset(target.position());
   return s;
 }
@@ -104,7 +110,7 @@ void DFlashSession::Drop(const std::string& why) {
 
 void DFlashSession::InjectCaptured(std::uint32_t start, std::uint32_t from,
                                    std::uint32_t end) {
-  if (!active_ || from >= end) {
+  if (!capturing() || from >= end) {
     return;
   }
   const std::size_t width = target_.feature_width();
@@ -141,7 +147,7 @@ void DFlashSession::InjectCaptured(std::uint32_t start, std::uint32_t from,
 
 bool DFlashSession::Prefill(std::span<const std::int32_t> tokens,
                             LogitsRows rows, float* logits,
-                            std::string* error_msg) {
+                            std::string* error_msg, std::uint32_t following) {
   if (tokens.empty()) {
     return true;
   }
@@ -168,12 +174,17 @@ bool DFlashSession::Prefill(std::span<const std::int32_t> tokens,
     return false;
   }
   const auto end = static_cast<std::uint32_t>(P + tokens.size());
-  // A block at `end` reads the window - 1 rows before it; older rows need no
-  // injection. A ring out of step with the target (a dropped and re-armed
-  // drafter, a restored target) starts over at the prompt rows it can see.
-  const std::uint32_t needed = end >= w_.window ? end - (w_.window - 1) : 0;
+  // A block at `end` (or, when `following` prompt tokens come after these,
+  // at the end of the prompt) reads the window - 1 rows before it; older rows
+  // need no injection. A ring out of step with the target (a dropped and
+  // re-armed drafter, a restored target) starts over at the prompt rows it
+  // can see. A ring with nothing to inject now restarts at `end`.
+  const std::uint64_t horizon = std::uint64_t{end} + following;
+  const std::uint32_t needed =
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(
+          horizon >= w_.window ? horizon - (w_.window - 1) : 0, end));
   std::uint32_t inject_from = P;
-  if (active_) {
+  if (capturing()) {
     DrafterKv& kv = drafter_->kv();
     if (!kv.valid() || kv.committed() != P || needed > P) {
       inject_from = std::max(P, needed);
@@ -195,7 +206,7 @@ bool DFlashSession::Prefill(std::span<const std::int32_t> tokens,
       out = logits;
     }
     // Rows below inject_from need no capture.
-    const bool capture = active_ && s + T > inject_from;
+    const bool capture = capturing() && s + T > inject_from;
     ForwardArgs args;
     args.features = capture ? capture_ : nullptr;
     if (!target_.Forward(tokens.subspan(s - P, T), r, out, args, error_msg)) {
@@ -214,12 +225,13 @@ bool DFlashSession::Prefill(std::span<const std::int32_t> tokens,
 bool DFlashSession::Verify(std::span<const std::int32_t> tokens, float* logits,
                            std::string* error_msg) {
   const std::uint32_t P = target_.position();
-  if (active_ && (!drafter_->kv().valid() || drafter_->kv().committed() != P)) {
+  if (capturing() &&
+      (!drafter_->kv().valid() || drafter_->kv().committed() != P)) {
     Drop("laguna dflash session: the drafter is out of step with the target");
   }
   ForwardArgs args;
   args.path = Path::kVector;
-  args.features = active_ ? capture_ : nullptr;
+  args.features = capturing() ? capture_ : nullptr;
   if (!target_.Forward(tokens, LogitsRows::kAll, logits, args, error_msg)) {
     if (target_.poisoned()) {
       Drop("laguna dflash session: the target failed");
@@ -234,7 +246,7 @@ bool DFlashSession::Commit(std::uint32_t position, std::string* error_msg) {
   if (!target_.RewindTo(position, error_msg)) {
     return false;
   }
-  if (active_) {
+  if (capturing()) {
     std::string error;
     if (!drafter_->kv().RewindTo(position, &error)) {
       Drop("laguna dflash session: drafter rewind refused: " + error);
@@ -250,6 +262,10 @@ bool DFlashSession::Propose(std::int32_t anchor, std::uint32_t block_rows,
   if (!active_) {
     Assign(error_msg,
            "laguna dflash session: no drafter (" + drafter_error_ + ")");
+    return false;
+  }
+  if (suspended_) {
+    Assign(error_msg, "laguna dflash session: the drafter is suspended");
     return false;
   }
   if (target_.poisoned()) {
@@ -303,6 +319,12 @@ bool DFlashSession::Reset(std::string* error_msg) {
     Drop("laguna dflash session: the target could not be reset");
     return false;
   }
+  if (suspended_) {
+    if (!target_.SetFeatureTaps(taps_, error_msg)) {
+      return false;
+    }
+    suspended_ = false;
+  }
   drafter_->kv().Reset(0);
   if (hipMemset(nonfinite_, 0, sizeof(int)) != hipSuccess) {
     Drop("laguna dflash session: tap check reset failed");
@@ -312,6 +334,129 @@ bool DFlashSession::Reset(std::string* error_msg) {
   drafter_error_.clear();
   poison_next_ = false;
   return true;
+}
+
+}  // namespace gufo::models::laguna::rocm
+
+namespace gufo::models::laguna::rocm {
+
+void DFlashSession::Suspend() {
+  if (suspended_) {
+    return;
+  }
+  // Clearing the taps cannot fail (an empty list is always valid).
+  (void)target_.SetFeatureTaps({});
+  suspended_ = true;
+}
+
+bool DFlashSession::Resume(std::string* error_msg) {
+  if (!suspended_) {
+    return true;
+  }
+  if (!target_.SetFeatureTaps(taps_, error_msg)) {
+    return false;
+  }
+  suspended_ = false;
+  if (active_) {
+    drafter_->kv().Reset(target_.position());
+    if (hipMemset(nonfinite_, 0, sizeof(int)) != hipSuccess) {
+      Drop("laguna dflash session: tap check reset failed");
+    }
+  }
+  return true;
+}
+
+bool DFlashSession::SaveDrafter(DrafterImage* image, std::string* error_msg) {
+  if (image == nullptr || !capturing() || !drafter_->kv().valid() ||
+      drafter_->kv().committed() != target_.position()) {
+    Assign(error_msg, "laguna dflash session: the drafter is not in step");
+    return false;
+  }
+  // A pending non-finite tap would drop the drafter at the next block; an
+  // image of that ring must not outlive the flag.
+  int flag = 0;
+  if (hipMemcpy(&flag, nonfinite_, sizeof(int), hipMemcpyDeviceToHost) !=
+          hipSuccess ||
+      flag != 0) {
+    Drop("laguna dflash session: non-finite tap or tap check read failure");
+    Assign(error_msg, drafter_error_);
+    return false;
+  }
+  std::string error;
+  if (!drafter_->kv().Export(image, target_.stream(), &error)) {
+    Drop("laguna dflash session: drafter export failed: " + error);
+    Assign(error_msg, drafter_error_);
+    return false;
+  }
+  return true;
+}
+
+bool DFlashSession::RestoreDrafter(const DrafterImage* image,
+                                   std::string* error_msg) {
+  if (target_.poisoned()) {
+    Assign(error_msg, "laguna dflash session: the target is poisoned");
+    return false;
+  }
+  if (suspended_) {
+    if (!target_.SetFeatureTaps(taps_, error_msg)) {
+      return false;
+    }
+    suspended_ = false;
+  }
+  // Re-arm: whatever the ring held before belongs to another history.
+  active_ = true;
+  drafter_error_.clear();
+  DrafterKv& kv = drafter_->kv();
+  kv.Reset(target_.position());
+  if (hipMemset(nonfinite_, 0, sizeof(int)) != hipSuccess) {
+    Drop("laguna dflash session: tap check reset failed");
+    Assign(error_msg, drafter_error_);
+    return false;
+  }
+  if (image == nullptr) {
+    return true;
+  }
+  if (image->committed != target_.position()) {
+    Drop("laguna dflash session: the drafter image is of another position");
+    Assign(error_msg, drafter_error_);
+    return false;
+  }
+  std::string error;
+  if (!kv.Import(*image, target_.stream(), &error)) {
+    kv.Reset(target_.position());
+    Drop("laguna dflash session: drafter import failed: " + error);
+    Assign(error_msg, drafter_error_);
+    return false;
+  }
+  return true;
+}
+
+bool DFlashSession::Warmup(std::uint32_t verify_rows, std::uint32_t block_rows,
+                           std::string* error_msg) {
+  if (target_.position() != 0 || verify_rows == 0 || verify_rows > 32 ||
+      verify_rows > target_.max_chunk() || block_rows < 2 ||
+      block_rows > w_.block_size) {
+    Assign(error_msg, "laguna dflash session: bad warm-up");
+    return false;
+  }
+  const std::size_t V = target_.model().config().vocab_size;
+  std::vector<float> logits(std::size_t{verify_rows} * V);
+  const std::vector<std::int32_t> tokens(verify_rows, 0);
+  std::vector<std::int32_t> drafts;
+  if (!Verify(tokens, logits.data(), error_msg)) {
+    return false;
+  }
+  if (capturing() && !Propose(0, block_rows, &drafts, nullptr, error_msg)) {
+    return false;
+  }
+  return Reset(error_msg);
+}
+
+std::size_t DFlashSession::device_bytes() const noexcept {
+  return std::size_t{target_.max_chunk()} * taps_.size() * w_.hidden *
+             sizeof(float) +
+         sizeof(int) + drafter_->kv().device_bytes() +
+         drafter_->ops().scratch_bytes();
 }
 
 }  // namespace gufo::models::laguna::rocm

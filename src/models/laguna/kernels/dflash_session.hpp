@@ -26,10 +26,15 @@
 //    flagged on the device as it is injected) drops only the drafter: the
 //    target's result stands and the session continues as plain decode. A
 //    dropped drafter stays dropped until Reset().
-//  * Not here (design notes for 6e): snapshots of the drafter ring (rule 5;
-//    a target RestoreSnapshot desynchronizes the drafter, so it is dropped by
-//    the next call that finds it out of step) and batched decode (rule 6:
-//    Executor::DecodeBatch refuses an executor with feature taps).
+//  * Snapshots (rule 5, phase 6e): SaveDrafter/RestoreDrafter carry the
+//    drafter ring with the target's snapshot. Restoring without an image
+//    restarts the ring empty at the restored position (a cold drafter: it
+//    drafts from the rows injected after that point), never from the rows
+//    the ring held before the restore.
+//  * Batched decode (rule 6): Executor::DecodeBatch refuses an executor with
+//    feature taps. A session serving a request that does not speculate (a
+//    sampled request, phase 6e) is Suspend()ed: its taps are cleared so it
+//    can join batched decode, and Resume() sets them again with a cold ring.
 
 #include <hip/hip_runtime.h>
 
@@ -65,10 +70,13 @@ public:
   /// own path) and injects their taps. With kAll `logits` gets [n][vocab],
   /// with kLast the last row. Refused up front, touching nothing, on a token
   /// outside the vocabulary or a context overflow. A target failure poisons
-  /// the executor and drops the drafter.
+  /// the executor and drops the drafter. `following` is how many prompt
+  /// tokens are known to come after these (a later Prefill): rows that no
+  /// block after them can read are not injected.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens,
                              LogitsRows rows, float* logits,
-                             std::string* error_msg = nullptr);
+                             std::string* error_msg = nullptr,
+                             std::uint32_t following = 0);
 
   /// Runs `tokens` (1 to 32 rows: a decode token, or a verify block
   /// [anchor, drafts...]) at position() on the vector path, logits [T][vocab]
@@ -94,8 +102,51 @@ public:
                              std::string* error_msg = nullptr);
 
   /// A fresh request: resets the target (Reset() when poisoned, else Clear())
-  /// and re-arms the drafter with an empty ring.
+  /// and re-arms the drafter with an empty ring (resuming a suspended one).
   [[nodiscard]] bool Reset(std::string* error_msg = nullptr);
+
+  /// Stops speculating for now (a request that samples): clears the
+  /// executor's feature taps, so DecodeBatch takes it, and parks the drafter.
+  /// Prefill, Verify and Commit then neither capture nor inject and Propose
+  /// is refused (nothing is dropped). No-op when already suspended.
+  void Suspend();
+  /// Undoes Suspend(): sets the taps again and restarts the ring empty at
+  /// position() (cold: the rows decoded while suspended were not captured).
+  /// A dropped drafter stays dropped. False, still suspended, when the taps
+  /// cannot be set.
+  [[nodiscard]] bool Resume(std::string* error_msg = nullptr);
+  [[nodiscard]] bool suspended() const noexcept { return suspended_; }
+  /// Captures and injects now: active, not suspended.
+  [[nodiscard]] bool capturing() const noexcept {
+    return active_ && !suspended_;
+  }
+
+  /// Copies the drafter ring to `image` when it is in step with the target
+  /// (capturing and committed at position()); false otherwise or on a copy
+  /// failure (which drops the drafter), leaving `image` untouched.
+  [[nodiscard]] bool SaveDrafter(DrafterImage* image,
+                                 std::string* error_msg = nullptr);
+  /// After the target was restored to a snapshot: replaces the ring with
+  /// `image` (which must have been taken at the target's position()), or,
+  /// with no image, restarts it empty at position() (cold). Resumes a
+  /// suspended drafter and re-arms a dropped one. A drafter that cannot take
+  /// the image is dropped (false); the target is never touched.
+  [[nodiscard]] bool RestoreDrafter(const DrafterImage* image,
+                                    std::string* error_msg = nullptr);
+  /// Bytes SaveDrafter copies.
+  [[nodiscard]] std::size_t drafter_image_bytes() const noexcept {
+    return drafter_->kv().device_bytes();
+  }
+
+  /// Grows the scratch a verify of `verify_rows` on the vector path and a
+  /// block of `block_rows` need (DFLASH 6d open item 2: the executor's own
+  /// warm-up runs the batched path only), then Reset()s. Call on a fresh
+  /// session.
+  [[nodiscard]] bool Warmup(std::uint32_t verify_rows, std::uint32_t block_rows,
+                            std::string* error_msg = nullptr);
+  /// Device bytes of the session's own buffers (capture buffer, flag) plus
+  /// the drafter's ring and scratch held now.
+  [[nodiscard]] std::size_t device_bytes() const noexcept;
 
   [[nodiscard]] std::uint32_t position() const noexcept {
     return target_.position();
@@ -129,9 +180,11 @@ private:
   Executor& target_;
   const DrafterWeights& w_;
   std::unique_ptr<DrafterSession> drafter_;
+  std::vector<std::uint32_t> taps_;
   float* capture_{nullptr};
   int* nonfinite_{nullptr};  ///< device flag: a non-finite tap was injected
   bool active_{true};
+  bool suspended_{false};
   bool poison_next_{false};
   std::string drafter_error_;
 };
