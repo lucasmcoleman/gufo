@@ -856,3 +856,24 @@ outside `--suite all`:
 nix develop -c python3 tests/functional/embedding_images.py \
   --base-url http://127.0.0.1:8080/v1 --output /tmp/image-embeddings.json
 ```
+
+## Laguna-S-2.1
+
+`laguna_suites.py` is Laguna's opt-in to the shared runner. It selects the
+`laguna` sampling preset and the suites whose assertions hold for it (core and
+RAM-snapshot cache groups; `--group tools` for the tool suites, whose output
+dialect is the JSON fallback), and starts a server on the real GGUF only when
+the file exists: otherwise it prints `SKIP` and exits 77. Run it inside a GPU
+window:
+
+```sh
+GPU_ADMISSION_LOCK=/server/state/gpu-admission/gpu.lock \
+  /server/ai/strix-halo-club/scripts/gpu-lock-exec -w 600 \
+  python3 tests/functional/laguna_suites.py --binary build/release/gufo \
+  --output /tmp/laguna-functional-1 --record-baseline
+```
+
+`family_smoke.py laguna` is the quick check: a three-turn chat with one tool
+call and cached-prefix reuse against `gufo serve llm`. `test_laguna_suites.py`
+checks the wiring and that smoke's logic against a scripted server, with no
+model.

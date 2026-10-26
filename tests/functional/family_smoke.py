@@ -9,8 +9,8 @@ host) can run it next to a downloaded gufo bundle:
 Each family runs gufo once and checks one property against a committed
 reference: EmbeddingGemma 2 vectors against sentence-transformers goldens,
 Qwen3-ASR against a reviewed transcript, Qwen3-TTS speech back through
-Qwen3-ASR, and a Qwen LLM on one greedy arithmetic answer through
-`gufo prompt`. The broader suites (embeddings.py, asr_service.py, ...) stay
+Qwen3-ASR, a Qwen LLM on one greedy arithmetic answer through
+`gufo prompt`, and Laguna-S-2.1 on a three-turn tool chat through `gufo serve`. The broader suites (embeddings.py, asr_service.py, ...) stay
 the quality gate.
 """
 
@@ -209,7 +209,80 @@ def check_llm(args):
     return "greedy 6 x 7 = 42"
 
 
-FAMILIES = {"embedding": check_embedding, "asr": check_asr, "tts": check_tts, "llm": check_llm}
+LAGUNA_TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_weather", "description": "Get the current weather for a location.",
+        "parameters": {"type": "object", "properties": {
+            "location": {"type": "string", "description": "City name"},
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}},
+            "required": ["location"]}}},
+    {"type": "function", "function": {
+        "name": "search_web", "description": "Search the web for a query.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
+                       "required": ["query"]}}},
+]
+
+
+def check_laguna(args):
+    """Laguna-S-2.1 through `gufo serve llm`: a three-turn chat with one tool call.
+
+    Turn 1 asks for the weather and must end in a get_weather call, turn 2
+    returns the tool result and must answer with it, turn 3 is a plain
+    follow-up. Turns 2 and 3 must reuse the cached conversation prefix.
+    Greedy decoding keeps the check repeatable; the model is loaded onto the
+    GPU, so run it inside a GPU window with --startup-timeout 1800 or more.
+    """
+    extra = ["--served-model-name", "laguna", "--sessions", "1", "--context", "8192"]
+    with server(args.binary, "llm", args.model, extra, args.log_dir / "laguna-server.log",
+                args.startup_timeout) as url:
+        def chat(messages, **fields):
+            return request(url + "/v1/chat/completions", {
+                "model": "laguna", "messages": messages, "temperature": 0,
+                "max_tokens": 1024, **fields}, timeout=1800)
+
+        def cached(response):
+            usage = response["usage"]
+            return usage.get("cached_tokens",
+                             usage.get("prompt_tokens_details", {}).get("cached_tokens", 0))
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant with access to tools. "
+             "When a tool is needed, call it; when it returns a result, answer the user "
+             "directly using that result."},
+            {"role": "user", "content": "What is the weather in Tokyo right now? Use celsius."}]
+        first = chat(messages, tools=LAGUNA_TOOLS)
+        reply = first["choices"][0]["message"]
+        print(f"  turn 1: finish={first['choices'][0]['finish_reason']} "
+              f"reasoning={len(reply.get('reasoning_content') or '')} chars "
+              f"calls={[c['function'] for c in reply.get('tool_calls') or []]}")
+        calls = reply.get("tool_calls") or []
+        assert len(calls) == 1 and calls[0]["function"]["name"] == "get_weather", \
+            f"turn 1 did not make exactly one get_weather call: {reply}"
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        assert "tokyo" in str(arguments.get("location", "")).lower(), arguments
+        messages += [reply, {"role": "tool", "tool_call_id": calls[0]["id"],
+                             "content": json.dumps({"temp_c": 18, "conditions": "cloudy"})}]
+        second = chat(messages, tools=LAGUNA_TOOLS)
+        answer = second["choices"][0]["message"]
+        print(f"  turn 2: cached={cached(second)} answer={answer.get('content')!r}")
+        assert not answer.get("tool_calls"), f"turn 2 called a tool again: {answer}"
+        assert "18" in (answer.get("content") or ""), f"turn 2 does not use the result: {answer}"
+        assert cached(second) > 0, "turn 2 reused no cached prefix"
+        messages += [{"role": "assistant", "content": answer["content"]},
+                     {"role": "user", "content": "Is that warm or cold? One short sentence."}]
+        third = chat(messages, tools=LAGUNA_TOOLS)
+        follow_up = third["choices"][0]["message"]
+        print(f"  turn 3: cached={cached(third)} answer={follow_up.get('content')!r}")
+        assert (follow_up.get("content") or "").strip() and not follow_up.get("tool_calls"), follow_up
+        assert cached(third) > 0, "turn 3 reused no cached prefix"
+        health = request(url + "/health", timeout=30)
+        print(f"  health: {health}")
+    return (f"3 turns, one get_weather call, cached {cached(second)} / {cached(third)} "
+            "prompt tokens on turns 2 / 3")
+
+
+FAMILIES = {"embedding": check_embedding, "asr": check_asr, "tts": check_tts, "llm": check_llm,
+            "laguna": check_laguna}
 
 
 def main():

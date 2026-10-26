@@ -65,6 +65,8 @@ llama.cpp-named taps diffed against `llama-eval-callback` dumps.
    snapshots, sessions and scratch together. Report passes, skips and
    failures separately. Decide perf changes by unprofiled, counterbalanced
    A/B on matched Release binaries.
+   Status: implemented and verified without the real model; the real-model
+   runs are pending a GPU window. See "Phase 5: serve path" below.
 6. DFlash drafter (`laguna-s-2.1-DFlash-Q4_K.gguf`, arch `dflash`), only after
    5, with its own feature-layer and mask verification.
 
@@ -73,3 +75,61 @@ Lessons source: codexms #965 review of #ai-dev-gufo 12015-16101,
 `/server/programming/llama.cpp-laguna/BUILD-LAGUNA-REF.txt`.
 
 Each phase lands as its own commit on `feat/laguna-s21`.
+
+## Phase 5: serve path
+
+`gufo serve llm --model <laguna.gguf>` reaches Laguna through
+`general.architecture == "laguna"` in `InferenceBackend::load` (the same place
+DeepSeek and Flash-Next are dispatched), with the pieces below.
+
+| Piece | Where |
+| --- | --- |
+| `Model` (weights resident, tokenizer, pinned template, memory preflight) and `Session` (one executor: own stream, KV, scratch) | `src/models/laguna/engine.{hpp,cpp}` |
+| Runner, state and snapshot adapters for the shared scheduler and snapshot pool | `LagunaTextRunner` in `src/cli/serve/inference_backend.cpp`, beside the DeepSeek one |
+| Chat template, compiled and pinned to the GGUF's template hash | `src/models/laguna/chat_template.{hpp,cpp}` |
+| Sampling preset `kLaguna` (temperature 1.0, top_k 20, top_p 1.0, min_p 0) | `src/core/text_sampling_defaults.hpp` |
+| KV export and import (retained history of a full layer or ring) | `KvCache::Export/Import`, `Executor::SaveSnapshot/RestoreSnapshot` |
+| `gufo bench` rows | `RunLagunaBenchmark` in `src/cli/bench/bench.cpp` |
+
+Decisions and limits:
+
+- **Template.** Poolside's `chat_template.jinja` is byte-identical to the GGUF's
+  (SHA-256 `444819b8...99ff`). The renderer follows it exactly, including the
+  default system message, thinking on by default (`<think>` after
+  `<assistant>`; off gives `</think>`), `preserve_thinking`, tool definitions
+  serialized like `json.dumps(ensure_ascii=False)` and historical tool calls as
+  `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`.
+  Goldens: 25 conversations rendered by Jinja (transformers' `tojson` and
+  `generation` tag emulated; transformers is not installed on the host) and
+  tokenized by llama.cpp's `llama-tokenize` (no HF `tokenizer.json` is
+  available locally). The prompt carries BOS itself (`〈|EOS|〉`, id 2), so none
+  is added; raw completions get BOS, as llama.cpp does for this GGUF.
+- **Stop tokens** are EOS 2 and EOT 24 (`</assistant>`).
+- **Tool calls.** History renders natively. Output uses the repository's JSON
+  fallback dialect (`<tool_call>{"name":..,"arguments":..}</tool_call>`, grammar
+  constrained), not Laguna's native `<arg_key>` form: the native dialect would
+  need its own parser and grammar in `openai_chat.cpp` and `json_constraint.cpp`.
+- **Control text in content.** Like llama.cpp and the Hugging Face tokenizer, a
+  client message containing `</assistant>` or `<think>` tokenizes to that token.
+- **Snapshots.** RAM snapshots of the full-layer KV up to the position and each
+  ring's retained history (`committed`, `retained_begin`, `valid`), plus the
+  frontier logits. There is no serialized format, so `--cache-disk` is refused.
+- **Failure.** A device error after work was enqueued marks the session invalid
+  and rebuilds its executor at once; cancellation and ordinary invalidation
+  keep the KV memory and start over at position 0.
+- **Memory.** `Model::Load` checks weights plus `--sessions` sessions (KV at
+  `--context`, scratch, logits, qfn_mmq arena) against the free device memory
+  before uploading, and the scheduler's resource claim repeats it. Per session at
+  chunk 512: 1.2 GiB at 8192 tokens, 2.3 GiB at 32768, 12.8 GiB at 262144
+  (`laguna_logits --budget-only --context N --ubatch 512` prints the table);
+  weights are 68.64 GiB. The default `--context` is the model's 262144, so pass
+  `--context` (and keep `--sessions` small) unless that is what you want:
+  weights plus the sessions must stay below the free device memory minus the
+  4 GiB driver reserve, or the load fails with the budget in its message.
+- **Not supported:** images, speculative decoding (phase 6), disk caches,
+  `gufo prompt` and `gufo chat` (refused with a message).
+
+Tests: `ctest -R '^laguna\.'` (chat template goldens, token goldens, engine,
+serving, bench, functional wiring). `laguna.functional` runs the shared
+functional suites on the real model and skips unless the GGUF exists and
+`GUFO_LAGUNA_FUNCTIONAL=1`.
