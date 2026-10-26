@@ -59,9 +59,10 @@ def response_result(client, request, streaming):
                 finish="tool_calls" if calls else "stop", usage=response.usage.to_dict())
 
 
-def check_reasoning_separator(client, model, checks, chat_result, server_log=None):
+def check_reasoning_separator(client, model, checks, chat_result, server_log=None,
+                              sampling_preset=None):
     """Reasoning framing is not visible text, with or without constraints (#439)."""
-    from cache_growth import check_unchanged_retry, log_offset
+    from cache_growth import check_unchanged_retry, log_offset, reasoning_mode_matches
     function = {"name": "unused", "description": "Not needed for arithmetic.",
                 "parameters": {"type": "object", "properties": {},
                                "additionalProperties": False}}
@@ -104,7 +105,10 @@ def check_reasoning_separator(client, model, checks, chat_result, server_log=Non
                 name = f"reasoning_separator_{endpoint}_{mode}_{streaming}"
                 replay_end = log_offset(server_log)
                 result = save(name, run(client, request, streaming))
-                assert result["reasoning"] and not result["tools"], result
+                # An adaptive model may close reasoning at once; the
+                # `</think>` before the answer is still framing, not text.
+                assert reasoning_mode_matches(result["reasoning"], True, sampling_preset) \
+                    and not result["tools"], result
                 assert result["finish"] == "stop", result
                 # Do not strip: that hid the original regression from other suites.
                 assert result["text"] and not result["text"].startswith(("\r", "\n")), result

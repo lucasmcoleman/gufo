@@ -8,6 +8,26 @@ import sys
 # `<|im_start|>assistant\n<think>\n`, is a few tokens long.
 ASSISTANT_OPENING_TOKENS = 16
 
+# Sampling presets of families that think adaptively. Laguna-S-2.1's prompt
+# opens reasoning (`<assistant><think>`) whenever thinking is on, and the
+# model itself closes it at once (`</think>`) on prompts it judges simple.
+# llama.cpp d854d98 on the same GGUF does exactly that, greedy, for "What is
+# two plus two?", the reasoning-separator and reasoning-budget prompts and the
+# cache-growth BETA turn, with identical prompt token counts, and still
+# reasons on "Compute 123 times 456." (job 961 triage,
+# /server/staging/laguna/p5-real/triage/probe-llama.json). For these
+# families an enabled-thinking reply may have an empty reasoning channel.
+# Everything else stays strict: thinking off must leave reasoning empty, the
+# framing must not reach the text, and answers and replays are unchanged.
+ADAPTIVE_THINKING_PRESETS = frozenset({"laguna"})
+
+
+def reasoning_mode_matches(reasoning, thinking, sampling_preset=None):
+    """Whether a reply's reasoning channel fits the requested thinking mode."""
+    if bool(reasoning) == thinking:
+        return True
+    return thinking and sampling_preset in ADAPTIVE_THINKING_PRESETS
+
 
 def log_offset(server_log):
     return server_log.stat().st_size if server_log else 0
@@ -47,7 +67,8 @@ def check_unchanged_retry(label, retry, prefilled, server_log, start, end, *,
           f"prefilled {prefilled} of {total} tokens", file=sys.stderr, flush=True)
 
 
-def check_cache_growth(client, model, checks, chat_result, server_log=None):
+def check_cache_growth(client, model, checks, chat_result, server_log=None,
+                       sampling_preset=None):
     failures = []
     for replay in ("drop_reasoning", "keep_reasoning", "discard_reasoning", "thinking_off"):
         label = "cache_growth_" + replay
@@ -100,7 +121,8 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
             total, reused, prefilled = work(result)
             assert result["text"].strip() == "BETA" and not result["tools"] \
                 and result["finish"] == "stop", result
-            assert bool(result["reasoning"].strip()) == thinking, result
+            assert reasoning_mode_matches(
+                result["reasoning"].strip(), thinking, sampling_preset), result
             if turn == 0:
                 assert total >= 2048 and reused == 0 and prefilled == total, result
             else:

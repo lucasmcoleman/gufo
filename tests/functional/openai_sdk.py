@@ -44,7 +44,8 @@ from cache_compaction import check_cache_compaction
 from cache_workloads import check_cache_transforms, check_cache_pressure
 from cache_messages_loop import check_cache_messages_loop
 from system_injection import check_system_injection
-from cache_growth import check_cache_growth, check_unchanged_retry, log_offset
+from cache_growth import (check_cache_growth, check_unchanged_retry, log_offset,
+                          reasoning_mode_matches)
 from messages_tools import check_messages_tools
 from reasoning_budget import check_reasoning_budget
 from messages_count_tokens import check_messages_count_tokens, check_messages_image_counts
@@ -331,7 +332,7 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
         }
         default = chat_result(client, request)
         explicit = chat_result(client, {**request, "reasoning_effort": effort}, True)
-        assert bool(default["reasoning"]) == thinking, default
+        assert reasoning_mode_matches(default["reasoning"], thinking, preset), default
         assert signature(default) == signature(explicit), (default, explicit)
         record("default_thinking_effort", default)
         if preset == "deepseek4" and thinking:
@@ -991,7 +992,8 @@ def check_conversations(client, model, checks, vision=False, server_log=None):
         assert warm["usage"]["cached_tokens"] > 0, warm
 
 
-def check_long_context(client, model, checks, context, vision=False, server_log=None):
+def check_long_context(client, model, checks, context, vision=False, server_log=None,
+                       sampling_preset=None):
     """A bounded, multi-turn agent history; actual depth is retained in usage."""
     if context < 8192:
         raise ValueError("long-context requires a server context of at least 8192")
@@ -1081,19 +1083,25 @@ def check_long_context(client, model, checks, context, vision=False, server_log=
                     **extra, "chat_template_kwargs": {
                         "enable_thinking": True, "preserve_thinking": True}}}
     limited = chat("long_thinking_token_limit", thinking, True)
-    assert limited["finish"] == "length" and limited["reasoning"], limited
+    assert limited["finish"] == "length" and reasoning_mode_matches(
+        limited["reasoning"], True, sampling_preset), limited
+    # An adaptive model that closed reasoning streams its answer instead;
+    # cancel that stream at the same point.
+    adaptive = not limited["reasoning"]
     # Switching thinking changes the template's leading instructions; that
     # frontier may legitimately miss. Subsequent same-mode continuation must hit.
     count = 0
     with client.chat.completions.create(
             **{**thinking, "max_completion_tokens": 128}, stream=True) as stream:
         for chunk in stream:
-            count += sum(bool(getattr(c.delta, "reasoning_content", "")) for c in chunk.choices)
+            count += sum(bool(getattr(c.delta, "reasoning_content", "")
+                              or (adaptive and c.delta.content)) for c in chunk.choices)
             if count >= 3:
                 break
         else:
             raise AssertionError("long thinking stream never reached cancellation point")
-    checks["long_thinking_cancel"] = {"reasoning_deltas": count}
+    checks["long_thinking_cancel"] = {
+        ("content_deltas" if adaptive else "reasoning_deltas"): count}
     # Discard the interrupted assistant, as Pi does, then continue immediately.
     continued = {**thinking, "max_completion_tokens": 192,
                  "messages": [*messages, {"role": "user", "content":
@@ -2869,7 +2877,8 @@ def main():
             "tool-reasoning": lambda: check_tool_reasoning(
                 client, args.model, checks, chat_result, args.sampling_preset),
             "reasoning-separator": lambda: check_reasoning_separator(
-                client, args.model, checks, chat_result, args.server_log),
+                client, args.model, checks, chat_result, args.server_log,
+                args.sampling_preset),
             "tool-streaming": lambda: check_tool_streaming(client, args.model, checks, chat_result),
             "reasoning-budget": lambda: check_reasoning_budget(
                 client, args.model, checks, chat_result),
@@ -2906,7 +2915,8 @@ def main():
             "batch": lambda: check_batches(
                 client, args.model, checks, args.concurrency, args.vision, args.speculative),
             "long-context": lambda: check_long_context(
-                client, args.model, checks, args.context, args.vision, args.server_log),
+                client, args.model, checks, args.context, args.vision, args.server_log,
+                args.sampling_preset),
             "progress": lambda: check_prompt_progress(
                 client, args.model, checks, args.concurrency, args.vision,
                 args.allow_missing_progress, args.server_log),
@@ -2919,7 +2929,8 @@ def main():
             "cache-edits": lambda: check_cache_edits(
                 client, args.model, checks, chat_result, args.server_log),
             "cache-growth": lambda: check_cache_growth(
-                client, args.model, checks, chat_result, args.server_log),
+                client, args.model, checks, chat_result, args.server_log,
+                args.sampling_preset),
             "cache-depth": lambda: check_cache_depth(
                 client, args.model, checks, chat_result, args.concurrency, args.server_log),
             "cache-stalls": lambda: check_cache_stalls(

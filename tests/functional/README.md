@@ -863,8 +863,13 @@ nix develop -c python3 tests/functional/embedding_images.py \
 `laguna` sampling preset and the suites whose assertions hold for it (core and
 RAM-snapshot cache groups; `--group tools` for the tool suites, whose output
 dialect is the JSON fallback), and starts a server on the real GGUF only when
-the file exists: otherwise it prints `SKIP` and exits 77. Run it inside a GPU
-window:
+the file exists: otherwise it prints `SKIP` and exits 77. Each suite runs under
+the server configuration `impact.json` assigns it, as for the other families:
+`standard` (`--context 32768 --sessions 2`) and `single-session`
+(`--context 32768 --sessions 1`: `long-context`, `cache-depth`,
+`cache-rotation`), one server per configuration, each writing
+`OUTPUT/<configuration>/`. `--context`/`--sessions` override every group. Run it
+inside a GPU window:
 
 ```sh
 GPU_ADMISSION_LOCK=/server/state/gpu-admission/gpu.lock \
@@ -872,6 +877,15 @@ GPU_ADMISSION_LOCK=/server/state/gpu-admission/gpu.lock \
   python3 tests/functional/laguna_suites.py --binary build/release/gufo \
   --output /tmp/laguna-functional-1 --record-baseline
 ```
+
+Laguna thinks adaptively: with thinking on, its prompt opens `<think>` and the
+model may close it at once on a simple prompt, as llama.cpp does with the same
+GGUF. The `laguna` preset is in `ADAPTIVE_THINKING_PRESETS` (`cache_growth.py`),
+so `sampling-defaults`, `reasoning-separator`, `long-context` and `cache-growth`
+accept an empty reasoning channel when thinking is on; thinking off, framing,
+answers and replays stay strict. `batch` needs physical batching at the
+configured width, which the Laguna runner does not provide yet (serial plan
+only), so it fails visibly.
 
 `family_smoke.py laguna` is the quick check: a three-turn chat with one tool
 call and cached-prefix reuse against `gufo serve llm`. `test_laguna_suites.py`
