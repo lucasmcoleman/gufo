@@ -666,6 +666,30 @@ void DrafterKv::Release() noexcept {
   }
 }
 
+std::string DrafterKv::RejectContinue(std::uint32_t position) const {
+  if (!valid_) {
+    return "laguna dflash: kv invalidated by a failed call; Reset() it";
+  }
+  if (position < floor_ || position > committed_) {
+    return "laguna dflash: position outside [floor, committed]";
+  }
+  const std::uint32_t lo = position + 1 <= window_ ? 0 : position + 1 - window_;
+  if (std::max(lo, floor_) < retained_begin_) {
+    return "laguna dflash: context keys the block needs were overwritten";
+  }
+  return {};
+}
+
+bool DrafterKv::RewindTo(std::uint32_t position, std::string* error_msg) {
+  if (std::string why = RejectContinue(position); !why.empty()) {
+    Assign(error_msg, why);
+    return false;
+  }
+  retained_begin_ = std::min(retained_begin_, position);
+  committed_ = position;
+  return true;
+}
+
 std::optional<DrafterKv> DrafterKv::Create(const DrafterWeights& w,
                                            std::uint32_t max_rows,
                                            std::string* error_msg) {
@@ -1048,11 +1072,8 @@ bool DFlashOps::CheckAttention(const DrafterWeights& w, std::uint32_t layer,
     return false;
   }
   // The first context key row 0 reads must still be in its slot.
-  const std::uint32_t n = kv.committed_;
-  const std::uint32_t lo = n + 1 <= w.window ? 0 : n + 1 - w.window;
-  if (std::max(lo, kv.floor_) < kv.retained_begin_) {
-    Assign(error_msg,
-           "laguna dflash: context keys the block needs were overwritten");
+  if (std::string why = kv.RejectContinue(kv.committed_); !why.empty()) {
+    Assign(error_msg, why);
     return false;
   }
   return true;
@@ -1425,6 +1446,16 @@ bool DrafterSession::Inject(std::span<const float> features,
     return false;
   }
   return ops_.Inject(w_, kv_, features_, rows, start, path, error_msg);
+}
+
+bool DrafterSession::InjectDevice(const float* features, std::uint32_t rows,
+                                  std::uint32_t start, Path path,
+                                  std::string* error_msg) {
+  if (features == nullptr || rows == 0 || rows > max_inject_rows_) {
+    Assign(error_msg, "laguna dflash session: bad feature rows");
+    return false;
+  }
+  return ops_.Inject(w_, kv_, features, rows, start, path, error_msg);
 }
 
 bool DrafterSession::Propose(std::int32_t anchor, std::uint32_t block_rows,

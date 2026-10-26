@@ -83,6 +83,14 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(laguna.dflash_gpu_real PROPERTIES SKIP_RETURN_CODE 77
     TIMEOUT 3600)
 
+  # DFlash target side (phase 6d) on tiny random models: device-side tap
+  # capture, the per-call vector path's bit identity with solo decode,
+  # RewindTo at every depth 0..16 across 511/512/513 and ring wraps and its
+  # refusals, the drafter ring's rewind, and DFlashSession (captured taps into
+  # the drafter, commit, failure rules, batched-decode exclusion, two
+  # threads). Nothing is skipped.
+  add_laguna_test(dflash_target gufo_laguna "hip;gpu;gfx1151")
+
   # Full-model GPU executor (phase 4) on random tiny models: the oracle match,
   # chunk-split and decode bit-identity, reset, untapped reruns and the
   # allocation-failure paths. Nothing is skipped.

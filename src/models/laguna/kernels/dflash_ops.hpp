@@ -160,6 +160,18 @@ public:
   [[nodiscard]] std::uint32_t Slot(std::uint32_t p) const noexcept {
     return p % capacity_;
   }
+  /// Why a block (or a rewind) at `position` cannot read its context now (""
+  /// when it can): an invalid ring, a position outside [floor(), committed()],
+  /// or context keys max(position + 1 - window, floor()) .. position - 1 that
+  /// the ring has already overwritten. DFlashOps validates every block with
+  /// it, and RewindTo() every rewind.
+  [[nodiscard]] std::string RejectContinue(std::uint32_t position) const;
+  /// Gives up the injected rows from `position` on (trimming the rows of
+  /// rejected drafts, DFLASH rule 4): host bookkeeping only, the next
+  /// injection overwrites them. Refused, touching nothing, when
+  /// RejectContinue(position) refuses.
+  [[nodiscard]] bool RewindTo(std::uint32_t position,
+                              std::string* error_msg = nullptr);
   /// Bytes of one position's K (or V) row of one layer.
   [[nodiscard]] std::size_t row_bytes() const noexcept {
     return std::size_t{kv_heads_} * 128 * 2;
@@ -379,6 +391,12 @@ public:
   [[nodiscard]] bool Inject(std::span<const float> features,
                             std::uint32_t start, Path path = Path::kAuto,
                             std::string* error_msg = nullptr);
+  /// The same from device features ([rows][taps*hidden] F32, e.g. the target
+  /// executor's ForwardArgs::features), read in stream order on the session's
+  /// stream: nothing is copied or synchronized. Rows <= max_inject_rows.
+  [[nodiscard]] bool InjectDevice(const float* features, std::uint32_t rows,
+                                  std::uint32_t start, Path path = Path::kAuto,
+                                  std::string* error_msg = nullptr);
 
   /// Drafts block_rows - 1 tokens after `anchor` (the sampled token at
   /// position kv().committed(), not yet given to the target): the block
@@ -393,6 +411,10 @@ public:
 
   [[nodiscard]] DrafterKv& kv() noexcept { return kv_; }
   [[nodiscard]] DFlashOps& ops() noexcept { return ops_; }
+  [[nodiscard]] std::uint32_t max_inject_rows() const noexcept {
+    return max_inject_rows_;
+  }
+  [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
 
 private:
   DrafterSession(const DrafterWeights& w, const DeviceMatrix& head,
