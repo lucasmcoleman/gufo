@@ -26,6 +26,7 @@
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/glm53_flash/executor.hpp"
+#include "src/models/glm53_flash/kernels/blas.hpp"
 #include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/layer_ops.hpp"
 #include "src/models/glm53_flash/profile.hpp"
@@ -134,10 +135,16 @@ constexpr unsigned kHeadsTokenTile = 32;  ///< tokens per block in z
 /// activation loads are coalesced. The reduction order differs from gufo's
 /// Q6_K GEMMs (sequential per lane, then a wave tree); results agree to
 /// F32 rounding.
-template<unsigned kBlocks>
+///
+/// With Out = __half (GUFO_GLM53_MLA_F16_QABS, the dense prefill attention's
+/// absorbed q) it stores fp16(acc * out_scale): the same value ToHalfKernel
+/// makes from the F32 output, without the F32 round trip. Idea ported from
+/// mikealanni/gufo 5b505adf (F16 absorbed-q GEMM output; MIT, Mike Alani).
+template<unsigned kBlocks, typename Out = float>
 __global__ void MatmulQ6KHeadsKernel(const std::uint8_t* w, const float* x,
-                                     float* y, std::uint32_t rows,
-                                     std::uint32_t tokens) {
+                                     Out* y, std::uint32_t rows,
+                                     std::uint32_t tokens,
+                                     float out_scale = 1.0F) {
   constexpr std::uint32_t kCols = kBlocks * kQ6KBlockElems;
   const std::uint32_t lane = threadIdx.x % kWave;
   const std::uint32_t r =
@@ -185,8 +192,139 @@ __global__ void MatmulQ6KHeadsKernel(const std::uint8_t* w, const float* x,
     }
     acc = WaveSum(acc);
     if (lane == 0) {
-      y[(((head * tokens) + t) * rows) + r] = acc;
+      if constexpr (std::is_same_v<Out, __half>) {
+        y[(((head * tokens) + t) * rows) + r] = __float2half(acc * out_scale);
+      } else {
+        y[(((head * tokens) + t) * rows) + r] = acc;
+      }
     }
+  }
+}
+
+/// MatmulQ6KHeadsKernel with kRows weight rows per wave (GUFO_GLM53_MLA_
+/// HEADS_ROWS=4): each activation row a wave loads serves kRows outputs
+/// instead of one, cutting the activation traffic per output by kRows. Each
+/// output's arithmetic (dequantised weights, per-lane products in (b, i)
+/// order, WaveSum) is MatmulQ6KHeadsKernel's, so the results are expected to
+/// match it bit for bit (mla_heads_rows_test checks). Idea from the head GEMM
+/// batching of mikealanni/gufo 2a9e953c (MIT, Mike Alani), kept in Q6_K.
+template<unsigned kBlocks, unsigned kRows, typename Out>
+__global__ void MatmulQ6KHeadsRowsKernel(const std::uint8_t* w, const float* x,
+                                         Out* y, std::uint32_t rows,
+                                         std::uint32_t tokens,
+                                         float out_scale) {
+  constexpr std::uint32_t kCols = kBlocks * kQ6KBlockElems;
+  const std::uint32_t lane = threadIdx.x % kWave;
+  const std::uint32_t r_base =
+      ((blockIdx.x * (blockDim.x / kWave)) + (threadIdx.x / kWave)) * kRows;
+  const std::size_t head = blockIdx.y;
+  if (r_base >= rows) {
+    return;
+  }
+  float wv[kRows][kBlocks * 8];
+#pragma unroll
+  for (unsigned rr = 0; rr < kRows; ++rr) {
+    const std::uint32_t r = min(r_base + rr, rows - 1);
+    const std::uint8_t* row =
+        w + (((head * rows) + r) * (std::size_t{kBlocks} * kQ6KBlockBytes));
+#pragma unroll
+    for (unsigned b = 0; b < kBlocks; ++b) {
+      const std::uint8_t* blk = row + (b * kQ6KBlockBytes);
+      const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
+      const float d = __half2float(*reinterpret_cast<const __half*>(blk + 208));
+#pragma unroll
+      for (unsigned hh = 0; hh < 2; ++hh) {
+        const std::uint8_t qh = blk[128 + (hh * 32) + lane];
+#pragma unroll
+        for (unsigned qd = 0; qd < 4; ++qd) {
+          const std::uint8_t ql = blk[(hh * 64) + ((qd & 1) * 32) + lane];
+          const int q = ((qd >> 1) != 0 ? (ql >> 4) : (ql & 0xF)) |
+                        (((qh >> (2 * qd)) & 3) << 4);
+          const int s = sc[(hh * 8) + (qd * 2) + (lane / 16)];
+          wv[rr][(b * 8) + (hh * 4) + qd] =
+              d * static_cast<float>(s) * static_cast<float>(q - 32);
+        }
+      }
+    }
+  }
+  const std::uint32_t t0 = blockIdx.z * kHeadsTokenTile;
+  const std::uint32_t t1 = min(t0 + kHeadsTokenTile, tokens);
+  for (std::uint32_t t = t0; t < t1; ++t) {
+    const float* xt = x + (((head * tokens) + t) * kCols);
+    float xv[kBlocks * 8];
+#pragma unroll
+    for (unsigned b = 0; b < kBlocks; ++b) {
+#pragma unroll
+      for (unsigned i = 0; i < 8; ++i) {
+        xv[(b * 8) + i] =
+            xt[(b * kQ6KBlockElems) + ((i >> 2) * 128) + ((i & 3) * 32) + lane];
+      }
+    }
+#pragma unroll
+    for (unsigned rr = 0; rr < kRows; ++rr) {
+      float acc = 0.0F;
+#pragma unroll
+      for (unsigned j = 0; j < kBlocks * 8; ++j) {
+        acc += wv[rr][j] * xv[j];
+      }
+      acc = WaveSum(acc);
+      const std::uint32_t r = r_base + rr;
+      if (lane == 0 && r < rows) {
+        if constexpr (std::is_same_v<Out, __half>) {
+          y[(((head * tokens) + t) * rows) + r] = __float2half(acc * out_scale);
+        } else {
+          y[(((head * tokens) + t) * rows) + r] = acc;
+        }
+      }
+    }
+  }
+}
+
+/// Rows per wave of MatmulQ6KHeadsRowsKernel (GUFO_GLM53_MLA_HEADS_ROWS: 4,
+/// or 2), 1 (the original kernel) by default.
+unsigned HeadsRowsPerWave() {
+  static const unsigned rows = [] {
+    const char* v = std::getenv("GUFO_GLM53_MLA_HEADS_ROWS");
+    const int n = v != nullptr ? std::atoi(v) : 1;
+    return n == 4 ? 4U : n == 2 ? 2U : 1U;
+  }();
+  return rows;
+}
+
+/// Launches the Q6_K head kernel for 1- or 2-block rows, the multi-row
+/// variant when HeadsRowsPerWave() > 1.
+template<typename Out>
+void LaunchQ6KHeads(const std::uint8_t* w, std::uint64_t cols, const float* x,
+                    Out* y, std::uint32_t rows, std::uint32_t heads,
+                    std::uint32_t tokens, float out_scale, Stream stream,
+                    unsigned per_wave = HeadsRowsPerWave()) {
+  constexpr unsigned kWaves = kThreads / kWave;
+  const unsigned tiles = (tokens + kHeadsTokenTile - 1) / kHeadsTokenTile;
+  const unsigned per_block = kWaves * per_wave;
+  const dim3 grid((rows + per_block - 1) / per_block, heads, tiles);
+  const bool one = cols == kQ6KBlockElems;
+  if (per_wave == 4) {
+    if (one) {
+      MatmulQ6KHeadsRowsKernel<1, 4, Out>
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, tokens, out_scale);
+    } else {
+      MatmulQ6KHeadsRowsKernel<2, 4, Out>
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, tokens, out_scale);
+    }
+  } else if (per_wave == 2) {
+    if (one) {
+      MatmulQ6KHeadsRowsKernel<1, 2, Out>
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, tokens, out_scale);
+    } else {
+      MatmulQ6KHeadsRowsKernel<2, 2, Out>
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, tokens, out_scale);
+    }
+  } else if (one) {
+    MatmulQ6KHeadsKernel<1, Out>
+        <<<grid, kThreads, 0, stream>>>(w, x, y, rows, tokens, out_scale);
+  } else {
+    MatmulQ6KHeadsKernel<2, Out>
+        <<<grid, kThreads, 0, stream>>>(w, x, y, rows, tokens, out_scale);
   }
 }
 
@@ -530,43 +668,24 @@ __global__ void ToHalfKernel(const float* x, __half* y, std::size_t count,
   }
 }
 
-/// One hipBLAS handle per stream: hipblasSetStream changes handle state, so
-/// a shared handle would race between streams. Null if creation fails.
+/// The stream's hipBLAS handle (kernels/blas.hpp).
 hipblasHandle_t Blas(hipStream_t stream) {
-  static std::mutex mutex;
-  static std::map<hipStream_t, hipblasHandle_t> handles;
-  const std::lock_guard<std::mutex> lock(mutex);
-  auto it = handles.find(stream);
-  if (it == handles.end()) {
-    hipblasHandle_t h = nullptr;
-    if (hipblasCreate(&h) != HIPBLAS_STATUS_SUCCESS ||
-        hipblasSetStream(h, stream) != HIPBLAS_STATUS_SUCCESS)
-      return nullptr;
-    it = handles.emplace(stream, h).first;
-  }
-  return it->second;
+  return BlasHandle(stream);
 }
 
-/// Prefill latent attention as two fp16 GEMMs with F32 accumulation, when
-/// every token attends to all of its causal rows, which holds while the
-/// indexer keeps every pool (SelectKernel: pools <= budget selects
-/// 0..pools-1, plus the raw tail):
-///   S = (scale Q) L^T   (Q = qabs [heads * n][L], L = latent rows 0..R-1)
-///   P = causal softmax of S (CausalSoftmaxKernel, fp16 out)
-///   ctx = P L           ([heads][n][L], as LatentAttentionKernel writes it)
-/// All heads share the latent rows, so the GEMMs read them as one dense
-/// matrix instead of once per (token, 4 heads) like LatentAttentionKernel.
-/// The scale is folded into Q before the fp16 cast to keep it in range; Q,
-/// latent and P are rounded to fp16, products accumulate in F32. False
-/// (nothing written) if the BLAS handle or scratch is unavailable.
-bool DenseLatentAttention(const float* qabs, const float* latent, float* ctx,
-                          std::uint32_t heads, std::uint32_t n,
-                          std::uint32_t pos0, std::uint32_t L, float scale,
-                          Stream stream) {
-  const hipblasHandle_t h = Blas(stream);
-  if (h == nullptr) {
-    return false;
-  }
+/// Scratch of DenseLatentAttention for `heads` x `n` query rows over r =
+/// pos0 + n latent rows: F32 scores, fp16 P, fp16 Q and fp16 latent.
+struct DenseScratch {
+  float* scores{nullptr};
+  __half* p16{nullptr};
+  __half* q16{nullptr};
+  __half* l16{nullptr};
+};
+
+/// Lays out DenseScratch from the stream's grow-only buffer. False when the
+/// shape overflows or the buffer is unavailable.
+bool GetDenseScratch(std::uint32_t heads, std::uint32_t n, std::uint32_t pos0,
+                     std::uint32_t L, Stream stream, DenseScratch* out) {
   const std::uint32_t r = pos0 + n;
   const std::size_t m = std::size_t{heads} * n;
   if (m > 0x7fffffffU || r > 0x7fffffffU) {
@@ -582,38 +701,80 @@ bool DenseLatentAttention(const float* qabs, const float* latent, float* ctx,
   if (base == nullptr) {
     return false;
   }
-  auto* scores = reinterpret_cast<float*>(base);
-  auto* p16 = reinterpret_cast<__half*>(base + s_bytes);
-  auto* q16 = reinterpret_cast<__half*>(base + s_bytes + p_bytes);
-  auto* l16 = reinterpret_cast<__half*>(base + s_bytes + p_bytes + q_bytes);
+  out->scores = reinterpret_cast<float*>(base);
+  out->p16 = reinterpret_cast<__half*>(base + s_bytes);
+  out->q16 = reinterpret_cast<__half*>(base + s_bytes + p_bytes);
+  out->l16 = reinterpret_cast<__half*>(base + s_bytes + p_bytes + q_bytes);
+  return true;
+}
+
+/// Prefill latent attention as two fp16 GEMMs with F32 accumulation, when
+/// every token attends to all of its causal rows, which holds while the
+/// indexer keeps every pool (SelectKernel: pools <= budget selects
+/// 0..pools-1, plus the raw tail):
+///   S = (scale Q) L^T   (Q = qabs [heads * n][L], L = latent rows 0..R-1)
+///   P = causal softmax of S (CausalSoftmaxKernel, fp16 out)
+///   ctx = P L           ([heads][n][L], as LatentAttentionKernel writes it)
+/// All heads share the latent rows, so the GEMMs read them as one dense
+/// matrix instead of once per (token, 4 heads) like LatentAttentionKernel.
+/// The scale is folded into Q before the fp16 cast to keep it in range; Q,
+/// latent and P are rounded to fp16, products accumulate in F32. With
+/// `q_ready`, the scaled fp16 Q is already in the scratch's q16 (written by
+/// ProjectHeadsHalf) and `qabs` is not read. False (nothing written) if the
+/// BLAS handle or scratch is unavailable.
+bool DenseLatentAttention(const float* qabs, bool q_ready, const float* latent,
+                          float* ctx, std::uint32_t heads, std::uint32_t n,
+                          std::uint32_t pos0, std::uint32_t L, float scale,
+                          Stream stream) {
+  const hipblasHandle_t h = Blas(stream);
+  DenseScratch d;
+  if (h == nullptr || !GetDenseScratch(heads, n, pos0, L, stream, &d)) {
+    return false;
+  }
+  const std::uint32_t r = pos0 + n;
+  const std::size_t m = std::size_t{heads} * n;
   const auto grid = [](std::size_t count) {
     return static_cast<unsigned>(std::min<std::size_t>((count + 255) / 256, 65535));
   };
-  ToHalfKernel<<<grid(m * L), 256, 0, stream>>>(qabs, q16, m * L, scale);
+  if (!q_ready) {
+    ToHalfKernel<<<grid(m * L), 256, 0, stream>>>(qabs, d.q16, m * L, scale);
+  }
   ToHalfKernel<<<grid(std::size_t{r} * L), 256, 0, stream>>>(
-      latent, l16, std::size_t{r} * L, 1.0F);
+      latent, d.l16, std::size_t{r} * L, 1.0F);
   const float zero = 0.0F, one = 1.0F;
   const int mi = static_cast<int>(m), ri = static_cast<int>(r),
             li = static_cast<int>(L);
   // Row-major S[m][r] = Q[m][L] latent[r][L]^T is column-major
   // S^T (r x m) = latent (op T of the L x r column-major view) Q^T (L x m).
-  if (hipblasGemmEx(h, HIPBLAS_OP_T, HIPBLAS_OP_N, ri, mi, li, &one, l16,
-                    HIP_R_16F, li, q16, HIP_R_16F, li, &zero, scores, HIP_R_32F,
-                    ri, HIPBLAS_COMPUTE_32F,
+  if (hipblasGemmEx(h, HIPBLAS_OP_T, HIPBLAS_OP_N, ri, mi, li, &one, d.l16,
+                    HIP_R_16F, li, d.q16, HIP_R_16F, li, &zero, d.scores,
+                    HIP_R_32F, ri, HIPBLAS_COMPUTE_32F,
                     HIPBLAS_GEMM_DEFAULT) != HIPBLAS_STATUS_SUCCESS) {
     return false;
   }
   CausalSoftmaxKernel<<<static_cast<unsigned>(m), kThreads, 0, stream>>>(
-      scores, p16, n, r, pos0);
+      d.scores, d.p16, n, r, pos0);
   // Row-major ctx[m][L] = P[m][r] latent[r][L] is column-major
   // ctx^T (L x m) = latent^T (L x r) P^T (r x m).
-  if (hipblasGemmEx(h, HIPBLAS_OP_N, HIPBLAS_OP_N, li, mi, ri, &one, l16,
-                    HIP_R_16F, li, p16, HIP_R_16F, ri, &zero, ctx, HIP_R_32F,
+  if (hipblasGemmEx(h, HIPBLAS_OP_N, HIPBLAS_OP_N, li, mi, ri, &one, d.l16,
+                    HIP_R_16F, li, d.p16, HIP_R_16F, ri, &zero, ctx, HIP_R_32F,
                     li, HIPBLAS_COMPUTE_32F,
                     HIPBLAS_GEMM_DEFAULT) != HIPBLAS_STATUS_SUCCESS) {
     return false;
   }
   return hipGetLastError() == hipSuccess;
+}
+
+/// GUFO_GLM53_MLA_F16_QABS=1: the dense prefill attention takes its scaled
+/// fp16 absorbed q straight from the k_b head GEMM (ProjectHeadsHalf)
+/// instead of an F32 qabs plus a ToHalfKernel pass. Bit-identical q16; off
+/// by default until a GPU A/B.
+bool F16Qabs() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_GLM53_MLA_F16_QABS");
+    return v != nullptr && *v != '\0' && *v != '0';
+  }();
+  return enabled;
 }
 
 std::uint32_t SelectionRows(const Config& c) {
@@ -786,14 +947,6 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   }
 
   // Absorb k_b per head, attend over the latent rows, v_b per head.
-  scope.emplace(ctx.profiler, "mla/k_b", stream);
-  SwapKernel<<<dim3(n, heads), 64, 0, stream>>>(s.q, s.qh, n, heads, nope);
-  ok = ProjectHeads(w.k_b, heads, s.qh, s.qabs, n, stream);
-  scope.reset();
-  if (!ok) {
-    return false;
-  }
-  scope.emplace(ctx.profiler, "mla/attention", stream);
   const int g = AttentionGroup(c);
   const std::uint32_t smax = SelectionRows(c);
   const float scale = 1.0F / std::sqrt(static_cast<float>(nope));
@@ -808,12 +961,33 @@ bool Pass(const OpContext& ctx, const Config& c, std::uint32_t layer,
   }();
   const bool dense = dense_enabled && n > 8 && !ExactPrefill() && kpool > 0 &&
                      (pos0 + n) / kpool <= budget;
+  scope.emplace(ctx.profiler, "mla/k_b", stream);
+  SwapKernel<<<dim3(n, heads), 64, 0, stream>>>(s.q, s.qh, n, heads, nope);
+  // The dense path's scaled fp16 q, straight from the head GEMM (F16Qabs).
+  DenseScratch dense_scratch;
+  bool q16_ready =
+      dense && F16Qabs() &&
+      GetDenseScratch(heads, n, pos0, L, stream, &dense_scratch) &&
+      ProjectHeadsHalf(w.k_b, heads, s.qh, dense_scratch.q16, n, scale, stream);
+  ok = q16_ready || ProjectHeads(w.k_b, heads, s.qh, s.qabs, n, stream);
+  scope.reset();
+  if (!ok) {
+    return false;
+  }
+  scope.emplace(ctx.profiler, "mla/attention", stream);
   // Decode: split the rows across blocks once there are enough of them.
   const std::uint32_t splits = std::min(
       SplitCount(c), (pos0 + n + kSplitRows - 1) / kSplitRows);
   const bool split = !ExactPrefill() && n <= kSplitMaxTokens && splits > 1;
-  if (dense && DenseLatentAttention(s.qabs, cache.latent, s.ctx, heads, n,
-                                    pos0, L, scale, stream)) {
+  const bool dense_done =
+      dense && DenseLatentAttention(s.qabs, q16_ready, cache.latent, s.ctx,
+                                    heads, n, pos0, L, scale, stream);
+  if (!dense_done && q16_ready &&
+      !ProjectHeads(w.k_b, heads, s.qh, s.qabs, n, stream)) {
+    // The fallbacks below read the F32 qabs the fp16 route skipped.
+    return false;
+  }
+  if (dense_done) {
   } else if (split) {
     const dim3 sgrid(n, heads / static_cast<std::uint32_t>(g), splits);
     const std::size_t slds = SplitLds(g, L);
@@ -924,22 +1098,12 @@ bool ProjectHeads(const DeviceMatrix& w, std::uint32_t heads, const float* x,
                                      tokens);
     return true;
   }
-  const unsigned tiles = (tokens + kHeadsTokenTile - 1) / kHeadsTokenTile;
-  if (w.type == GgmlType::kQ6_K && w.cols % kQ6KBlockElems == 0 &&
+  if (w.type == GgmlType::kQ6_K &&
+      (w.cols == kQ6KBlockElems || w.cols == 2 * kQ6KBlockElems) &&
       w.row_bytes == (w.cols / kQ6KBlockElems) * kQ6KBlockBytes) {
-    const auto* base = static_cast<const std::uint8_t*>(w.data);
-    if (w.cols == kQ6KBlockElems) {
-      MatmulQ6KHeadsKernel<1>
-          <<<dim3(row_blocks, heads, tiles), kThreads, 0, stream>>>(
-              base, x, y, rows, tokens);
-      return true;
-    }
-    if (w.cols == 2 * kQ6KBlockElems) {
-      MatmulQ6KHeadsKernel<2>
-          <<<dim3(row_blocks, heads, tiles), kThreads, 0, stream>>>(
-              base, x, y, rows, tokens);
-      return true;
-    }
+    LaunchQ6KHeads<float>(static_cast<const std::uint8_t*>(w.data), w.cols, x,
+                          y, rows, heads, tokens, 1.0F, stream);
+    return true;
   }
   // Other encodings: a GEMM per head.
   for (std::uint32_t h = 0; h < heads; ++h) {
@@ -949,6 +1113,44 @@ bool ProjectHeads(const DeviceMatrix& w, std::uint32_t heads, const float* x,
     }
   }
   return true;
+}
+
+bool ProjectHeadsQ6KRows(const DeviceMatrix& w, std::uint32_t heads,
+                         const float* x, float* y, std::uint32_t tokens,
+                         unsigned rows_per_wave, Stream stream) {
+  if (!CanProject(w) || w.experts != heads || x == nullptr || y == nullptr ||
+      w.type != GgmlType::kQ6_K ||
+      (w.cols != kQ6KBlockElems && w.cols != 2 * kQ6KBlockElems) ||
+      w.row_bytes != (w.cols / kQ6KBlockElems) * kQ6KBlockBytes ||
+      (rows_per_wave != 1 && rows_per_wave != 2 && rows_per_wave != 4)) {
+    return false;
+  }
+  if (tokens == 0 || heads == 0) {
+    return true;
+  }
+  LaunchQ6KHeads<float>(static_cast<const std::uint8_t*>(w.data), w.cols, x, y,
+                        static_cast<std::uint32_t>(w.rows), heads, tokens, 1.0F,
+                        stream, rows_per_wave);
+  return hipPeekAtLastError() == hipSuccess;
+}
+
+bool ProjectHeadsHalf(const DeviceMatrix& w, std::uint32_t heads,
+                      const float* x, void* y, std::uint32_t tokens,
+                      float scale, Stream stream) {
+  if (!CanProject(w) || w.experts != heads || x == nullptr || y == nullptr ||
+      w.type != GgmlType::kQ6_K ||
+      (w.cols != kQ6KBlockElems && w.cols != 2 * kQ6KBlockElems) ||
+      w.row_bytes != (w.cols / kQ6KBlockElems) * kQ6KBlockBytes) {
+    return false;
+  }
+  if (tokens == 0 || heads == 0) {
+    return true;
+  }
+  LaunchQ6KHeads<__half>(static_cast<const std::uint8_t*>(w.data), w.cols, x,
+                         static_cast<__half*>(y),
+                         static_cast<std::uint32_t>(w.rows), heads, tokens,
+                         scale, stream);
+  return hipPeekAtLastError() == hipSuccess;
 }
 
 bool NormRows(const float* src, const float* weight, const float* bias,

@@ -89,6 +89,25 @@ struct IndexerBuffers {
                                 const float* x, float* y, std::uint32_t tokens,
                                 Stream stream);
 
+/// ProjectHeads for Q6_K stacks of one or two blocks per row with an
+/// explicit kernel choice: rows_per_wave 1 (the default kernel) or 2 / 4
+/// (GUFO_GLM53_MLA_HEADS_ROWS's multi-row kernel). For tests; production
+/// goes through ProjectHeads. False (nothing launched) on other shapes.
+[[nodiscard]] bool ProjectHeadsQ6KRows(const DeviceMatrix& w,
+                                       std::uint32_t heads, const float* x,
+                                       float* y, std::uint32_t tokens,
+                                       unsigned rows_per_wave, Stream stream);
+
+/// ProjectHeads for Q6_K stacks of one or two blocks per row only, storing
+/// fp16(acc * scale) into `y` (__half [heads][tokens][w.rows]): the value
+/// ProjectHeads followed by an fp16 cast of x * scale would give, bit for
+/// bit. False (nothing launched) for any other encoding or shape. Used by
+/// the dense prefill attention under GUFO_GLM53_MLA_F16_QABS.
+[[nodiscard]] bool ProjectHeadsHalf(const DeviceMatrix& w, std::uint32_t heads,
+                                    const float* x, void* y,
+                                    std::uint32_t tokens, float scale,
+                                    Stream stream);
+
 /// True if `w` (any expert) has a Project route.
 [[nodiscard]] bool CanProject(const DeviceMatrix& w) noexcept;
 

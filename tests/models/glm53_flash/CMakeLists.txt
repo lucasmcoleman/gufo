@@ -232,6 +232,19 @@ if (ENGINE_ENABLE_HIP)
     ENVIRONMENT "GUFO_GLM53_EXACT_PREFILL=1")
 endif()
 
+if (ENGINE_ENABLE_HIP)
+  # ProjectHeadsHalf (GUFO_GLM53_MLA_F16_QABS) is bitwise fp16(ProjectHeads *
+  # scale). The full operator with the switch on: mla_ops_f16_qabs.
+  add_glm53_flash_test(mla_f16_qabs gufo_glm53_flash "hip;gpu;gfx1151")
+  target_compile_definitions(glm53_flash_mla_f16_qabs_test PRIVATE
+    GLM53_ROCM_BUILD=1)
+  set_tests_properties(glm53_flash.mla_f16_qabs PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(NAME glm53_flash.mla_ops_f16_qabs COMMAND glm53_flash_mla_ops_test)
+  set_tests_properties(glm53_flash.mla_ops_f16_qabs PROPERTIES
+    LABELS "glm53_flash;hip;gpu;gfx1151"
+    ENVIRONMENT "GUFO_GLM53_MLA_F16_QABS=1")
+endif()
+
 # Short-reply latency probe (not a test): tools/glm53/short_reply_probe.cpp.
 if (ENGINE_ENABLE_HIP)
   add_executable(glm53_flash_short_reply_probe
