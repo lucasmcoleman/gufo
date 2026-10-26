@@ -46,3 +46,25 @@ matrices without fused epilogues or stream-K. The existing rectangular
 launch remains for other shapes. No environment switch was added.
 This differs from the earlier rejected grid-striding experiment: the new
 list removes empty expert/column combinations from the launch bound.
+
+## Ideas ported from mikealanni/gufo, 2026-10-26 (unmeasured)
+
+Source-only round (job 989): built, CPU-tested, not yet run on the GPU.
+Every switch is off by default; none changes the default path. The GPU
+round decides each one by an unprofiled A/B plus the quality gate.
+
+| Switch | What it does | Numerics |
+| --- | --- | --- |
+| `GUFO_GLM53_EXPERT_VEC=1` (`gateup`, `down`) | Few-token routed expert matvec (tokens <= 8): one lane per 256-weight block, gate and up in one launch over one activation quantization; IQ2_XXS, IQ2_S, IQ3_XXS (`kernels/expert_vec.*`) | mmvq's integer math, different F32 order; F32 activation scales |
+| `GUFO_GLM53_DECODE_GRAPH=1` | HIP graphs over runs of position-independent half-layers (KDA mixer, capture-safe FFN) for passes up to max_verify_tokens; MLA attention halves stay eager | bitwise vs eager |
+| `GUFO_GLM53_MLA_F16_QABS=1` | Dense prefill attention takes its scaled fp16 q from the k_b head kernel | bitwise |
+| `GUFO_GLM53_KDA_LOWRANK=1` | Prefill f_b / g_b (Q8_0, 128 columns) through an LDS-tiled kernel | F32, different order |
+| `GUFO_GLM53_MLA_HEADS_ROWS=4` (or 2) | k_b / v_b head kernel with 4 rows per wave | expected bitwise |
+| `GUFO_GLM53_ROUTER_GEMM=sgemm` | Prefill router logits as one hipBLAS SGEMM | plain F32: quality gate |
+| `GUFO_GLM53_PREFILL_CHUNK=N` | Overrides the prefill chunk (1..8192) for the chunk x MoE tile sweep; the head projects at most 256 rows at a time | chunk != 256 changes logits |
+
+Ideas are from Mike Alani's fork (MIT), commits c338778f, 5a394170,
+8808f1a0, 5b505adf, e5490fee, 3ec04be3, 2a9e953c, 3ba034e2, 92f05df6 and
+a9ea8e67; the code is GLM-local, not his patches. His attend-rescale skip
+(3ec04be3) has no counterpart here: our latent attention materialises the
+scores and normalises once, with no running-max accumulator to rescale.
