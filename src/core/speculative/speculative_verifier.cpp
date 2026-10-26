@@ -463,7 +463,10 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
     prepared.working_sampler.emplace(request.sampler);
   prepared.max_draft_tokens =
       request.max_emitted_tokens > 1 && draft_backend_ != nullptr &&
-              (!prepared.sampled || draft_backend_->SupportsSampledProposals())
+              (!prepared.sampled ||
+               draft_backend_->SupportsSampledProposals() ||
+               (options_.draft_deterministic_sampled &&
+                !prepared.random_sampling))
           ? std::min(current_draft_length_, request.max_emitted_tokens - 1)
           : 0;
   if (prepared.max_draft_tokens == 0) {

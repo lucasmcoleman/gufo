@@ -31,6 +31,13 @@ struct SpeculativeOptions {
   bool enable_adaptive_draft_length{true};
   bool use_batched_verification{false};
   bool retain_frontier_logits{false};
+  /// Draft greedy proposals for requests whose selection is deterministic but
+  /// not a plain argmax (a grammar constraint, penalties or a reasoning budget
+  /// at temperature 0) even when the backend has no sampled proposals. The
+  /// verifier already runs such requests' sampler through the draft prefix,
+  /// so their output is unchanged; the default keeps those requests on
+  /// target-only steps, as before.
+  bool draft_deterministic_sampled{false};
   DFlashDraftPolicy dflash_policy{DFlashDraftPolicy::kAdaptive};
 };
 
