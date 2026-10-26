@@ -43,6 +43,8 @@
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/laguna/engine.hpp"
+#include "src/models/laguna/kernels/dflash_session.hpp"
+#include "src/models/laguna/speculative.hpp"
 #include "src/models/qwen/continuation_adapter.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -2299,7 +2301,9 @@ public:
 
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
       const noexcept override {
-    return {.per_request_state_bytes = session_->KvBytes(),
+    const std::size_t drafter =
+        session_->dflash() != nullptr ? session_->dflash()->device_bytes() : 0;
+    return {.per_request_state_bytes = session_->KvBytes() + drafter,
             .temporary_scratch_bytes = std::nullopt};
   }
 
@@ -2346,11 +2350,24 @@ const LagunaTextRunnerState& RequireLagunaState(const TextRunnerState& state) {
 /// never need an extra pass. Tool calls use the model's native dialect on
 /// output, grammar-constrained (JsonConstraint::ToolFormat::kLaguna), the same
 /// bytes the template renders for calls in history.
+///
+/// With a DFlash drafter attached (--speculative dflash2 --dflash-model, phase
+/// 6e of DFLASH.md) decoding is multi-token: a deterministic request
+/// (temperature 0, or top_k 1; grammars, penalties and reasoning budgets
+/// included) takes greedy speculative steps that emit the frontier token and
+/// the accepted drafts; the session's state after a step is the one plain
+/// decode reaches after the same tokens, so snapshots, cancellation and
+/// prefix reuse need nothing extra. A request that samples at random decodes
+/// plainly (no lossless sampled verifier yet), its session suspended from
+/// speculation so it can share batched decode passes; speculating sessions
+/// decode alone (DFLASH rule 6).
 class LagunaTextRunner final : public HipTextModelRunner {
 public:
   LagunaTextRunner(std::shared_ptr<models::laguna::Model> model,
                    std::uint32_t max_context)
-      : model_(std::move(model)), max_context_(max_context) {}
+      : model_(std::move(model)),
+        max_context_(max_context),
+        speculative_(model_->has_drafter()) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -2367,8 +2384,10 @@ public:
                 // the executed frontier, as for DeepSeek.
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = false,
-                .batched_multi_token_decode = false,
+                .multi_token_decode = speculative_,
+                .batched_multi_token_decode = speculative_,
+                .batched_multi_token_decode_max_width =
+                    speculative_ ? kLagunaMaxBatchWidth : 0,
                 .prefix_reuse = true,
                 // Every prefill chunk is a complete forward pass.
                 .partial_prefill_retention = true,
@@ -2388,9 +2407,10 @@ public:
       capacity = free_bytes;
     }
     return {
-        .resident_weights_bytes = model_->device().resident_bytes(),
+        .resident_weights_bytes =
+            model_->device().resident_bytes() + model_->DrafterBytes(),
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes = budget.kv(),
+        .per_request_state_bytes = budget.kv() + model_->DrafterSessionBytes(),
         .temporary_scratch_bytes = budget.scratch(),
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
         .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
@@ -2587,7 +2607,13 @@ public:
     }
     const auto chunk = LagunaEngineTokens(prompt.subspan(offset, consumed));
     std::string error;
-    if (!session.Prefill(chunk, &error)) {
+    // The rest of the prompt follows in later calls: the drafter skips the
+    // rows no block after the prompt can read.
+    const std::size_t following = prompt.size() - offset - consumed;
+    if (!session.Prefill(
+            chunk, &error,
+            static_cast<std::uint32_t>(std::min<std::size_t>(
+                following, std::numeric_limits<std::uint32_t>::max())))) {
       throw std::runtime_error("Laguna prefill failed: " + error);
     }
     return {.consumed_tokens = consumed,
@@ -2615,6 +2641,104 @@ public:
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     return Select(RequireLagunaState(state), sampler);
+  }
+
+  /// A deterministic request on a speculating model takes a speculative step;
+  /// anything else is the plain select-and-advance step (suspending the
+  /// session's drafter: it does not speculate a sampled request).
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    if (!speculative_) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    auto& laguna = RequireLagunaState(state);
+    if (sampler.config().uses_random_sampling()) {
+      laguna.session().SuspendDrafter();
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    return SpeculativeStep(laguna, max_tokens, sampler);
+  }
+
+  /// Speculating requests verify alone, one after the other (DFLASH rule 6);
+  /// the others select their token and advance together in shared decode
+  /// passes (Session::EvaluateBatch).
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    if (!speculative_) {
+      return TextModelRunner::DecodeBatch(decodes);
+    }
+    std::vector<TextDecodeStep> steps(decodes.size());
+    std::vector<TextRunnerAdvance> advances;
+    std::vector<std::size_t> plain;
+    std::vector<std::exception_ptr> failures(decodes.size());
+    advances.reserve(decodes.size());
+    for (std::size_t i = 0; i < decodes.size(); ++i) {
+      const auto& decode = decodes[i];
+      try {
+        if (decode.max_tokens == 0) {
+          throw std::invalid_argument(
+              "text runner decode step budget must be at least one token");
+        }
+        auto& laguna = RequireLagunaState(decode.state.get());
+        if (!decode.sampler.get().config().uses_random_sampling()) {
+          continue;
+        }
+        laguna.session().SuspendDrafter();
+        auto selection = Select(laguna, decode.sampler.get());
+        if (selection.stop) {
+          steps[i].stop = true;
+          continue;
+        }
+        const TextRunnerToken token = selection.token;
+        steps[i].selections.push_back(std::move(selection));
+        advances.push_back({decode.state, token, &failures[i]});
+        plain.push_back(i);
+      } catch (...) {
+        steps[i] = {};
+        steps[i].failure = std::current_exception();
+      }
+    }
+    if (!advances.empty()) {
+      try {
+        AdvanceBatch(advances);
+      } catch (...) {
+        const auto failure = std::current_exception();
+        for (const std::size_t i : plain) {
+          if (!failures[i]) {
+            failures[i] = failure;
+          }
+        }
+      }
+      const TextExecutionPlan plan{
+          .kind = plain.size() > 1 ? TextExecutionPlanKind::kBatched
+                                   : TextExecutionPlanKind::kSerial,
+          .physical_width = plain.size() > 1 ? plain.size() : 1};
+      for (const std::size_t i : plain) {
+        if (failures[i]) {
+          steps[i] = {};
+          steps[i].failure = failures[i];
+        } else {
+          steps[i].execution_plan = plan;
+        }
+      }
+    }
+    for (std::size_t i = 0; i < decodes.size(); ++i) {
+      const auto& decode = decodes[i];
+      if (steps[i].failure || steps[i].stop || !steps[i].selections.empty() ||
+          decode.max_tokens == 0 ||
+          decode.sampler.get().config().uses_random_sampling()) {
+        continue;
+      }
+      try {
+        steps[i] = SpeculativeStep(RequireLagunaState(decode.state.get()),
+                                   decode.max_tokens, decode.sampler.get());
+      } catch (...) {
+        steps[i] = {};
+        steps[i].failure = std::current_exception();
+      }
+    }
+    return steps;
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(
@@ -2671,6 +2795,40 @@ private:
     return "user";
   }
 
+  [[nodiscard]] TextDecodeStep SpeculativeStep(
+      LagunaTextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const {
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "text runner decode step budget must be at least one token");
+    }
+    models::laguna::SpeculativeStepResult result;
+    std::string error;
+    if (!state.session().DecodeSpeculative(
+            sampler,
+            static_cast<std::uint32_t>(std::min<std::size_t>(
+                max_tokens, std::numeric_limits<std::uint32_t>::max())),
+            max_context_, state.stop_at_eos(), &result, &error)) {
+      throw std::runtime_error("Laguna speculative decode failed: " + error);
+    }
+    TextDecodeStep step;
+    step.stop = result.stop;
+    step.draft_rounds = result.drafted > 0 ? 1 : 0;
+    step.draft_tokens = result.drafted;
+    step.draft_accepted_tokens = result.accepted;
+    step.execution_plan = {.kind = TextExecutionPlanKind::kSerial,
+                           .physical_width = 1};
+    step.selections.reserve(result.tokens.size());
+    for (const std::int32_t token : result.tokens) {
+      step.selections.push_back({
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = model_->DecodeToken(token),
+      });
+    }
+    return step;
+  }
+
   [[nodiscard]] TextDecodeSelection Select(
       LagunaTextRunnerState& state, sampling::SamplerState& sampler) const {
     auto& session = state.session();
@@ -2691,7 +2849,42 @@ private:
 
   std::shared_ptr<models::laguna::Model> model_;
   std::uint32_t max_context_;
+  bool speculative_;
 };
+
+/// Loads the Laguna DFlash drafter named by --dflash-model onto `model`. The
+/// block is --draft-tokens + 1 rows when given, else the drafter's measured
+/// default (DrafterOptions: 4 rows). --draft-policy and --min-draft-tokens do
+/// not apply: the block is fixed.
+bool AttachLagunaDrafter(models::laguna::Model& model,
+                         const TextSpeculativeConfig& config,
+                         std::string* error) {
+  if (config.draft_model_path.empty()) {
+    *error = "Laguna DFlash speculative decoding requires --dflash-model";
+    return false;
+  }
+  std::string open_error;
+  std::shared_ptr<const core::GgufReader> reader =
+      core::GgufReader::OpenFile(config.draft_model_path, &open_error);
+  if (reader == nullptr) {
+    *error = "Failed to open the Laguna DFlash drafter: " + open_error;
+    return false;
+  }
+  models::laguna::DrafterOptions options;
+  if (config.max_draft_tokens_supplied) {
+    if (config.max_draft_tokens == 0 || config.max_draft_tokens > 15) {
+      *error = "Laguna DFlash takes --draft-tokens 1 to 15 (blocks of 2 to 16)";
+      return false;
+    }
+    options.block_rows = config.max_draft_tokens + 1;
+  }
+  std::string attach_error;
+  if (!model.AttachDrafter(std::move(reader), options, &attach_error)) {
+    *error = "Failed to load the Laguna DFlash drafter: " + attach_error;
+    return false;
+  }
+  return true;
+}
 
 /// Derives the content identity that keys persistent continuations for one
 /// GGUF artifact. Full digests are cached by the open file metadata.
@@ -3507,10 +3700,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       SetError(error, "Laguna does not support --mmproj");
       return false;
     }
-    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        speculative_config.backend != TextSpeculativeBackend::kDFlash) {
       SetError(error,
-               "Laguna does not support speculative decoding yet (its DFlash "
-               "drafter is a later phase)");
+               "Laguna supports only DFlash speculative decoding "
+               "(--speculative dflash2 --dflash-model <Laguna DFlash GGUF>)");
       return false;
     }
     if (DiskCacheEnabled(resolved_disk_cache_config)) {
@@ -3534,6 +3728,13 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     if (model == nullptr) {
       SetError(error, "Failed to create Laguna model: " + load_error);
       return false;
+    }
+    if (speculative_config.backend == TextSpeculativeBackend::kDFlash) {
+      std::string draft_error;
+      if (!AttachLagunaDrafter(*model, speculative_config, &draft_error)) {
+        SetError(error, draft_error);
+        return false;
+      }
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
@@ -3968,8 +4169,24 @@ bool InferenceBackend::load(std::shared_ptr<models::laguna::Model> model,
   }
   if (max_context == 0)
     max_context = model->MaxContext();
-  if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
-    SetError(error, "Laguna does not support speculative decoding yet");
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+      speculative_config.backend != TextSpeculativeBackend::kDFlash) {
+    SetError(error, "Laguna supports only DFlash speculative decoding");
+    return false;
+  }
+  if (speculative_config.backend == TextSpeculativeBackend::kDFlash &&
+      !model->has_drafter()) {
+    std::string draft_error;
+    if (!AttachLagunaDrafter(*model, speculative_config, &draft_error)) {
+      SetError(error, draft_error);
+      return false;
+    }
+  }
+  if (speculative_config.backend == TextSpeculativeBackend::kDisabled &&
+      model->has_drafter()) {
+    SetError(error,
+             "this Laguna model has a drafter attached; serve it with "
+             "--speculative dflash2");
     return false;
   }
   if (session_count == 0) {

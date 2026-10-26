@@ -41,6 +41,8 @@ struct PromptOptions {
   // is unrelated to the Qwen DFlash paths above.
   std::string dspark_model_path;
   std::uint32_t draft_tokens = 7;
+  /// --draft-tokens was given (Laguna's DFlash otherwise keeps its own block).
+  bool draft_tokens_supplied{false};
   std::uint32_t min_draft_tokens = 1;
 };
 

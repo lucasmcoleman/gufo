@@ -1258,8 +1258,9 @@ int RunServe(std::span<const char* const> args) {
                          "HTTP draft backend: dspark, dflash2, mtp, or off",
                          "Speculative", &speculative_backend);
     llm_parser.AddOption("", "--dflash-model", "PATH",
-                         "Path to Qwen DFlash2 GGUF file", "Speculative",
-                         &dflash_model_path);
+                         "Path to the DFlash GGUF (Qwen DFlash2, or the "
+                         "Laguna-S-2.1 DFlash drafter)",
+                         "Speculative", &dflash_model_path);
     llm_parser.AddOption(
         "", "--draft-policy", "POLICY",
         "DFlash2 block length: fixed or adaptive (default: adaptive)",
@@ -1457,6 +1458,8 @@ int RunServe(std::span<const char* const> args) {
             : dflash_model_path;
     speculative_config.max_draft_tokens =
         static_cast<std::uint32_t>(draft_tokens);
+    speculative_config.max_draft_tokens_supplied =
+        llm_parser.WasSupplied("--draft-tokens");
     speculative_config.min_draft_tokens =
         static_cast<std::uint32_t>(min_draft_tokens);
     if (model.empty()) {

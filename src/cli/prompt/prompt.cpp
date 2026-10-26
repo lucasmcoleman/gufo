@@ -28,6 +28,8 @@
 #include <hip/hip_runtime.h>
 
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/laguna/engine.hpp"
+#include "src/models/laguna/speculative.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -145,11 +147,13 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
   };
   parser.AddCustomOption(
       "", "--speculative", "MODE",
-      "Draft backend: dspark (DeepSeek V4 Flash), dflash2, mtp, or off",
+      "Draft backend: dspark (DeepSeek V4 Flash), dflash2 (Qwen DFlash2 or "
+      "Laguna-S-2.1 DFlash), mtp, or off",
       "Speculative", parse_speculative_backend);
   parser.AddOption("", "--dflash-model", "PATH",
-                   "Path to Qwen DFlash2 GGUF file", "Speculative",
-                   &opt.dflash_model_path);
+                   "Path to the DFlash GGUF (Qwen DFlash2, or the "
+                   "Laguna-S-2.1 DFlash drafter)",
+                   "Speculative", &opt.dflash_model_path);
   parser.AddOption(
       "", "--draft-policy", "POLICY",
       "DFlash2 block length: fixed or adaptive (default: adaptive)",
@@ -177,6 +181,7 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
           return false;
         }
         opt.draft_tokens = count;
+        opt.draft_tokens_supplied = true;
         return true;
       });
 
@@ -250,13 +255,17 @@ bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";
 }
 
-// Laguna-S-2.1 runs through `gufo serve` and `gufo bench`; the one-shot
-// prompt and chat commands have no Laguna path yet.
-bool RejectLaguna(const core::GgufReader& reader) {
-  if (reader.GetMetadataString("general.architecture") != "laguna")
+bool IsLaguna(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "laguna";
+}
+
+// Laguna-S-2.1 runs through `gufo serve`, `gufo bench` and `gufo prompt`;
+// the interactive chat command has no Laguna path yet.
+bool RejectLagunaChat(const core::GgufReader& reader) {
+  if (!IsLaguna(reader))
     return false;
-  std::cerr << "Laguna-S-2.1 is supported by `gufo serve` and `gufo bench`, "
-               "not by `gufo prompt` or `gufo chat`\n";
+  std::cerr << "Laguna-S-2.1 is supported by `gufo serve`, `gufo bench` and "
+               "`gufo prompt`, not by `gufo chat`\n";
   return true;
 }
 
@@ -526,6 +535,167 @@ int GenerateDeepSeekResponse(
   }
   return 0;
 }
+/// Context of a `gufo prompt` Laguna session (2.3 GiB of KV and rings).
+constexpr std::uint32_t kLagunaPromptContext = 32768;
+
+/// `gufo prompt` on Laguna-S-2.1: one session, chat template (or raw text with
+/// BOS), and with `--speculative dflash2 --dflash-model` the DFlash drafter
+/// (DFLASH.md phase 6e): deterministic requests decode in greedy speculative
+/// steps, which emit exactly what plain decode would; a request that samples
+/// at random decodes plainly.
+int RunLagunaPrompt(const PromptOptions& opt,
+                    const std::shared_ptr<const core::GgufReader>& reader,
+                    std::chrono::steady_clock::time_point load_start) {
+  namespace lg = models::laguna;
+  if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+    std::cerr << "Laguna-S-2.1 does not support image input\n";
+    return 2;
+  }
+  if (opt.force_cpu) {
+    std::cerr << "Laguna-S-2.1 is supported only by the ROCm backend\n";
+    return 2;
+  }
+  const bool speculative = opt.speculative_backend == "dflash2";
+  if (!opt.speculative_backend.empty() && !speculative) {
+    std::cerr << "Laguna-S-2.1 supports only --speculative dflash2 (its "
+                 "DFlash drafter)\n";
+    return 2;
+  }
+  if (speculative && opt.dflash_model_path.empty()) {
+    std::cerr << "--speculative dflash2 requires --dflash-model\n";
+    return 2;
+  }
+  if (speculative && opt.draft_tokens_supplied &&
+      (opt.draft_tokens == 0 || opt.draft_tokens > 15)) {
+    std::cerr << "Laguna DFlash takes --draft-tokens 1 to 15\n";
+    return 2;
+  }
+  std::string error;
+  const auto native = reader->GetMetadataUint32("laguna.context_length");
+  const std::uint32_t context = std::min<std::uint32_t>(
+      kLagunaPromptContext, native.value_or(kLagunaPromptContext));
+  auto model = lg::Model::Load(
+      reader, lg::ModelOptions{.max_context = context, .session_count = 1},
+      &error);
+  if (model == nullptr) {
+    std::cerr << "Error creating Laguna model: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  if (speculative) {
+    std::shared_ptr<const core::GgufReader> drafter =
+        core::GgufReader::OpenFile(opt.dflash_model_path, &error);
+    lg::DrafterOptions options;
+    if (opt.draft_tokens_supplied)
+      options.block_rows = opt.draft_tokens + 1;
+    if (drafter == nullptr || !model->AttachDrafter(drafter, options, &error)) {
+      std::cerr << "Error loading the Laguna DFlash drafter: " << error << '\n';
+      PrintModelLoadTime(load_start, false);
+      return 1;
+    }
+  }
+  PrintModelLoadTime(load_start);
+  auto session = model->CreateSession(&error);
+  if (session == nullptr) {
+    std::cerr << "Laguna session creation failed: " << error << '\n';
+    return 1;
+  }
+  std::vector<std::int32_t> prompt;
+  if (opt.use_chat_template) {
+    std::vector<lg::ChatMessage> messages;
+    if (!opt.system_prompt.empty())
+      messages.push_back({.role = "system", .content = opt.system_prompt});
+    messages.push_back({.role = "user", .content = opt.prompt_text});
+    prompt = model->EncodeChat(
+        messages, {},
+        lg::ResolveLagunaChatOptions(PromptReasoningOptions(opt)));
+  } else {
+    prompt = model->Tokenize(opt.prompt_text, /*add_bos=*/true);
+  }
+  if (prompt.empty() || prompt.size() + opt.max_tokens > context) {
+    std::cerr << "Laguna prompt and output exceed the " << context
+              << "-token CLI context\n";
+    return 1;
+  }
+  if (!session->Prefill(prompt, &error)) {
+    std::cerr << "Laguna prefill failed: " << error << '\n';
+    return 1;
+  }
+  if (opt.verbose) {
+    std::cout << "[Engine]: Laguna-S-2.1 ROCm (gfx1151)"
+              << (speculative ? ", DFlash speculative decoding" : "") << '\n'
+              << "Model: " << model->ModelName() << '\n'
+              << "Prompt tokens: " << prompt.size() << '\n'
+              << "Max tokens: " << opt.max_tokens << '\n'
+              << "--- Generation Output ---\n";
+  }
+  const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
+  sampling::SamplerState sampler(opt.sampling, history);
+  const bool speculate = speculative && !opt.sampling.uses_random_sampling();
+  if (speculative && !speculate)
+    session->SuspendDrafter();
+  const auto generation_start = std::chrono::steady_clock::now();
+  std::vector<tokenization::TokenId> generated_ids;
+  std::size_t generated = 0;
+  std::size_t steps = 0, drafted = 0, accepted = 0;
+  const auto emit = [&](std::int32_t token) {
+    std::cout << model->DecodeToken(token) << std::flush;
+    sampler.Accept(static_cast<sampling::TokenId>(token));
+    generated_ids.push_back(static_cast<tokenization::TokenId>(token));
+    ++generated;
+  };
+  while (generated < opt.max_tokens) {
+    if (speculate) {
+      lg::SpeculativeStepResult step;
+      if (!session->DecodeSpeculative(
+              sampler, static_cast<std::uint32_t>(opt.max_tokens - generated),
+              context, true, &step, &error)) {
+        std::cerr << "\nLaguna speculative decode failed: " << error << '\n';
+        return 1;
+      }
+      if (step.stop)
+        break;
+      ++steps;
+      drafted += step.drafted;
+      accepted += step.accepted;
+      for (const std::int32_t token : step.tokens)
+        emit(token);
+      continue;
+    }
+    if (session->Position() >= context)
+      break;
+    const auto token =
+        static_cast<std::int32_t>(sampler.Sample(session->Logits()));
+    if (model->IsStopToken(token))
+      break;
+    emit(token);
+    if (generated < opt.max_tokens && !session->Evaluate(token, &error)) {
+      std::cerr << "\nLaguna decode failed: " << error << '\n';
+      return 1;
+    }
+  }
+  std::cout << '\n';
+  if (speculate) {
+    std::cerr << "[Speculative]: block=" << session->decoder()->block_rows()
+              << " steps=" << steps << " drafted=" << drafted
+              << " accepted=" << accepted << " acceptance="
+              << (drafted ? static_cast<double>(accepted) / drafted : 0.0)
+              << " accepted_per_step="
+              << (steps ? static_cast<double>(accepted) / steps : 0.0) << '\n';
+  }
+  if (opt.verbose && generated > 0) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      generation_start)
+            .count();
+    std::cout << "Generated " << generated << " tokens on ROCm in " << seconds
+              << "s (" << static_cast<double>(generated) / seconds
+              << " tok/s)\n";
+    PrintTokenTrace(generated_ids);
+  }
+  return 0;
+}
+
 int RunDeepSeekPrompt(const PromptOptions& opt, const core::GgufReader& reader,
                       std::chrono::steady_clock::time_point load_start) {
   auto model = LoadDeepSeekModel(opt, reader, load_start);
@@ -1014,12 +1184,12 @@ int RunPrompt(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
-  if (RejectLaguna(*reader)) {
-    return 2;
-  }
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (IsLaguna(*reader)) {
+    return RunLagunaPrompt(opt, reader, model_load_start);
+  }
   if (IsDeepSeekV4Flash(*reader)) {
     if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
       std::cerr << "DeepSeek does not support image input\n";
@@ -1028,6 +1198,11 @@ int RunPrompt(std::span<const char* const> args) {
     return RunDeepSeekPrompt(opt, *reader, model_load_start);
   }
 #else
+  if (IsLaguna(*reader)) {
+    std::cerr << "Laguna-S-2.1 requires ENGINE_ENABLE_HIP=ON\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
   if (IsDeepSeekV4Flash(*reader)) {
     std::cerr << "DeepSeek V4 Flash requires ENGINE_ENABLE_HIP=ON\n";
     PrintModelLoadTime(model_load_start, false);
@@ -1240,7 +1415,7 @@ int RunChat(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
-  if (RejectLaguna(*reader)) {
+  if (RejectLagunaChat(*reader)) {
     return 2;
   }
   ResolvePromptSampling(*reader, &opt);

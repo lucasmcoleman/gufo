@@ -47,6 +47,9 @@ struct TextSpeculativeConfig {
   TextSpeculativeBackend backend{TextSpeculativeBackend::kDisabled};
   std::string draft_model_path;
   std::uint32_t max_draft_tokens{7};
+  /// --draft-tokens was given. Laguna's DFlash takes its own default block
+  /// (4 rows, 3 drafts) otherwise.
+  bool max_draft_tokens_supplied{false};
   std::uint32_t min_draft_tokens{1};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};

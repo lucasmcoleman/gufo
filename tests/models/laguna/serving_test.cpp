@@ -32,6 +32,7 @@
 
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/core/text_sampling_defaults.hpp"
+#include "tests/models/laguna/dflash_gpu.hpp"
 #include "tests/models/laguna/engine_fixture.hpp"
 
 using namespace gufo::testing::laguna;
@@ -528,9 +529,9 @@ void MultiSession(const EngineFixture&, srv::InferenceBackend& backend) {
 /// Concurrent requests share batched decode steps (kBatched plans) and still
 /// equal their solo results token for token, greedy and seeded, with a peer
 /// cancelled mid-decode and a device error inside a shared step.
-void BatchedDecode(const EngineFixture& f, srv::InferenceBackend& backend) {
+void BatchedDecode(const EngineFixture& f, srv::InferenceBackend& backend,
+                   const int kRequests = 3) {
   constexpr std::size_t kMax = 48;
-  constexpr int kRequests = 3;
   std::vector<srv::ChatRequest> requests;
   std::vector<smp::SamplingConfig> configs;
   std::vector<Result> expected;
@@ -586,7 +587,10 @@ void BatchedDecode(const EngineFixture& f, srv::InferenceBackend& backend) {
     });
     Require(cancelled.cancelled || cancelled.tokens == expected[1].tokens,
             "the cancelled peer ends");
-    for (const int i : {0, 2}) {
+    for (int i = 0; i < kRequests; ++i) {
+      if (i == 1) {
+        continue;
+      }
       Require(pending[i]->Wait().tokens == expected[i].tokens,
               "a peer of a request cancelled mid-decode is exact");
     }
@@ -629,10 +633,11 @@ void BatchedDecode(const EngineFixture& f, srv::InferenceBackend& backend) {
 
 // ---- context limit -------------------------------------------------------
 
-void ContextLimit(const EngineFixture& f) {
+void ContextLimit(const EngineFixture& f,
+                  const srv::TextSpeculativeConfig& speculative = {}) {
   std::string error;
   srv::InferenceBackend backend;
-  Require(backend.load(f.model, &error, 256, 2), error);
+  Require(backend.load(f.model, &error, 256, 2, {}, {}, speculative), error);
   const Result result = backend.chat(ChatOf("fill the context"), 500, kGreedy);
   Require(result.finish_reason ==
                   srv::TextGenerationBackend::FinishReason::kLength ||
@@ -749,6 +754,104 @@ void ToolPrompts(const EngineFixture& f, srv::InferenceBackend& backend) {
   std::cout << "tool prompts ok\n";
 }
 
+// ---- speculative decoding (DFLASH phase 6e) -----------------------------
+
+/// The same tiny model with a tiny DFlash drafter attached (the real head
+/// geometry at hidden 512, three taps, the target's vocabulary).
+struct SpeculativeFixture {
+  EngineFixture engine;
+  std::unique_ptr<TinyDrafter> drafter;
+};
+
+SpeculativeFixture MakeSpeculativeFixture() {
+  SpeculativeFixture f{
+      MakeEngineFixture({.max_context = 2048, .prefill_chunk = 16}), nullptr};
+  constexpr DrafterShape kShape{"serve", 512, 768, 18,  2,
+                                3,       512, 3,   640, 500000.0F};
+  f.drafter = std::make_unique<TinyDrafter>(kShape, 0x5E7E);
+  f.drafter->drafter.config.target_layers = {2, 4, 6};
+  std::string error;
+  Require(f.engine.model->AttachDrafterWeights(f.drafter->drafter, {}, &error),
+          "attach drafter: " + error);
+  return f;
+}
+
+/// A server whose model has a drafter: greedy requests take speculative
+/// steps (multi-token decode), sampled ones decode plainly and batch with
+/// each other. Everything the plain server guarantees must hold, and greedy
+/// output must equal the plain model's greedy decode.
+void SpeculativeServing() {
+  // The same weights (the fixture's seed) without a drafter: the reference.
+  const EngineFixture plain =
+      MakeEngineFixture({.max_context = 2048, .prefill_chunk = 16});
+  SpeculativeFixture sf = MakeSpeculativeFixture();
+  const EngineFixture& f = sf.engine;
+  srv::TextSpeculativeConfig speculative;
+  speculative.backend = srv::TextSpeculativeBackend::kDFlash;
+  std::string error;
+  {
+    srv::InferenceBackend refuse;
+    Require(!refuse.load(f.model, &error, 256, 1) &&
+                error.find("drafter") != std::string::npos,
+            "a drafter model served without --speculative is refused");
+  }
+  srv::InferenceBackend backend;
+  Require(backend.load(f.model, &error, 2048, 4, {}, {}, speculative),
+          "load: " + error);
+  {
+    // Greedy chat equals the plain model's greedy decode and drafts.
+    constexpr std::size_t kMax = 40;
+    for (const bool thinking : {true, false}) {
+      auto request = ChatOf("the then there is the end of the");
+      request.reasoning.enabled = thinking;
+      request.cache_prompt = false;
+      const Result result = backend.chat(request, kMax, kGreedy);
+      const auto prompt =
+          PromptOf(*plain.model, "the then there is the end of the", thinking);
+      // The server splits every prompt two tokens before its end.
+      Require(result.tokens ==
+                  DirectSplit(*plain.model, prompt, {prompt.size() - 2}, kMax),
+              "speculative chat equals plain greedy decode");
+      Require(result.draft_tokens > 0 && result.draft_rounds > 0,
+              "a greedy request did not speculate");
+    }
+    // The tool-call grammar (tool_choice required) through the drafts.
+    srv::ChatRequest tools = ChatOf("Weather in Oslo for three days?");
+    tools.tool_choice = srv::ChatRequest::ToolChoice::kRequired;
+    tools.cache_prompt = false;
+    tools.tools.push_back(
+        {"get_weather", "Get the weather.",
+         R"({"type":"object","properties":{"location":{"type":"string"},)"
+         R"("days":{"type":"integer"}},"required":["location","days"]})",
+         ""});
+    srv::InferenceBackend plain_backend;
+    Require(plain_backend.load(plain.model, &error, 2048, 1), error);
+    const Result want = plain_backend.chat(tools, kMax, kGreedy);
+    const Result got = backend.chat(tools, kMax, kGreedy);
+    Require(got.tokens == want.tokens && got.text == want.text,
+            "a constrained tool call differs from the plain server");
+    Require(got.draft_tokens > 0, "the constrained request did not draft");
+    // A sampled request does not speculate.
+    auto sampled = backend.sampling_defaults().Resolve(true);
+    sampled.seed = 5;
+    const Result s = backend.chat(ChatOf("the then there"), 16, sampled);
+    Require(s.draft_tokens == 0 &&
+                s.tokens ==
+                    plain_backend.chat(ChatOf("the then there"), 16, sampled)
+                        .tokens,
+            "a sampled request speculated or differs from the plain server");
+  }
+  ChatAndCompletion(f, backend);
+  Snapshots(f, backend);
+  Cancellation(f, backend);
+  MultiSession(f, backend);
+  BatchedDecode(f, backend, 4);
+  Failures(f, backend);
+  ToolPrompts(f, backend);
+  ContextLimit(f, speculative);
+  std::cout << "speculative serving ok\n";
+}
+
 }  // namespace
 
 int main() {
@@ -766,6 +869,7 @@ int main() {
     Failures(fixture, backend);
     ToolPrompts(fixture, backend);
     ContextLimit(fixture);
+    SpeculativeServing();
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << '\n';
     return 1;
