@@ -31,6 +31,19 @@ target_compile_definitions(glm53_flash_chat_template_test PRIVATE
 # refusal without Lane B's operators (also on GLM53_FLASH_GGUF when set).
 add_glm53_flash_test(generator gufo_glm53_flash "cpu")
 
+# Few-token routed expert matvec arithmetic (kernels/expert_vec_math.hpp),
+# host build of the kernel's block math vs core IQ dequantization. Pure CPU:
+# no gufo library (and so no HIP runtime) is linked.
+add_executable(glm53_flash_expert_vec_math_test expert_vec_math_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/core/quant/ggml_dequant.cpp)
+target_include_directories(glm53_flash_expert_vec_math_test PRIVATE
+  ${PROJECT_SOURCE_DIR})
+add_test(NAME glm53_flash.expert_vec_math
+  COMMAND glm53_flash_expert_vec_math_test)
+set_tests_properties(glm53_flash.expert_vec_math PROPERTIES
+  LABELS "glm53_flash;cpu")
+add_dependencies(glm53_flash_tests glm53_flash_expert_vec_math_test)
+
 # HF-generated hyper-connection fixture (fixtures/make_hc_fixture.py).
 set(GLM53_HC_FIXTURE "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hc_fixture.bin")
 add_glm53_flash_test(hc_reference gufo_glm53_flash_reference "cpu")

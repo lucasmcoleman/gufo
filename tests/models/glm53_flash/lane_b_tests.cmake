@@ -29,3 +29,10 @@ if (ENGINE_ENABLE_HIP)
   target_compile_definitions(glm53_flash_lane_b_executor_test PRIVATE
     GLM53_E2E_FIXTURE="${GLM53_E2E_FIXTURE}")
 endif()
+
+if (ENGINE_ENABLE_HIP)
+  # Few-token routed expert matvec (kernels/expert_vec.hpp) vs the host build
+  # of its block math and an FP64 dequantization oracle.
+  add_glm53_flash_test(expert_vec gufo_glm53_flash "hip;gpu;gfx1151")
+  set_tests_properties(glm53_flash.expert_vec PROPERTIES SKIP_RETURN_CODE 77)
+endif()

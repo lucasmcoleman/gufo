@@ -12,6 +12,7 @@
 
 #include "ds4_mmq.h"
 #include "ds4_pool.h"
+#include "src/models/glm53_flash/kernels/expert_vec.hpp"
 #include "src/models/glm53_flash/kernels/mmq/iq.hpp"
 #include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/profile.hpp"
@@ -44,7 +45,7 @@ struct Layout {
 struct Buffers {
   Layout layout;
   std::size_t gate, up, down, logits, probs, ids, weights, raw_weights,
-      norm_weights, shared;
+      norm_weights, shared, expert_vec;
   Buffers(const Config& c, std::uint32_t tokens) {
     const std::size_t routed = std::size_t{c.num_experts_used} * c.expert_ff;
     const auto ff = std::max(
@@ -59,6 +60,14 @@ struct Buffers {
     raw_weights = layout.Take(tokens, c.num_experts_used);
     norm_weights = layout.Take(tokens, c.num_experts_used);
     shared = layout.Take(tokens, c.hidden_size);
+    // Quantized activations of the few-token expert kernels
+    // (expert_vec.hpp): gate/up read [T][hidden], down [T * routes][ff].
+    const std::uint32_t vec_tokens = std::min(tokens, expert_vec::kMaxTokens);
+    const std::size_t vec_bytes = std::max(
+        expert_vec::ScratchBytes(vec_tokens, c.hidden_size),
+        expert_vec::ScratchBytes(vec_tokens * c.num_experts_used, c.expert_ff));
+    expert_vec =
+        layout.Take(1, (vec_bytes + sizeof(float) - 1) / sizeof(float));
   }
 };
 bool IsIq(GgmlType t) {
@@ -620,7 +629,17 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
     const bool routed = selected != nullptr;
     scope.emplace(ctx.profiler, routed ? "ffn_moe/gate_up" : "ffn/gate_up",
                   ctx.stream);
-    if (UseDs4(gate, up, selected)) {
+    const expert_vec::Mode vec = expert_vec::EnvMode();
+    const bool vec_tokens = routed && tokens <= expert_vec::kMaxTokens;
+    void* vec_scratch = ptr(b.expert_vec);
+    const std::size_t vec_bytes = ctx.scratch_bytes - b.expert_vec;
+    if (vec.gate_up && vec_tokens && gate.type == up.type &&
+        expert_vec::Supported(gate.type, gate.cols) &&
+        expert_vec::Launch(gate, &up, x, selected, g, u, tokens, routes,
+                           /*per_route=*/false, vec_scratch, vec_bytes,
+                           ctx.stream)) {
+      // Gate and up in one launch over one activation quantization.
+    } else if (UseDs4(gate, up, selected)) {
       if (!Ds4GateUp(gate, up, x, selected, g, u, tokens, routes, ctx.stream))
         return false;
     } else if (!Project(gate, x, selected, g, tokens, routes, true,
@@ -640,10 +659,15 @@ bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
     scope.emplace(ctx.profiler, routed ? "ffn_moe/down" : "ffn/down",
                   ctx.stream);
     const bool ok =
-        UseDs4Down(down, selected)
-            ? Ds4Down(down, g, selected, out, tokens, routes, ctx.stream)
-            : Project(down, g, selected, out, tokens, routes, false,
-                      ctx.stream);
+        (vec.down && vec_tokens &&
+         expert_vec::Supported(down.type, down.cols) &&
+         expert_vec::Launch(down, nullptr, g, selected, out, nullptr, tokens,
+                            routes, /*per_route=*/true, vec_scratch, vec_bytes,
+                            ctx.stream)) ||
+        (UseDs4Down(down, selected)
+             ? Ds4Down(down, g, selected, out, tokens, routes, ctx.stream)
+             : Project(down, g, selected, out, tokens, routes, false,
+                       ctx.stream));
     scope.reset();
     return ok;
   };
