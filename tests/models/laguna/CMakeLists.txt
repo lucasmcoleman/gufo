@@ -117,6 +117,12 @@ if (ENGINE_ENABLE_HIP)
   add_executable(laguna_logits logits_cli.cpp)
   target_link_libraries(laguna_logits PRIVATE gufo_laguna)
   add_dependencies(laguna_tests laguna_logits)
+
+  # CLI: verify-cost timing of one Forward of w rows per context depth, the
+  # DFlash 6b-0 (c) decision data. Not a test: it needs the real model.
+  add_executable(laguna_verify_cost verify_cost_cli.cpp)
+  target_link_libraries(laguna_verify_cost PRIVATE gufo_laguna)
+  add_dependencies(laguna_tests laguna_verify_cost)
 endif()
 
 # Functional suites (tests/functional/run.py) for Laguna. `functional_suites`
