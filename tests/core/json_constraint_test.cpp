@@ -107,13 +107,38 @@ void TestLagunaNativeTools() {
                   "</arg_value></tool_call>"));
   // An untyped open tool keeps native framing with any argument names.
   const auto open = JsonConstraint::ToolParameters(
-      parse(R"({"type":"object","additionalProperties":true})"), false, kLaguna);
+      parse(R"({"type":"object","additionalProperties":true})"), false,
+      kLaguna);
   const auto untyped = JsonConstraint::WithTools(nullptr, {{"note", open}},
                                                  true, false, kLaguna);
   assert(Accepts(*untyped, "<tool_call>note</tool_call>"));
   assert(Accepts(*untyped,
                  "<tool_call>note<arg_key>any</arg_key><arg_value>x"
                  "</arg_value></tool_call>"));
+  // The template writes JSON values with tojson and no escaping, as llama.cpp
+  // reads them: a JSON string may hold the closer, raw text may not. The
+  // HTTP parser scans JSON values structurally to match.
+  const auto nested = JsonConstraint::ToolParameters(parse(R"({
+    "type":"object","properties":{
+      "items":{"type":"array","items":{"type":"string"}},
+      "options":{"type":"object"},"text":{"type":"string"}},
+    "required":["items"],"additionalProperties":false})"),
+                                                     false, kLaguna);
+  const auto delimited = JsonConstraint::WithTools(
+      nullptr, {{"record", nested}}, true, false, kLaguna);
+  assert(Accepts(*delimited,
+                 "<tool_call>record<arg_key>items</arg_key><arg_value>"
+                 R"(["</arg_value>"])"
+                 "</arg_value></tool_call>"));
+  assert(Accepts(*delimited,
+                 "<tool_call>record<arg_key>items</arg_key><arg_value>[]"
+                 "</arg_value><arg_key>options</arg_key><arg_value>"
+                 R"({"k": "</arg_value></tool_call>"})"
+                 "</arg_value></tool_call>"));
+  assert(!Accepts(*delimited,
+                  "<tool_call>record<arg_key>items</arg_key><arg_value>[]"
+                  "</arg_value><arg_key>text</arg_key><arg_value>a</arg_value>b"
+                  "</arg_value></tool_call>"));
 }
 
 void TestWideNativeArgumentOrder() {

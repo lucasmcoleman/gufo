@@ -28,9 +28,34 @@ std::string_view BeforePartialDelimiter(std::string_view value,
   return value;
 }
 
+// Offset of the </arg_value> ending a JSON value: the first one outside a
+// JSON string, since only strings can hold `<`. `quoted` reports whether an
+// unterminated value ends inside a string.
+std::size_t JsonValueEnd(std::string_view value, bool* quoted) noexcept {
+  bool escaped = false;
+  *quoted = false;
+  for (std::size_t i = 0; i < value.size(); ++i) {
+    const char c = value[i];
+    if (*quoted) {
+      if (escaped)
+        escaped = false;
+      else if (c == '\\')
+        escaped = true;
+      else if (c == '"')
+        *quoted = false;
+    } else if (c == '"') {
+      *quoted = true;
+    } else if (value.substr(i).starts_with(ToolSyntax::kValueClose)) {
+      return i;
+    }
+  }
+  return std::string_view::npos;
+}
+
 }  // namespace
 
-ToolCallScan ScanToolCall(std::string_view text) {
+ToolCallScan ScanToolCall(std::string_view text,
+                          const JsonArgument& json_argument) {
   ToolCallScan result;
   if (!text.starts_with(ToolSyntax::kCallOpen))
     return result;
@@ -78,12 +103,17 @@ ToolCallScan ScanToolCall(std::string_view text) {
       break;
     }
     body.remove_prefix(ToolSyntax::kValueOpen.size());
-    const auto value_end = body.find(ToolSyntax::kValueClose);
+    bool quoted = false;
+    const auto value_end =
+        json_argument && json_argument(call.name, argument.name)
+            ? JsonValueEnd(body, &quoted)
+            : body.find(ToolSyntax::kValueClose);
     if (value_end == std::string_view::npos) {
       // Never recover a nested example from inside an unfinished value.
       result.progress = text.size();
-      argument.value =
-          std::string(BeforePartialDelimiter(body, ToolSyntax::kValueClose));
+      argument.value = std::string(
+          quoted ? body
+                 : BeforePartialDelimiter(body, ToolSyntax::kValueClose));
       argument.progress = text.size();
       call.unfinished = std::move(argument);
       valid = false;

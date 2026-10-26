@@ -1545,9 +1545,36 @@ bool InterpretQwenParameter(
 
 // A Laguna call in the shape of a native Qwen scan: both dialects carry
 // untyped parameters that the advertised schema interprets, so the Qwen
-// interpretation, recovery and streaming below apply unchanged.
-tokenization::QwenToolCallScan ScanLagunaToolCall(std::string_view text) {
-  const auto scan = models::laguna::ScanToolCall(text);
+// interpretation, recovery and streaming below apply unchanged. A declared
+// parameter whose schema admits no string is a JSON value under the native
+// grammar, so its scan respects JSON strings that hold the closer.
+tokenization::QwenToolCallScan ScanLagunaToolCall(
+    std::string_view text, std::span<const tokenization::ChatTool> tools) {
+  std::string schema_name;
+  std::optional<json::Value> schema;
+  const auto json_argument = [&](std::string_view name, std::string_view key) {
+    if (!schema || schema_name != name) {
+      schema_name = std::string(name);
+      schema.reset();
+      for (const auto& tool : tools)
+        if (tool.name == name) {
+          schema = TryParseJson(tool.parameters_json);
+          break;
+        }
+      if (!schema)
+        schema = json::Value();
+    }
+    const auto* object =
+        schema->is_object() ? ResolveToolSchema(*schema, *schema) : nullptr;
+    const auto* properties = object ? object->find("properties") : nullptr;
+    const auto* property =
+        properties && properties->is_object()
+            ? properties->find(QwenParameterName(properties, key))
+            : nullptr;
+    return property &&
+           !SchemaAccepts(*schema, *property, json::Value(std::string()));
+  };
+  const auto scan = models::laguna::ScanToolCall(text, json_argument);
   tokenization::QwenToolCallScan result{
       .matched = scan.matched, .progress = scan.progress, .end = scan.end};
   if (!scan.call)
@@ -1589,7 +1616,7 @@ void ParseQwenCalls(
     }
     const auto marker_begin = cursor;
     const auto scan =
-        laguna ? ScanLagunaToolCall(text.substr(marker_begin))
+        laguna ? ScanLagunaToolCall(text.substr(marker_begin), tools)
                : tokenization::ScanQwenToolCall(text.substr(marker_begin));
     if (!scan.matched || !scan.call) {
       cursor = marker_begin + scan.progress;

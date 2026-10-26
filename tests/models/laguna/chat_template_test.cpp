@@ -6,6 +6,8 @@
 
 #include <iostream>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "src/core/crypto/sha256.hpp"
 #include "tests/models/laguna/chat_golden.hpp"
@@ -168,6 +170,74 @@ void EdgeCases() {
     const auto empty = ml::ScanToolCall("<tool_call>noop</tool_call>");
     Require(empty.call && empty.call->complete && empty.call->arguments.empty(),
             "a call without arguments is complete");
+  }
+  // The template writes JSON values with tojson and no escaping, so a JSON
+  // string may hold </arg_value>. A JSON argument ends at the first closer
+  // outside its strings, through the whole call and every byte prefix, and
+  // the scanned call renders back to the same bytes.
+  {
+    const auto json_argument = [](std::string_view name, std::string_view key) {
+      return name == "record" && (key == "items" || key == "options");
+    };
+    const std::string items = R"(["</arg_value>", "a\"</arg_value>\\"])";
+    const std::string options =
+        R"({"k": "</arg_value></tool_call><tool_call>x", "n": [1]})";
+    const std::string generated =
+        "<tool_call>record<arg_key>items</arg_key><arg_value>" + items +
+        "</arg_value><arg_key>options</arg_key><arg_value>" + options +
+        "</arg_value><arg_key>text</arg_key><arg_value>t\"</arg_value>"
+        "</tool_call>";
+    const auto scan = ml::ScanToolCall(generated, json_argument);
+    Require(scan.call && scan.call->complete && scan.end == generated.size() &&
+                scan.call->arguments.size() == 3 &&
+                scan.call->arguments[0].value == items &&
+                scan.call->arguments[1].value == options &&
+                scan.call->arguments[2].value == "t\"",
+            "JSON arguments keep an embedded closer");
+    Require(!ml::ScanToolCall(generated).call->complete,
+            "raw scanning ends JSON at the first closer");
+    for (std::size_t size = 0; size < generated.size(); ++size) {
+      const auto prefix =
+          ml::ScanToolCall(generated.substr(0, size), json_argument);
+      bool consistent = !prefix.call || !prefix.call->complete;
+      if (prefix.call) {
+        const auto& arguments = prefix.call->arguments;
+        const std::vector<std::string> want{items, options, "t\""};
+        for (std::size_t i = 0; i < arguments.size(); ++i)
+          consistent =
+              consistent && i < want.size() && arguments[i].value == want[i];
+        if (const auto& unfinished = prefix.call->unfinished)
+          consistent = consistent && arguments.size() < want.size() &&
+                       want[arguments.size()].starts_with(unfinished->value);
+      }
+      Require(consistent, "JSON closer prefix " + std::to_string(size));
+    }
+    M assistant;
+    assistant.role = "assistant";
+    ml::ChatMessage::ToolCall call;
+    call.name = scan.call->name;
+    for (const auto& argument : scan.call->arguments)
+      call.arguments.push_back(
+          {argument.name, argument.value, argument.name == "text"});
+    assistant.tool_calls.push_back(call);
+    ml::ChatTemplateOptions options_off;
+    options_off.add_generation_prompt = false;
+    options_off.enable_thinking = false;
+    const std::vector<M> messages{user("go"), assistant};
+    Require(
+        ml::RenderChat(messages, {}, options_off)
+            .ends_with("<assistant></think>" + generated + "</assistant>\n"),
+        "JSON closer round-trips through history rendering");
+    // Raw text, as llama.cpp's until(</arg_value>) reads it, ends at the
+    // first closer; the grammar never admits one inside raw text.
+    const auto raw = ml::ScanToolCall(
+        "<tool_call>record<arg_key>text</arg_key><arg_value>a</arg_value>b"
+        "</arg_value></tool_call>",
+        json_argument);
+    Require(raw.call && !raw.call->complete &&
+                raw.call->arguments.size() == 1 &&
+                raw.call->arguments[0].value == "a",
+            "raw text ends at the first closer");
   }
   // Only the first message can be the header; roles the template does not
   // know are skipped.

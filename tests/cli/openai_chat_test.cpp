@@ -6447,6 +6447,84 @@ void TestLagunaNativeToolCalls() {
          "Laguna call markup leaves content");
 }
 
+// Laguna's template writes JSON values with tojson and no escaping, and the
+// native grammar admits a JSON string holding </arg_value>. Arrays and objects
+// holding the closer must survive complete parsing and bytewise streaming.
+void TestLagunaJsonArgumentHoldsCloser() {
+  const std::string items = R"(["</arg_value>", "a\"</arg_value>"])";
+  const std::string options =
+      R"({"k": "</arg_value></tool_call><tool_call>x"})";
+  const std::string raw =
+      "<tool_call>record<arg_key>items</arg_key><arg_value>" + items +
+      "</arg_value><arg_key>options</arg_key><arg_value>" + options +
+      "</arg_value><arg_key>text</arg_key><arg_value>t</arg_value>"
+      "</tool_call>";
+  for (const bool stream : {false, true}) {
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"go"}],
+      "tool_choice":"required","parallel_tool_calls":false,
+      "chat_template_kwargs":{"enable_thinking":false},
+      "tools":[{"type":"function","function":{"name":"record",
+        "parameters":{"type":"object","properties":{
+          "items":{"type":"array","items":{"type":"string"}},
+          "options":{"type":"object"},"text":{"type":"string"}},
+        "required":["items","options","text"]}}}]})");
+    body["stream"] = stream;
+    FakeBackend backend;
+    backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kLaguna;
+    for (char byte : raw)
+      backend.pieces.emplace_back(1, byte);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    std::string content;
+    std::vector<std::string> names;
+    std::string arguments;
+    if (stream) {
+      response.streaming_body([&](std::string_view chunk) {
+        if (chunk == "data: [DONE]\n\n")
+          return true;
+        const auto event = gufo::json::parse(chunk.substr(6));
+        for (const auto& choice : event.find("choices")->items())
+          if (const auto* delta = choice.find("delta")) {
+            content += delta->member_str("content");
+            if (const auto* calls = delta->find("tool_calls"))
+              for (const auto& call : calls->items())
+                if (const auto* function = call.find("function")) {
+                  if (!function->member_str("name").empty())
+                    names.push_back(function->member_str("name"));
+                  arguments += function->member_str("arguments");
+                }
+          }
+        return true;
+      });
+    } else {
+      const auto parsed = gufo::json::parse(response.body);
+      const auto& message = *parsed.find("choices")->items()[0].find("message");
+      if (message.find("content")->is_string())
+        content = message.member_str("content");
+      if (const auto* calls = message.find("tool_calls");
+          calls && calls->is_array())
+        for (const auto& call : calls->items()) {
+          names.push_back(call.find("function")->member_str("name"));
+          arguments = call.find("function")->member_str("arguments");
+        }
+    }
+    Expect(names == std::vector<std::string>{"record"},
+           "Laguna call with an embedded closer is returned once");
+    const auto parsed = gufo::json::parse(arguments);
+    Expect(parsed.find("items") &&
+               parsed.find("items")->dump() == gufo::json::parse(items).dump(),
+           "Laguna array argument keeps an embedded closer");
+    Expect(parsed.find("options") && parsed.find("options")->dump() ==
+                                         gufo::json::parse(options).dump(),
+           "Laguna object argument keeps an embedded closer");
+    Expect(parsed.member_str("text") == "t",
+           "Laguna argument after an embedded closer is kept");
+    Expect(content.empty(),
+           "Laguna call with an embedded closer is not content");
+  }
+}
+
 void TestParallelCallSeparatorIsNotContent() {
   // Qwen writes a newline between parallel calls and may end with one. That
   // layout is not a reply: the turn has null content, as with one call (#673).
@@ -6547,6 +6625,7 @@ int main() {
   TestNativeToolTransports();
   TestParallelCallSeparatorIsNotContent();
   TestLagunaNativeToolCalls();
+  TestLagunaJsonArgumentHoldsCloser();
   TestJsonToolStringOwnership();
   TestNativeToolDialectSelection();
   TestNativeToolTextOutsideEnvelopes();

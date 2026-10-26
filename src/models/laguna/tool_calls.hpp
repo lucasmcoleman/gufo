@@ -5,10 +5,15 @@
 // historical calls:
 //   <tool_call>NAME(<arg_key>K</arg_key><arg_value>V</arg_value>)*</tool_call>
 // String values are raw text and other values JSON; nothing marks the type,
-// so the API surface decides from the tool schema, as for Qwen. The scanner
-// is header-light so the HTTP layer can link it without the model engine.
+// so the API surface decides from the tool schema, as for Qwen. The template
+// writes both verbatim (`v | tojson if v is not string else v`), so a JSON
+// string may hold a literal </arg_value>; a JSON value therefore ends at the
+// first closer outside its strings, while raw text ends at the first closer,
+// as llama.cpp's tagged parser reads them. The scanner is header-light so the
+// HTTP layer can link it without the model engine.
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -55,9 +60,17 @@ struct ToolCallScan {
   std::optional<ScannedToolCall> call;  ///< Absent until a name is present.
 };
 
+/// Whether argument `key` of tool `name` holds JSON, i.e. its schema admits
+/// no string. The native grammar then constrains it as a JSON value instead
+/// of raw text that excludes the closer.
+using JsonArgument =
+    std::function<bool(std::string_view name, std::string_view key)>;
+
 /// Scans the Laguna call beginning at `text[0]`, if any. ASCII whitespace
-/// between tags is tolerated; values are kept verbatim.
-[[nodiscard]] ToolCallScan ScanToolCall(std::string_view text);
+/// between tags is tolerated; values are kept verbatim. Without
+/// `json_argument`, every value is raw text.
+[[nodiscard]] ToolCallScan ScanToolCall(std::string_view text,
+                                        const JsonArgument& json_argument = {});
 
 }  // namespace gufo::models::laguna
 
