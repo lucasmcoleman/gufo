@@ -8,9 +8,10 @@
 //    loader for general.architecture == "laguna".
 //  * chat and raw completion equal the engine's own greedy decode (chat
 //    template, BOS policy, chunked prefill, stop tokens, streaming pieces).
-//  * snapshots: an identical prompt is a complete hit with no prefill, and a
-//    conversation that extends it restores the stored prompt and continues
-//    bit for bit like a cold run.
+//  * snapshots: an identical prompt is a complete hit with no prefill; a new
+//    user turn after an unkept reply restores the stable boundary before the
+//    generation prompt; a conversation that extends the prompt restores it.
+//    Each continues bit for bit like the engine on the same prefill passes.
 //  * cancellation (queued, mid-decode) and retry, untapped; the retry equals
 //    the cold run and every session returns to idle.
 //  * several requests admitted together on three sessions equal their
@@ -87,6 +88,47 @@ Tokens Direct(const ml::Model& model, const std::vector<std::int32_t>& prompt,
   auto session = model.CreateSession(&error);
   Require(session != nullptr, error);
   Require(session->Prefill(prompt, &error), error);
+  const std::vector<smp::TokenId> history(prompt.begin(), prompt.end());
+  smp::SamplerState sampler(kGreedy, history);
+  Tokens out;
+  while (out.size() < max_tokens) {
+    const auto token = sampler.Sample(session->Logits());
+    if (model.IsStopToken(static_cast<std::int32_t>(token))) {
+      break;
+    }
+    sampler.Accept(token);
+    out.push_back(token);
+    if (out.size() < max_tokens) {
+      Require(session->Evaluate(static_cast<std::int32_t>(token), &error),
+              error);
+    }
+  }
+  return out;
+}
+
+/// Direct() with the prompt prefilled in the segments the server uses: it
+/// stops at each cache boundary (`splits`, ascending) and resumes in
+/// PrefillChunk() pieces from there. A two-token tail pass is not
+/// bit-identical to the same rows inside a larger pass, so a run restored
+/// from a snapshot is compared with the engine on the same pass grid.
+Tokens DirectSplit(const ml::Model& model,
+                   const std::vector<std::int32_t>& prompt,
+                   const std::vector<std::size_t>& splits,
+                   std::size_t max_tokens) {
+  std::string error;
+  auto session = model.CreateSession(&error);
+  Require(session != nullptr, error);
+  std::size_t begin = 0;
+  auto ends = splits;
+  ends.push_back(prompt.size());
+  for (const std::size_t end : ends) {
+    Require(begin < end && end <= prompt.size(), "DirectSplit segment");
+    Require(session->Prefill(std::span<const std::int32_t>(prompt).subspan(
+                                 begin, end - begin),
+                             &error),
+            error);
+    begin = end;
+  }
   const std::vector<smp::TokenId> history(prompt.begin(), prompt.end());
   smp::SamplerState sampler(kGreedy, history);
   Tokens out;
@@ -296,6 +338,43 @@ void Snapshots(const EngineFixture& f, srv::InferenceBackend& backend) {
               again.cached_prompt_tokens > 0 && again.tokens == cold.tokens,
           "an identical prompt is a complete hit with no prefill");
 
+  // A new user turn after a reply the client did not keep (a cancelled
+  // stream, say) diverges at the complete prompt's `<assistant><think>`.
+  // The stable boundary before that generation prompt is restored. Every
+  // prompt is also split at its own boundary (cache_prompt only controls
+  // reuse), two tokens before its end.
+  const std::size_t boundary = cold.prompt_tokens - 2;
+  auto appended = first;
+  appended.messages.emplace_back(gufo::tokenization::ChatRole::kUser, ".", "",
+                                 "");
+  const Result branch = backend.chat(appended, kMax, kGreedy);
+  Require(branch.cache_hit && branch.cached_prompt_tokens == boundary,
+          "a new user turn restores the boundary before the generation "
+          "prompt (cached " +
+              std::to_string(branch.cached_prompt_tokens) + " of " +
+              std::to_string(branch.prompt_tokens) + ")");
+  const auto appended_prompt = f.model->EncodeChat(
+      [&] {
+        std::vector<ml::ChatMessage> v(2);
+        v[0].role = "user";
+        v[0].content = first.messages[0].content;
+        v[1].role = "user";
+        v[1].content = ".";
+        return v;
+      }(),
+      {}, {});
+  Require(appended_prompt.size() == branch.prompt_tokens, "appended prompt");
+  Require(
+      branch.tokens == DirectSplit(*f.model, appended_prompt,
+                                   {boundary, branch.prompt_tokens - 2}, kMax),
+      "a run restored at the stable boundary equals the engine's decode");
+  auto branch_cold = appended;
+  branch_cold.cache_prompt = false;
+  Require(backend.chat(branch_cold, kMax, kGreedy).tokens ==
+              DirectSplit(*f.model, appended_prompt, {branch.prompt_tokens - 2},
+                          kMax),
+          "the uncached run equals the engine's decode");
+
   // The conversation continues: the stored prompt is a prefix of the next
   // one. The restored run must equal a run that never saw the cache.
   const auto second = Continue(first, "ok", "And now a follow-up question.");
@@ -308,25 +387,29 @@ void Snapshots(const EngineFixture& f, srv::InferenceBackend& backend) {
           "the follow-up restores the stored prompt (cached " +
               std::to_string(warm.cached_prompt_tokens) + " of " +
               std::to_string(warm.prompt_tokens) + ")");
-  Require(warm.tokens == reference.tokens && warm.text == reference.text,
-          "a continuation from a snapshot equals a cold run");
-  Require(warm.tokens == Direct(*f.model,
-                                f.model->EncodeChat(
-                                    [&] {
-                                      std::vector<ml::ChatMessage> v(3);
-                                      v[0].role = "user";
-                                      v[0].content = first.messages[0].content;
-                                      v[1].role = "assistant";
-                                      v[1].content = "ok";
-                                      v[2].role = "user";
-                                      v[2].content =
-                                          "And now a follow-up "
-                                          "question.";
-                                      return v;
-                                    }(),
-                                    {}, {}),
-                                kMax),
-          "the follow-up equals the engine's own decode");
+  const auto second_prompt = f.model->EncodeChat(
+      [&] {
+        std::vector<ml::ChatMessage> v(3);
+        v[0].role = "user";
+        v[0].content = first.messages[0].content;
+        v[1].role = "assistant";
+        v[1].content = "ok";
+        v[2].role = "user";
+        v[2].content = "And now a follow-up question.";
+        return v;
+      }(),
+      {}, {});
+  Require(second_prompt.size() == warm.prompt_tokens, "follow-up prompt");
+  // The restored prefix was prefilled by the first request, split at its
+  // stable boundary; the follow-up then runs to its own boundary.
+  Require(warm.tokens ==
+              DirectSplit(
+                  *f.model, second_prompt,
+                  {boundary, cold.prompt_tokens, warm.prompt_tokens - 2}, kMax),
+          "a continuation from a snapshot equals the engine's decode");
+  Require(reference.tokens == DirectSplit(*f.model, second_prompt,
+                                          {warm.prompt_tokens - 2}, kMax),
+          "the uncached follow-up equals the engine's decode");
   // Rewriting the earlier turn diverges inside the cached prefix: still
   // correct.
   auto rewritten = Continue(AlignedChat(backend,

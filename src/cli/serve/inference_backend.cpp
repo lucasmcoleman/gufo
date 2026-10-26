@@ -2466,6 +2466,30 @@ public:
     return tokens;
   }
 
+  /// The snapshot boundary is the end of the last complete message, before
+  /// the `<assistant><think>` (or `</think>`) generation prompt. A client's
+  /// next turn keeps that prefix even when it drops or rewrites this reply,
+  /// or adds a user turn after a cancelled one; the complete prompt would
+  /// only match an identical retry. The renderer/tokenizer find the exact
+  /// frontier, as for DeepSeek, so a BPE merge across it cannot be missed.
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    auto prepared = TextModelRunner::PreparePrompt(request);
+    if (prepared) {
+      auto continuation = request;
+      continuation.messages.emplace_back(tokenization::ChatRole::kUser, "");
+      const auto continued = RenderAndTokenize(continuation);
+      if (continued) {
+        prepared->cache_prefix_tokens = static_cast<std::size_t>(
+            std::mismatch(prepared->tokens.begin(), prepared->tokens.end(),
+                          continued->begin(), continued->end())
+                .first -
+            prepared->tokens.begin());
+      }
+    }
+    return prepared;
+  }
+
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
     return models::laguna::ResolveLagunaChatOptions(request.reasoning)
