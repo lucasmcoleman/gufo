@@ -105,6 +105,84 @@ private:
   std::size_t bytes_{0};
 };
 
+/// The drafter's K/V of one session: per layer an F16 ring of
+/// `window + max(max_rows, block_size)` positions (position p in slot
+/// p % capacity). It holds the injected context rows; a block pass writes its
+/// own rows at committed() .. committed() + B - 1 and leaves committed()
+/// unchanged, so the next injection overwrites them (the fork's
+/// seq_rm after the draft pass). Bookkeeping follows the target's KvCache:
+/// [retained_begin(), committed()) is physically present, writing position p
+/// evicts p - capacity, and a failure after a write invalidates the ring until
+/// Reset(). floor() is the first position the session injected (Reset's
+/// argument): keys below it never existed and are not attended, as in the
+/// fork's cache, which holds only injected rows. Move-only.
+class DrafterKv {
+public:
+  DrafterKv() = default;
+  DrafterKv(const DrafterKv&) = delete;
+  DrafterKv& operator=(const DrafterKv&) = delete;
+  DrafterKv(DrafterKv&& other) noexcept;
+  DrafterKv& operator=(DrafterKv&& other) noexcept;
+  ~DrafterKv();
+
+  /// Rings for every layer of `w`; injections may carry up to `max_rows`
+  /// rows per call. Nullopt with a message on a HIP failure.
+  [[nodiscard]] static std::optional<DrafterKv> Create(
+      const DrafterWeights& w, std::uint32_t max_rows,
+      std::string* error_msg = nullptr);
+
+  [[nodiscard]] std::uint32_t capacity() const noexcept { return capacity_; }
+  [[nodiscard]] std::uint32_t window() const noexcept { return window_; }
+  [[nodiscard]] std::uint32_t layers() const noexcept {
+    return static_cast<std::uint32_t>(k_.size());
+  }
+  [[nodiscard]] std::uint32_t kv_heads() const noexcept { return kv_heads_; }
+  /// Rows one call may write: capacity - window.
+  [[nodiscard]] std::uint32_t max_rows() const noexcept {
+    return capacity_ - window_;
+  }
+  [[nodiscard]] std::uint32_t committed() const noexcept { return committed_; }
+  [[nodiscard]] std::uint32_t retained_begin() const noexcept {
+    return retained_begin_;
+  }
+  [[nodiscard]] std::uint32_t floor() const noexcept { return floor_; }
+  [[nodiscard]] bool valid() const noexcept { return valid_; }
+  /// Empties the rings; the next injection starts at `position`. Host state
+  /// only.
+  void Reset(std::uint32_t position = 0) noexcept {
+    committed_ = position;
+    retained_begin_ = position;
+    floor_ = position;
+    valid_ = true;
+  }
+  [[nodiscard]] std::uint32_t Slot(std::uint32_t p) const noexcept {
+    return p % capacity_;
+  }
+  /// Bytes of one position's K (or V) row of one layer.
+  [[nodiscard]] std::size_t row_bytes() const noexcept {
+    return std::size_t{kv_heads_} * 128 * 2;
+  }
+  /// [capacity][kv_heads][128] F16 (raw bits) of layer `il`, for tests.
+  [[nodiscard]] const void* keys(std::uint32_t il) const { return k_.at(il); }
+  [[nodiscard]] const void* values(std::uint32_t il) const { return v_.at(il); }
+  [[nodiscard]] std::size_t device_bytes() const noexcept {
+    return 2 * k_.size() * capacity_ * row_bytes();
+  }
+
+private:
+  friend class DFlashOps;
+  void Release() noexcept;
+  std::vector<void*> k_;
+  std::vector<void*> v_;
+  std::uint32_t kv_heads_{0};
+  std::uint32_t capacity_{0};
+  std::uint32_t window_{0};
+  std::uint32_t committed_{0};
+  std::uint32_t retained_begin_{0};
+  std::uint32_t floor_{0};
+  bool valid_{true};
+};
+
 class DFlashOps {
 public:
   /// `stream` must outlive this object. Calls qfn_mmq_init.
@@ -126,11 +204,33 @@ public:
                             Path path = Path::kAuto,
                             std::string* error_msg = nullptr);
 
+  /// K/V injection: for every layer l, x = RMSNorm(fused[t]) * attn_norm_l,
+  /// K = RoPE(RMSNorm_head(x Wk) * k_norm) at position start + t, V = x Wv,
+  /// stored F16 in the layer's ring. start must lie in
+  /// [kv.floor(), kv.committed()] (a start below committed() overwrites, as
+  /// trimming rejected rows does) and rows <= kv.max_rows(). Fails without
+  /// touching the ring on a bad argument, including an invalid ring; a
+  /// failure after the first store invalidates it.
+  [[nodiscard]] bool InjectKv(const DrafterWeights& w, DrafterKv& kv,
+                              const float* fused, std::uint32_t rows,
+                              std::uint32_t start, Path path = Path::kAuto,
+                              std::string* error_msg = nullptr);
+
+  /// Encode then InjectKv: features[t][taps*hidden] of the context rows at
+  /// positions start .. start + rows - 1.
+  [[nodiscard]] bool Inject(const DrafterWeights& w, DrafterKv& kv,
+                            const float* features, std::uint32_t rows,
+                            std::uint32_t start, Path path = Path::kAuto,
+                            std::string* error_msg = nullptr);
+
   /// Debug tap for stage-by-stage checks: the operator synchronizes the stream
   /// after each stage and calls `tap` with the stage name (the oracle's tap
   /// names, see DFlashModel::Forward, plus the raw projections), a device
   /// pointer and a float count. Taps hide stream races, so every check also
   /// runs untapped. Encoder stages: enc_aux_norm, fc_out, enc_norm_out.
+  /// Injection stages per layer N: kv_inp_normed-N, Kproj_injected-N (x Wk),
+  /// Vcur_injected-N (x Wv), then kv_stored-N (null pointer, count 0: the
+  /// rows are in the ring).
   using TapFn = std::function<void(std::string_view name, const float* device,
                                    std::size_t count)>;
   void SetTap(TapFn tap) { tap_ = std::move(tap); }
@@ -155,13 +255,23 @@ private:
             std::string* error_msg);
   bool Ready(Path path, std::uint32_t rows, bool* vector,
              std::string* error_msg) const;
+  /// Reserves `rows` zero expert ids (the projections' routing).
+  bool PrepareIds(std::uint32_t rows, std::string* error_msg);
+  bool EncodeImpl(const DrafterWeights& w, const float* features, float* fused,
+                  std::uint32_t rows, bool vector, std::string* error_msg);
+  bool InjectImpl(const DrafterWeights& w, DrafterKv& kv, const float* fused,
+                  std::uint32_t rows, std::uint32_t start, bool vector,
+                  std::string* error_msg);
+  bool CheckInject(const DrafterWeights& w, const DrafterKv& kv,
+                   std::uint32_t rows, std::uint32_t start,
+                   std::string* error_msg) const;
 
   hipStream_t stream_;
   DeviceAllocator allocator_;
   TapFn tap_;
   std::string fail_after_;
   bool initialized_{false};
-  Scratch ids_, aux_, u_;
+  Scratch ids_, aux_, u_, fused_, x_, k_, v_;
 };
 
 }  // namespace gufo::models::laguna::rocm

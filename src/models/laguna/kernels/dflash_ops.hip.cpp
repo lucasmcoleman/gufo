@@ -10,6 +10,7 @@
 
 #include "src/models/laguna/kernels/dflash_ops.hpp"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -83,6 +84,99 @@ __global__ void RmsNormKernel(const float* __restrict__ x,
   const float scale = 1.0F / sqrtf(mean + eps);
   for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
     yr[i] = (xr[i] * scale) * wr[i];
+  }
+}
+
+struct RopeArgs {
+  std::uint32_t rotary_dim;
+  float theta_scale;
+  float corr_low;
+  float corr_high;
+  float freq_scale;
+  float ext_factor;
+  float mscale;
+};
+
+RopeArgs ToArgs(const RopeSpec& r) {
+  return RopeArgs{r.rotary_dim, r.theta_scale, r.corr_low, r.corr_high,
+                  r.freq_scale, r.ext_factor,  r.mscale};
+}
+
+/// grid (rows, heads + 2*kv_heads), block 128. Block y < heads: query head
+/// (norm, rope, in place in q). Then key heads (norm, rope, F16 into the
+/// ring), then value heads (F16 into the ring). Row t sits at start_pos + t.
+/// The rotation is ggml's rope cache in the oracle's float arithmetic (the
+/// angle of pair i is the position times theta_scale, i times), as the
+/// target's attention operator computes it. Norm: y = (x * rsqrt(mean(x^2) +
+/// eps)) * gamma.
+__global__ void QkNormRopeStoreKernel(
+    float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ q_gamma,
+    const float* __restrict__ k_gamma, __half* __restrict__ k_ring,
+    __half* __restrict__ v_ring, std::uint32_t heads, std::uint32_t kv_heads,
+    float eps, std::uint32_t start_pos, std::uint32_t capacity, RopeArgs rope) {
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t b = blockIdx.y;
+  const std::uint32_t d = threadIdx.x;
+  const std::uint32_t pos = start_pos + t;
+  const std::size_t kv_width = std::size_t{kv_heads} * kHeadDim;
+  const std::size_t slot = pos % capacity;
+  if (b >= heads + kv_heads) {
+    const std::uint32_t h = b - heads - kv_heads;
+    v_ring[slot * kv_width + h * kHeadDim + d] =
+        __float2half(v[std::size_t{t} * kv_width + h * kHeadDim + d]);
+    return;
+  }
+  const bool is_q = b < heads;
+  const std::uint32_t h = is_q ? b : b - heads;
+  float* qrow = is_q ? q + (std::size_t{t} * heads + h) * kHeadDim : nullptr;
+  const float* krow = k + std::size_t{t} * kv_width + h * kHeadDim;
+  const float x = is_q ? qrow[d] : krow[d];
+  __shared__ float part[kHeadDim / 32];
+  __shared__ float normed[kHeadDim];
+  float ss = x * x;
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    ss += __shfl_xor(ss, offset);
+  }
+  if (d % warpSize == 0) {
+    part[d / warpSize] = ss;
+  }
+  __syncthreads();
+  float total = part[0];
+  for (int i = 1; i < static_cast<int>(kHeadDim) / warpSize; ++i) {
+    total += part[i];
+  }
+  const float mean = total / static_cast<float>(kHeadDim);
+  const float scale = 1.0F / sqrtf(mean + eps);
+  normed[d] = (x * scale) * (is_q ? q_gamma[d] : k_gamma[d]);
+  __syncthreads();
+  const std::uint32_t half_rot = rope.rotary_dim / 2;
+  float out = normed[d];
+  if (d < rope.rotary_dim) {
+    const std::uint32_t pair = d < half_rot ? d : d - half_rot;
+    float theta = static_cast<float>(pos);
+    for (std::uint32_t i = 0; i < pair; ++i) {
+      theta *= rope.theta_scale;
+    }
+    const float theta_interp = rope.freq_scale * theta;
+    float rotated = theta_interp;
+    if (rope.ext_factor != 0.0F) {
+      const float y = (static_cast<float>(pair) - rope.corr_low) /
+                      fmaxf(0.001F, rope.corr_high - rope.corr_low);
+      const float ramp = 1.0F - fminf(1.0F, fmaxf(0.0F, y));
+      const float ramp_mix = ramp * rope.ext_factor;
+      rotated = theta_interp * (1.0F - ramp_mix) + theta * ramp_mix;
+    }
+    const float c = cosf(rotated) * rope.mscale;
+    const float s = sinf(rotated) * rope.mscale;
+    const float x0 = normed[pair];
+    const float x1 = normed[pair + half_rot];
+    out = d < half_rot ? x0 * c - x1 * s : x0 * s + x1 * c;
+  }
+  if (is_q) {
+    qrow[d] = out;
+  } else {
+    k_ring[slot * kv_width + h * kHeadDim + d] = __float2half(out);
   }
 }
 
@@ -259,6 +353,84 @@ std::optional<DeviceDrafter> DeviceDrafter::Upload(const DFlashWeights& dw,
   return result;
 }
 
+// ---- DrafterKv --------------------------------------------------------------
+
+DrafterKv::DrafterKv(DrafterKv&& other) noexcept
+    : k_(std::move(other.k_)),
+      v_(std::move(other.v_)),
+      kv_heads_(other.kv_heads_),
+      capacity_(other.capacity_),
+      window_(other.window_),
+      committed_(other.committed_),
+      retained_begin_(other.retained_begin_),
+      floor_(other.floor_),
+      valid_(other.valid_) {
+  other.k_.clear();
+  other.v_.clear();
+  other.capacity_ = 0;
+}
+
+DrafterKv& DrafterKv::operator=(DrafterKv&& other) noexcept {
+  if (this != &other) {
+    Release();
+    k_ = std::move(other.k_);
+    v_ = std::move(other.v_);
+    kv_heads_ = other.kv_heads_;
+    capacity_ = other.capacity_;
+    window_ = other.window_;
+    committed_ = other.committed_;
+    retained_begin_ = other.retained_begin_;
+    floor_ = other.floor_;
+    valid_ = other.valid_;
+    other.k_.clear();
+    other.v_.clear();
+    other.capacity_ = 0;
+  }
+  return *this;
+}
+
+DrafterKv::~DrafterKv() {
+  Release();
+}
+
+void DrafterKv::Release() noexcept {
+  for (std::vector<void*>* list : {&k_, &v_}) {
+    for (void* p : *list) {
+      if (p != nullptr) {
+        (void)hipFree(p);
+      }
+    }
+    list->clear();
+  }
+}
+
+std::optional<DrafterKv> DrafterKv::Create(const DrafterWeights& w,
+                                           std::uint32_t max_rows,
+                                           std::string* error_msg) {
+  if (w.kv_heads == 0 || w.head_dim != kHeadDim || w.window == 0 ||
+      w.layers.empty() || max_rows == 0) {
+    Assign(error_msg, "laguna dflash kv: bad geometry");
+    return std::nullopt;
+  }
+  DrafterKv kv;
+  kv.kv_heads_ = w.kv_heads;
+  kv.window_ = w.window;
+  kv.capacity_ = w.window + std::max(max_rows, w.block_size);
+  const std::size_t bytes = std::size_t{kv.capacity_} * kv.row_bytes();
+  // A failure leaves `kv` owning whatever was allocated; its destructor frees
+  // it.
+  for (std::size_t il = 0; il < w.layers.size(); ++il) {
+    for (std::vector<void*>* list : {&kv.k_, &kv.v_}) {
+      void* p = nullptr;
+      if (!CheckHip(hipMalloc(&p, bytes), "hipMalloc drafter kv", error_msg)) {
+        return std::nullopt;
+      }
+      list->push_back(p);
+    }
+  }
+  return kv;
+}
+
 // ---- DFlashOps --------------------------------------------------------------
 
 DFlashOps::DFlashOps(hipStream_t stream)
@@ -270,14 +442,14 @@ DFlashOps::DFlashOps(hipStream_t stream)
 
 DFlashOps::~DFlashOps() {
   (void)hipStreamSynchronize(stream_);
-  for (Scratch* s : {&ids_, &aux_, &u_}) {
+  for (Scratch* s : {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_}) {
     Free(s);
   }
 }
 
 std::size_t DFlashOps::scratch_bytes() const noexcept {
   std::size_t total = 0;
-  for (const Scratch* s : {&ids_, &aux_, &u_}) {
+  for (const Scratch* s : {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_}) {
     total += s->capacity;
   }
   return total;
@@ -384,13 +556,24 @@ bool DFlashOps::Ready(Path path, std::uint32_t rows, bool* vector,
   return true;
 }
 
+bool DFlashOps::PrepareIds(std::uint32_t rows, std::string* error_msg) {
+  const std::size_t bytes = std::size_t{rows} * sizeof(std::int32_t);
+  return Reserve(&ids_, bytes, error_msg) &&
+         CheckHip(hipMemsetAsync(ids_.ptr, 0, bytes, stream_), "hipMemsetAsync",
+                  error_msg);
+}
+
 bool DFlashOps::Encode(const DrafterWeights& w, const float* features,
                        float* fused, std::uint32_t rows, Path path,
                        std::string* error_msg) {
   bool vector = false;
-  if (!Ready(path, rows, &vector, error_msg)) {
-    return false;
-  }
+  return Ready(path, rows, &vector, error_msg) &&
+         EncodeImpl(w, features, fused, rows, vector, error_msg);
+}
+
+bool DFlashOps::EncodeImpl(const DrafterWeights& w, const float* features,
+                           float* fused, std::uint32_t rows, bool vector,
+                           std::string* error_msg) {
   const std::size_t width = std::size_t{w.taps} * w.hidden;
   if (w.taps == 0 || w.hidden == 0 || w.fc.cols != width ||
       w.fc.rows != w.hidden || !ProjectionType(w.fc.type) ||
@@ -402,14 +585,9 @@ bool DFlashOps::Encode(const DrafterWeights& w, const float* features,
     Assign(error_msg, "laguna dflash encoder: null input or output");
     return false;
   }
-  const std::size_t ids_bytes = std::size_t{rows} * sizeof(std::int32_t);
-  if (!Reserve(&ids_, ids_bytes, error_msg) ||
+  if (!PrepareIds(rows, error_msg) ||
       !Reserve(&aux_, rows * width * sizeof(float), error_msg) ||
       !Reserve(&u_, std::size_t{rows} * w.hidden * sizeof(float), error_msg)) {
-    return false;
-  }
-  if (!CheckHip(hipMemsetAsync(ids_.ptr, 0, ids_bytes, stream_),
-                "hipMemsetAsync", error_msg)) {
     return false;
   }
   float* aux = static_cast<float*>(aux_.ptr);
@@ -427,6 +605,159 @@ bool DFlashOps::Encode(const DrafterWeights& w, const float* features,
   return CheckHip(hipGetLastError(), "encoder norm launch", error_msg) &&
          Emit("enc_norm_out", -1, fused, std::size_t{rows} * w.hidden,
               error_msg);
+}
+
+namespace {
+
+/// Shapes and pointers of one layer's attention tensors.
+bool LayerConsistent(const DrafterWeights& w, const DrafterLayer& l) {
+  const std::uint32_t qd = w.heads * kHeadDim;
+  const std::uint32_t kvd = w.kv_heads * kHeadDim;
+  const auto ok = [](const DeviceMatrix& m, std::uint32_t cols,
+                     std::uint32_t rows) {
+    return ProjectionType(m.type) && m.experts == 1 && m.data != nullptr &&
+           m.cols == cols && m.rows == rows;
+  };
+  return ok(l.q, w.hidden, qd) && ok(l.k, w.hidden, kvd) &&
+         ok(l.v, w.hidden, kvd) && ok(l.o, qd, w.hidden) &&
+         ok(l.gate, w.hidden, w.heads) && ok(l.ffn_gate, w.hidden, w.ffn) &&
+         ok(l.ffn_up, w.hidden, w.ffn) && ok(l.ffn_down, w.ffn, w.hidden) &&
+         l.attn_norm != nullptr && l.q_norm != nullptr && l.k_norm != nullptr &&
+         l.ffn_norm != nullptr;
+}
+
+bool GeometryConsistent(const DrafterWeights& w) {
+  if (w.head_dim != kHeadDim || w.kv_heads == 0 || w.heads % w.kv_heads != 0 ||
+      w.hidden == 0 || w.ffn == 0 || w.window == 0 || w.layers.empty() ||
+      w.rope.rotary_dim == 0 || w.rope.rotary_dim % 2 != 0 ||
+      w.rope.rotary_dim > kHeadDim) {
+    return false;
+  }
+  return std::all_of(
+      w.layers.begin(), w.layers.end(),
+      [&](const DrafterLayer& l) { return LayerConsistent(w, l); });
+}
+
+}  // namespace
+
+bool DFlashOps::CheckInject(const DrafterWeights& w, const DrafterKv& kv,
+                            std::uint32_t rows, std::uint32_t start,
+                            std::string* error_msg) const {
+  if (!GeometryConsistent(w)) {
+    Assign(error_msg, "laguna dflash: inconsistent drafter weights");
+    return false;
+  }
+  if (kv.k_.size() != w.layers.size() || kv.kv_heads_ != w.kv_heads ||
+      kv.window_ != w.window) {
+    Assign(error_msg, "laguna dflash: kv rings do not match the drafter");
+    return false;
+  }
+  if (!kv.valid_) {
+    Assign(error_msg,
+           "laguna dflash: kv invalidated by a failed call; Reset() it");
+    return false;
+  }
+  if (start < kv.floor_ || start > kv.committed_) {
+    Assign(error_msg,
+           "laguna dflash: injection must start in [floor, committed]");
+    return false;
+  }
+  if (rows > kv.max_rows() || std::uint64_t{start} + rows > UINT32_MAX) {
+    Assign(error_msg, "laguna dflash: injection exceeds the ring");
+    return false;
+  }
+  return true;
+}
+
+bool DFlashOps::InjectKv(const DrafterWeights& w, DrafterKv& kv,
+                         const float* fused, std::uint32_t rows,
+                         std::uint32_t start, Path path,
+                         std::string* error_msg) {
+  bool vector = false;
+  if (!Ready(path, rows, &vector, error_msg) ||
+      !CheckInject(w, kv, rows, start, error_msg)) {
+    return false;
+  }
+  if (fused == nullptr) {
+    Assign(error_msg, "laguna dflash: null injection input");
+    return false;
+  }
+  return InjectImpl(w, kv, fused, rows, start, vector, error_msg);
+}
+
+bool DFlashOps::Inject(const DrafterWeights& w, DrafterKv& kv,
+                       const float* features, std::uint32_t rows,
+                       std::uint32_t start, Path path, std::string* error_msg) {
+  bool vector = false;
+  if (!Ready(path, rows, &vector, error_msg) ||
+      !CheckInject(w, kv, rows, start, error_msg) ||
+      !Reserve(&fused_, std::size_t{rows} * w.hidden * sizeof(float),
+               error_msg)) {
+    return false;
+  }
+  float* fused = static_cast<float*>(fused_.ptr);
+  return EncodeImpl(w, features, fused, rows, vector, error_msg) &&
+         InjectImpl(w, kv, fused, rows, start, vector, error_msg);
+}
+
+bool DFlashOps::InjectImpl(const DrafterWeights& w, DrafterKv& kv,
+                           const float* fused, std::uint32_t rows,
+                           std::uint32_t start, bool vector,
+                           std::string* error_msg) {
+  const std::size_t kvd = std::size_t{w.kv_heads} * kHeadDim;
+  if (!PrepareIds(rows, error_msg) ||
+      !Reserve(&x_, std::size_t{rows} * w.hidden * sizeof(float), error_msg) ||
+      !Reserve(&k_, rows * kvd * sizeof(float), error_msg) ||
+      !Reserve(&v_, rows * kvd * sizeof(float), error_msg)) {
+    return false;
+  }
+  float* x = static_cast<float*>(x_.ptr);
+  float* k = static_cast<float*>(k_.ptr);
+  float* v = static_cast<float*>(v_.ptr);
+  const RopeArgs rope = ToArgs(w.rope);
+  bool stored = false;  // a ring may hold part of the call's rows
+  const auto fail = [&] {
+    if (stored) {
+      kv.valid_ = false;
+      kv.committed_ = kv.floor_;
+      kv.retained_begin_ = kv.floor_;
+    }
+    return false;
+  };
+  for (std::uint32_t il = 0; il < w.layers.size(); ++il) {
+    const DrafterLayer& l = w.layers[il];
+    const int layer = static_cast<int>(il);
+    RmsNormKernel<<<rows, kNormThreads, 0, stream_>>>(fused, l.attn_norm, x,
+                                                      w.hidden, 1, w.eps);
+    if (!CheckHip(hipGetLastError(), "kv norm launch", error_msg) ||
+        !Emit("kv_inp_normed", layer, x, std::size_t{rows} * w.hidden,
+              error_msg) ||
+        !Project(l.k, x, k, rows, vector, error_msg) ||
+        !Emit("Kproj_injected", layer, k, rows * kvd, error_msg) ||
+        !Project(l.v, x, v, rows, vector, error_msg) ||
+        !Emit("Vcur_injected", layer, v, rows * kvd, error_msg)) {
+      return fail();
+    }
+    stored = true;
+    QkNormRopeStoreKernel<<<dim3(rows, 2 * w.kv_heads), kHeadDim, 0, stream_>>>(
+        nullptr, k, v, nullptr, l.k_norm, static_cast<__half*>(kv.k_[il]),
+        static_cast<__half*>(kv.v_[il]), 0, w.kv_heads, w.eps, start,
+        kv.capacity_, rope);
+    if (!CheckHip(hipGetLastError(), "kv store launch", error_msg) ||
+        !Emit("kv_stored", layer, nullptr, 0, error_msg)) {
+      return fail();
+    }
+  }
+  // Writing [start, end) evicted every position below end - capacity; a start
+  // below retained_begin keeps only the rows just written.
+  const std::uint32_t end = start + rows;
+  std::uint32_t retained = std::min(kv.retained_begin_, start);
+  if (end > kv.capacity_) {
+    retained = std::max(retained, end - kv.capacity_);
+  }
+  kv.retained_begin_ = retained;
+  kv.committed_ = end;
+  return true;
 }
 
 }  // namespace gufo::models::laguna::rocm

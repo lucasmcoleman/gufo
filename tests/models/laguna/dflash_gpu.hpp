@@ -417,6 +417,67 @@ inline std::vector<float> Values(const ml::TensorRef& t) {
   return ref::DequantizeTensor(t);
 }
 
+/// rms(got - want) / rms(want). An isolated Q8 code flip at a rounding tie
+/// moves single elements by up to a few percent of rms, so end-to-end
+/// distances are judged by this (and the max only loosely).
+inline double RelRms(const std::vector<float>& got,
+                     const std::vector<float>& want) {
+  Require(got.size() == want.size(), "RelRms: size mismatch");
+  double e = 0, r = 0;
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    Require(std::isfinite(got[i]), "GPU value not finite");
+    const double d = static_cast<double>(got[i]) - want[i];
+    e += d * d;
+    r += static_cast<double>(want[i]) * want[i];
+  }
+  return r > 0 ? std::sqrt(e / r) : std::sqrt(e);
+}
+
+/// End-to-end distance of a GPU result from the oracle in the same activation
+/// mode, next to the quantization noise (its distance from the F32 oracle).
+struct E2e {
+  double rms{0};        ///< RelRms to the matching oracle
+  double max{0};        ///< max |diff| / rms to the matching oracle
+  double noise_rms{0};  ///< RelRms to the F32 oracle
+  double noise_max{0};
+  void Merge(const E2e& o) {
+    rms = std::max(rms, o.rms);
+    max = std::max(max, o.max);
+    noise_rms = std::max(noise_rms, o.noise_rms);
+    noise_max = std::max(noise_max, o.noise_max);
+  }
+};
+
+inline E2e MeasureE2e(const std::vector<float>& got,
+                      const std::vector<float>& matched,
+                      const std::vector<float>& exact) {
+  E2e e;
+  e.rms = RelRms(got, matched);
+  e.max = Compare(got, matched).max_over_rms;
+  e.noise_rms = RelRms(got, exact);
+  e.noise_max = Compare(got, exact).max_over_rms;
+  return e;
+}
+
+/// The arithmetic is checked exactly stage by stage; end to end the GPU must
+/// sit far closer to the oracle in its own mode than the quantization noise:
+/// rms distance under 0.1 of the noise's, worst element under half of it.
+inline void RequireE2e(const std::string& what, const E2e& e) {
+  if (!(e.rms <= 0.1 * e.noise_rms && e.max <= 0.5 * e.noise_max)) {
+    std::ostringstream m;
+    m << what << ": differs from the oracle by " << e.rms << " rms / " << e.max
+      << " max of rms; Q8 noise " << e.noise_rms << " / " << e.noise_max;
+    Require(false, m.str());
+  }
+}
+
+inline std::string E2eText(const E2e& e) {
+  std::ostringstream m;
+  m << std::setprecision(3) << std::scientific << e.rms << " rms / " << e.max
+    << " max vs Q8 noise " << e.noise_rms << " / " << e.noise_max;
+  return m.str();
+}
+
 /// Relative closeness of a norm output computed by two implementations of
 /// the same formula (double sum, one float rounding per product): 2e-6 of the
 /// element plus 1e-6 of the rms covers one ulp of the shared scale.
@@ -430,9 +491,34 @@ struct EncoderReport {
   double aux_rel{0};
   double norm_rel{0};
   ProjStats proj;
-  double e2e_over_rms{0};  ///< GPU fused vs the oracle in the same mode
-  double q8_noise{0};      ///< GPU fused vs the F32 oracle
+  E2e e2e;
 };
+
+/// The encoder's stages of one tapped run against the oracle's building
+/// blocks (the GPU's own upstream stage as input). Fills the stage fields of
+/// `rep`; throws on any failure.
+inline void CheckEncoderStages(const std::string& label, const TinyDrafter& fx,
+                               const std::vector<float>& features,
+                               std::uint32_t T, bool vector, const Taps& taps,
+                               EncoderReport* rep) {
+  const ml::DFlashConfig& c = fx.config();
+  const std::size_t H = c.hidden_size;
+  const std::size_t width = c.fused_input_width();
+  const auto aux_w = Values(fx.drafter.aux_norm);
+  const auto aux_want =
+      NormRows(features, H, aux_w.data(), c.tap_count(), c.rms_eps);
+  const auto& aux = taps.F("enc_aux_norm");
+  Require(aux.size() == T * width, label + ": enc_aux_norm size");
+  CheckNorm(label + " enc_aux_norm", aux, aux_want, &rep->aux_rel);
+  const auto& fc_out = taps.F("fc_out");
+  const auto caps =
+      StageCaptures(taps, "fc_out", 1, fx.drafter.fc.type, vector, label);
+  CheckStage(label, "fc_out", fx.drafter.fc, aux, T, fc_out, caps[0],
+             &rep->proj);
+  const auto enc_w = Values(fx.drafter.enc_output_norm);
+  CheckNorm(label + " enc_norm_out", taps.F("enc_norm_out"),
+            NormRows(fc_out, H, enc_w.data(), 1, c.rms_eps), &rep->norm_rel);
+}
 
 /// Checks one encoder run (taps of a tapped run, `fused` its output) stage by
 /// stage and end to end against the oracle. `features` are what the oracle
@@ -446,22 +532,7 @@ inline EncoderReport CheckEncoder(const std::string& label,
   EncoderReport rep;
   rep.label = label;
   const ml::DFlashConfig& c = fx.config();
-  const std::size_t H = c.hidden_size;
-  const std::size_t width = c.fused_input_width();
-  const auto aux_w = Values(fx.drafter.aux_norm);
-  const auto aux_want =
-      NormRows(features, H, aux_w.data(), c.tap_count(), c.rms_eps);
-  const auto& aux = taps.F("enc_aux_norm");
-  Require(aux.size() == T * width, label + ": enc_aux_norm size");
-  CheckNorm(label + " enc_aux_norm", aux, aux_want, &rep.aux_rel);
-  const auto& fc_out = taps.F("fc_out");
-  const auto caps =
-      StageCaptures(taps, "fc_out", 1, fx.drafter.fc.type, vector, label);
-  CheckStage(label, "fc_out", fx.drafter.fc, aux, T, fc_out, caps[0],
-             &rep.proj);
-  const auto enc_w = Values(fx.drafter.enc_output_norm);
-  CheckNorm(label + " enc_norm_out", taps.F("enc_norm_out"),
-            NormRows(fc_out, H, enc_w.data(), 1, c.rms_eps), &rep.norm_rel);
+  CheckEncoderStages(label, fx, features, T, vector, taps, &rep);
   Require(BitIdentical(taps.F("enc_norm_out"), fused),
           label + ": output differs from the enc_norm_out tap");
   // End to end against DFlashModel itself (its encoder taps), in the GPU's
@@ -475,15 +546,11 @@ inline EncoderReport CheckEncoder(const std::string& label,
   const OracleTaps exact =
       RunDrafterOracle(fx, features, pos, block, static_cast<std::int32_t>(T),
                        ref::ActivationQuant::kNone);
-  rep.e2e_over_rms = Compare(fused, want.F("enc_norm_out")).max_over_rms;
-  rep.q8_noise = Compare(fused, exact.F("enc_norm_out")).max_over_rms;
   // The two sides quantize the same aux rows (equal to float noise), so they
   // differ only by an occasional code flip at a rounding tie and by the
-  // summation order; that must stay far below the quantization noise itself.
-  Require(rep.e2e_over_rms <= 0.1 * rep.q8_noise && rep.e2e_over_rms <= 5e-3,
-          label + ": encoder output differs from the oracle by " +
-              std::to_string(rep.e2e_over_rms) + " of rms (Q8 noise " +
-              std::to_string(rep.q8_noise) + ")");
+  // summation order.
+  rep.e2e = MeasureE2e(fused, want.F("enc_norm_out"), exact.F("enc_norm_out"));
+  RequireE2e(label + " encoder output", rep.e2e);
   return rep;
 }
 
@@ -492,8 +559,222 @@ inline void PrintEncoder(const EncoderReport& r) {
             << ": aux " << r.aux_rel << ", fc " << r.proj.over_rms
             << " of rms (" << r.proj.over_bound << " of bound, boundary codes "
             << r.proj.boundary_codes << "), norm " << r.norm_rel << ", e2e "
-            << r.e2e_over_rms << " vs Q8 noise " << r.q8_noise
-            << std::defaultfloat << "\n";
+            << E2eText(r.e2e) << std::defaultfloat << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// K/V injection
+// ---------------------------------------------------------------------------
+
+/// The F16 K and V rows of positions [begin, end) of every layer, read from
+/// the rings: [position][layer][kv_dim] raw bits.
+struct KvRows {
+  std::uint32_t begin{0};
+  std::uint32_t end{0};
+  std::size_t layers{0};
+  std::size_t kvd{0};
+  std::vector<std::uint16_t> k, v;
+  [[nodiscard]] const std::uint16_t* K(std::uint32_t p, std::size_t l) const {
+    return k.data() + ((p - begin) * layers + l) * kvd;
+  }
+  [[nodiscard]] const std::uint16_t* V(std::uint32_t p, std::size_t l) const {
+    return v.data() + ((p - begin) * layers + l) * kvd;
+  }
+};
+
+inline KvRows ReadRing(const gpu::DrafterKv& kv, std::uint32_t begin,
+                       std::uint32_t end) {
+  KvRows r;
+  r.begin = begin;
+  r.end = end;
+  r.layers = kv.layers();
+  r.kvd = kv.row_bytes() / 2;
+  r.k.resize((end - begin) * r.layers * r.kvd);
+  r.v.resize(r.k.size());
+  for (std::size_t l = 0; l < r.layers; ++l) {
+    const auto keys = ToHost(static_cast<const std::uint16_t*>(
+                                 kv.keys(static_cast<std::uint32_t>(l))),
+                             std::size_t{kv.capacity()} * r.kvd);
+    const auto vals = ToHost(static_cast<const std::uint16_t*>(
+                                 kv.values(static_cast<std::uint32_t>(l))),
+                             std::size_t{kv.capacity()} * r.kvd);
+    for (std::uint32_t p = begin; p < end; ++p) {
+      const std::size_t slot = kv.Slot(p);
+      std::copy_n(keys.data() + slot * r.kvd, r.kvd,
+                  r.k.data() + ((p - begin) * r.layers + l) * r.kvd);
+      std::copy_n(vals.data() + slot * r.kvd, r.kvd,
+                  r.v.data() + ((p - begin) * r.layers + l) * r.kvd);
+    }
+  }
+  return r;
+}
+
+struct InjectReport {
+  std::string label;
+  EncoderReport enc;
+  double kv_norm_rel{0};
+  ProjStats proj;
+  double rope_over_amax{0};  ///< K float disagreement before F16 / head amax
+  double k_excess{0};        ///< K beyond half an F16 ulp, / |x|
+  double v_excess{0};
+  bool has_e2e{false};
+  E2e e2e_k;  ///< stored K vs the oracle
+  E2e e2e_v;
+};
+
+/// F16 storage check of K/V: each stored binary16 must be within half an ulp
+/// of `want` plus `slack` of the head's largest element (K: the float
+/// disagreement of norm and rope; V is stored from the v projection itself, so
+/// its slack is 0: pure rounding). Returns the worst excess over half an ulp
+/// relative to the element; throws on a violation.
+inline double CheckF16Rows(const std::string& what, const std::uint16_t* got,
+                           const float* want, std::size_t count, double slack) {
+  double excess = 0;
+  for (std::size_t i = 0; i < count; ++i) {
+    const double g = HalfToFloat(got[i]);
+    const double w = want[i];
+    const double err = std::fabs(g - w);
+    const double half_ulp = 0.5 * HalfUlp(w);
+    double amax = 0;
+    if (slack > 0) {
+      const std::size_t h = i / 128;
+      for (std::size_t d = 0; d < 128; ++d) {
+        amax =
+            std::max(amax, static_cast<double>(std::fabs(want[h * 128 + d])));
+      }
+    }
+    const double allowed = half_ulp * (1.0 + 1e-6) +
+                           (slack > 0 ? 3e-6 * std::fabs(w) : 0.0) +
+                           slack * amax;
+    excess = std::max(
+        excess, std::max(0.0, err - half_ulp) / std::max(std::fabs(w), 1e-3));
+    if (err > allowed) {
+      std::ostringstream m;
+      m << what << ": element " << i << " stored " << g << ", want " << w;
+      Require(false, m.str());
+    }
+  }
+  return excess;
+}
+
+/// NeoX RoPE of the drafter at `positions` (the oracle's ApplyRope).
+inline void DrafterRope(const ml::DFlashConfig& c, float* x,
+                        const std::vector<std::int32_t>& positions,
+                        std::uint32_t heads) {
+  ref::RopeParams rope;
+  rope.n_rot = c.rotary_dim;
+  rope.freq_base = c.rope_theta;
+  ref::ApplyRope(x, positions, heads, c.head_dim, rope);
+}
+
+/// Per-head RMSNorm with a [128] weight, the oracle's.
+inline std::vector<float> NormHeads(const std::vector<float>& x,
+                                    const ml::TensorRef& gamma, float eps) {
+  const auto g = Values(gamma);
+  return NormRows(x, 128, g.data(), 1, eps);
+}
+
+/// Stages of one injection chunk (rows at positions pos .. pos + T - 1,
+/// features `features`) from its taps, and the ring rows it stored (`ring`,
+/// read right after the call). Throws on any failure.
+inline void CheckInjectChunk(const std::string& label, const TinyDrafter& fx,
+                             const std::vector<float>& features,
+                             std::uint32_t T, std::uint32_t pos, bool vector,
+                             const Taps& taps, const KvRows& ring,
+                             InjectReport* rep) {
+  const ml::DFlashConfig& c = fx.config();
+  const std::size_t H = c.hidden_size;
+  const std::size_t kvd = c.kv_dim();
+  CheckEncoderStages(label, fx, features, T, vector, taps, &rep->enc);
+  const auto& fused = taps.F("enc_norm_out");
+  const auto positions = Iota(static_cast<std::int32_t>(pos), T);
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    const ml::DFlashLayerWeights& lw = fx.drafter.layers[il];
+    const std::string sfx = "-" + std::to_string(il);
+    const auto norm_w = Values(lw.attn_norm);
+    const auto& x = taps.F("kv_inp_normed" + sfx);
+    CheckNorm(label + " kv_inp_normed" + sfx, x,
+              NormRows(fused, H, norm_w.data(), 1, c.rms_eps),
+              &rep->kv_norm_rel);
+    const auto kc = StageCaptures(taps, "Kproj_injected" + sfx, 1,
+                                  lw.attn_k.type, vector, label);
+    const auto vc = StageCaptures(taps, "Vcur_injected" + sfx, 1,
+                                  lw.attn_v.type, vector, label);
+    if (kc[0].layout == vc[0].layout) {
+      const std::string why = SharedInputMismatch({&kc[0], &vc[0]});
+      Require(why.empty(), label + ": K/V input" + sfx + ": " + why);
+    }
+    const auto& kp = taps.F("Kproj_injected" + sfx);
+    const auto& vp = taps.F("Vcur_injected" + sfx);
+    CheckStage(label, "Kproj_injected" + sfx, lw.attn_k, x, T, kp, kc[0],
+               &rep->proj);
+    CheckStage(label, "Vcur_injected" + sfx, lw.attn_v, x, T, vp, vc[0],
+               &rep->proj);
+    // Stored rows: K = rope(norm(GPU projection)), V = GPU projection.
+    std::vector<float> k_want = NormHeads(kp, lw.attn_k_norm, c.rms_eps);
+    DrafterRope(c, k_want.data(), positions, c.num_kv_heads);
+    for (std::uint32_t t = 0; t < T; ++t) {
+      const std::uint32_t p = pos + t;
+      Require(p >= ring.begin && p < ring.end, label + ": ring rows missing");
+      rep->k_excess = std::max(
+          rep->k_excess,
+          CheckF16Rows(label + " stored K" + sfx + " pos " + std::to_string(p),
+                       ring.K(p, il), k_want.data() + t * kvd, kvd, 1e-6));
+      rep->v_excess = std::max(
+          rep->v_excess,
+          CheckF16Rows(label + " stored V" + sfx + " pos " + std::to_string(p),
+                       ring.V(p, il), vp.data() + t * kvd, kvd, 0.0));
+    }
+  }
+}
+
+/// Stored K/V of positions [0, N) (rows `hist`) against the oracle's
+/// Kcur_injected / Vcur_injected for the same features (same activation mode)
+/// and against the F32 oracle (the quantization noise).
+inline void CheckInjectEndToEnd(const std::string& label, const TinyDrafter& fx,
+                                const std::vector<float>& features,
+                                std::uint32_t N, bool vector,
+                                const KvRows& hist, InjectReport* rep) {
+  const ml::DFlashConfig& c = fx.config();
+  const std::size_t kvd = c.kv_dim();
+  const auto pos = Iota(0, N);
+  const auto block =
+      BlockTokens(1, 2, static_cast<std::int32_t>(c.mask_token_id));
+  const OracleTaps want = RunDrafterOracle(
+      fx, features, pos, block, static_cast<std::int32_t>(N), ModeFor(vector));
+  const OracleTaps exact =
+      RunDrafterOracle(fx, features, pos, block, static_cast<std::int32_t>(N),
+                       ref::ActivationQuant::kNone);
+  rep->has_e2e = true;
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    const std::string sfx = "-" + std::to_string(il);
+    std::vector<float> k(N * kvd), v(N * kvd);
+    for (std::uint32_t p = 0; p < N; ++p) {
+      for (std::size_t i = 0; i < kvd; ++i) {
+        k[p * kvd + i] = HalfToFloat(hist.K(p, il)[i]);
+        v[p * kvd + i] = HalfToFloat(hist.V(p, il)[i]);
+      }
+    }
+    rep->e2e_k.Merge(MeasureE2e(k, want.F("Kcur_injected" + sfx),
+                                exact.F("Kcur_injected" + sfx)));
+    rep->e2e_v.Merge(MeasureE2e(v, want.F("Vcur_injected" + sfx),
+                                exact.F("Vcur_injected" + sfx)));
+  }
+  RequireE2e(label + " stored K", rep->e2e_k);
+  RequireE2e(label + " stored V", rep->e2e_v);
+}
+
+inline void PrintInject(const InjectReport& r) {
+  std::cout << std::setprecision(3) << std::scientific << "  " << r.label
+            << ": fc " << r.enc.proj.over_bound << " of bound, k/v proj "
+            << r.proj.over_rms << " of rms (" << r.proj.over_bound
+            << " of bound, boundary codes " << r.proj.boundary_codes
+            << "), K/V F16 excess " << r.k_excess << " / " << r.v_excess;
+  if (r.has_e2e) {
+    std::cout << "\n    e2e K " << E2eText(r.e2e_k) << "\n    e2e V "
+              << E2eText(r.e2e_v);
+  }
+  std::cout << std::defaultfloat << "\n";
 }
 
 }  // namespace gufo::testing::laguna
