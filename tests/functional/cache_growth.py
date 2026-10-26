@@ -160,7 +160,8 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None,
             assert work(cold) == (total, 0, total), cold
             assert answer(warm) == answer(cold), (warm, cold)
 
-    check_messages_growth(client, model, checks, chat_result, failures, server_log)
+    check_messages_growth(client, model, checks, chat_result, failures, server_log,
+                          sampling_preset)
     assert not failures, "\n".join(failures)
 
 
@@ -184,7 +185,8 @@ def messages_result(client, body):
     }
 
 
-def check_messages_growth(client, model, checks, chat_result, failures, server_log):
+def check_messages_growth(client, model, checks, chat_result, failures, server_log,
+                          sampling_preset=None):
     """Messages clients replay thinking blocks unchanged; reuse must then cover
     the previous assistant turn, and thinking must never reach the text block."""
     for replay in ("keep_thinking", "thinking_off"):
@@ -223,7 +225,8 @@ def check_messages_growth(client, model, checks, chat_result, failures, server_l
             result = record(f"turn_{turn}", messages_result(client, body))
             total, reused, prefilled = work(result)
             assert result["text"].strip() == "BETA" and result["finish"] == "stop", result
-            assert bool(result["reasoning"].strip()) == thinking, result
+            assert reasoning_mode_matches(
+                result["reasoning"].strip(), thinking, sampling_preset), result
             if turn > 0:
                 assert total > previous_total, (total, previous_total)
                 # An unchanged replay reproduces the generated assistant turn,
@@ -269,5 +272,6 @@ def check_messages_growth(client, model, checks, chat_result, failures, server_l
             record(f"cold_control_{turn}", cold)
             total = warm["usage"]["prompt_tokens"]
             assert work(cold) == (total, 0, total), (warm, cold)
+            # The warm reply already matched the requested mode above.
             assert (cold["text"].strip(), bool(cold["reasoning"].strip())) == \
-                (warm["text"].strip(), thinking), (warm, cold)
+                (warm["text"].strip(), bool(warm["reasoning"].strip())), (warm, cold)
