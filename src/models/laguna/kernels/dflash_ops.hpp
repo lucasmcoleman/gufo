@@ -247,6 +247,39 @@ public:
                                Path path = Path::kAuto,
                                std::string* error_msg = nullptr);
 
+  /// SwiGLU FFN of drafter layer `layer` on post-ffn_norm rows:
+  /// out = (silu(normed Wg) * (normed Wu)) Wd, silu(g) = g / (1 + exp(-g)).
+  /// Q4_K gate/up, Q4_K or Q6_K down.
+  [[nodiscard]] bool Ffn(const DrafterWeights& w, std::uint32_t layer,
+                         const float* normed, float* out, std::uint32_t rows,
+                         Path path = Path::kAuto,
+                         std::string* error_msg = nullptr);
+
+  /// The drafter's output: result_norm = RMSNorm(h) * output_norm for the B
+  /// rows h[B][hidden], logits[B - 1][vocab] = result_norm rows 1..B-1 times
+  /// the target's head (`head`, Q4_K/Q6_K [hidden -> vocab]), and drafts[r] =
+  /// argmax of logits row r (the first maximum; -1 if the row has no finite
+  /// maximum). `logits` and `drafts` are device buffers. B >= 2.
+  [[nodiscard]] bool Head(const DrafterWeights& w, const DeviceMatrix& head,
+                          const float* h, std::uint32_t rows, float* logits,
+                          std::int32_t* drafts, Path path = Path::kAuto,
+                          std::string* error_msg = nullptr);
+
+  /// The block forward: B rows [anchor, MASK, ...] with embeddings
+  /// `embeddings` ([B][hidden], the target's token_embd rows, no scale) at
+  /// positions n .. n + B - 1, n = kv.committed(), through every layer
+  /// (attn_norm, Attention, residual, ffn_norm, Ffn, residual), then Head.
+  /// 2 <= B <= block_size. Each MASK row predicts the token at its own
+  /// position: logits row r - 1 and drafts[r - 1] belong to block row r, the
+  /// draft for position n + r.
+  /// Fails without touching the ring on a bad argument; a failure after a
+  /// K/V write invalidates it.
+  [[nodiscard]] bool Block(const DrafterWeights& w, const DeviceMatrix& head,
+                           DrafterKv& kv, const float* embeddings,
+                           std::uint32_t rows, float* logits,
+                           std::int32_t* drafts, Path path = Path::kAuto,
+                           std::string* error_msg = nullptr);
+
   /// Debug tap for stage-by-stage checks: the operator synchronizes the stream
   /// after each stage and calls `tap` with the stage name (the oracle's tap
   /// names, see DFlashModel::Forward, plus the raw projections), a device
@@ -257,7 +290,10 @@ public:
   /// rows are in the ring). Attention stages per layer N: Qproj-N, Kproj-N,
   /// Vcur-N, attn_gate_proj-N (projections), Qcur-N (q after norm and rope;
   /// the block's K/V are in the ring from here), attn_out-N (before the gate),
-  /// attn_gate_softplus-N, attn_gated-N, attn_o_proj-N.
+  /// attn_gate_softplus-N, attn_gated-N, attn_o_proj-N. FFN stages per
+  /// layer: ffn_gate-N, ffn_up-N, ffn_swiglu-N, ffn_out-N. Head: result_norm
+  /// (all B rows), result_output (rows 1..B-1). Block adds inp_noise_embd,
+  /// noise_norm-N, ffn_inp-N, ffn_norm-N and l_out-N.
   using TapFn = std::function<void(std::string_view name, const float* device,
                                    std::size_t count)>;
   void SetTap(TapFn tap) { tap_ = std::move(tap); }
@@ -295,6 +331,12 @@ private:
   bool AttentionImpl(const DrafterWeights& w, std::uint32_t layer,
                      DrafterKv& kv, const float* normed, std::uint32_t rows,
                      float* out, bool vector, std::string* error_msg);
+  bool FfnImpl(const DrafterWeights& w, std::uint32_t layer,
+               const float* normed, float* out, std::uint32_t rows, bool vector,
+               std::string* error_msg);
+  bool HeadImpl(const DrafterWeights& w, const DeviceMatrix& head,
+                const float* h, std::uint32_t rows, float* logits,
+                std::int32_t* drafts, bool vector, std::string* error_msg);
   bool CheckInject(const DrafterWeights& w, const DrafterKv& kv,
                    std::uint32_t rows, std::uint32_t start,
                    std::string* error_msg) const;
@@ -305,6 +347,7 @@ private:
   std::string fail_after_;
   bool initialized_{false};
   Scratch ids_, aux_, u_, fused_, x_, k_, v_, q_, gate_, attn_;
+  Scratch fg_, fu_, fa_, h_, n_, o_, r_;
 };
 
 }  // namespace gufo::models::laguna::rocm

@@ -440,11 +440,15 @@ struct E2e {
   double max{0};        ///< max |diff| / rms to the matching oracle
   double noise_rms{0};  ///< RelRms to the F32 oracle
   double noise_max{0};
+  /// RelRms between the oracle's two GPU activation modes (Q8_1 and MMQ):
+  /// how far two valid quantization chains drift apart. -1: not measured.
+  double cross_rms{-1};
   void Merge(const E2e& o) {
     rms = std::max(rms, o.rms);
     max = std::max(max, o.max);
     noise_rms = std::max(noise_rms, o.noise_rms);
     noise_max = std::max(noise_max, o.noise_max);
+    cross_rms = std::max(cross_rms, o.cross_rms);
   }
 };
 
@@ -459,19 +463,31 @@ inline E2e MeasureE2e(const std::vector<float>& got,
   return e;
 }
 
-/// The arithmetic is checked exactly stage by stage (captured activations);
-/// end to end the two sides quantize their own (float-noise different)
-/// intermediates, so Q8 codes at rounding ties flip and the flips compound
-/// through later projections. The end-to-end bound is therefore a sanity
-/// bound that any wiring error (wrong weight, mask, position, tap) exceeds:
-/// it is at or above the quantization noise itself. The GPU must sit at most
-/// a quarter of the noise's rms distance from the oracle in its own mode, and
-/// its worst element at most half the noise's worst.
+/// The arithmetic is checked exactly stage by stage (captured activations).
+/// End to end, the two sides quantize their own intermediates, which differ
+/// by float noise, so Q8 codes at rounding ties flip; a flip changes later
+/// inputs, which flips more codes downstream, and the two quantization chains
+/// drift apart layer by layer. Measured on the tiny random drafters: after
+/// one layer the GPU-to-matched-oracle distance is half the quantization
+/// noise, after three it equals it, exactly as the oracle's own Q8_1 and MMQ
+/// modes drift apart (cross_rms). So:
+///  * a single stage on identical input (`tight`): rms under a quarter of
+///    the noise and worst element under half of it;
+///  * a composed chain (`cross_rms` measured): rms and worst element within
+///    twice the larger of the noise and the cross-mode distance, a sanity
+///    bound at noise scale. A wiring error (wrong weight, mask, position,
+///    tap) moves the result by 0.3 to 1.5 of rms, ten to a hundred times
+///    more; the stage checks are what judge the arithmetic.
 inline void RequireE2e(const std::string& what, const E2e& e) {
-  if (!(e.rms <= 0.25 * e.noise_rms && e.max <= 0.5 * e.noise_max)) {
+  const bool tight = e.rms <= 0.25 * e.noise_rms && e.max <= 0.5 * e.noise_max;
+  const bool chain = e.cross_rms >= 0 &&
+                     e.rms <= 2.0 * std::max(e.noise_rms, e.cross_rms) &&
+                     e.max <= 2.0 * e.noise_max;
+  if (!(tight || chain)) {
     std::ostringstream m;
     m << what << ": differs from the oracle by " << e.rms << " rms / " << e.max
-      << " max of rms; Q8 noise " << e.noise_rms << " / " << e.noise_max;
+      << " max of rms; Q8 noise " << e.noise_rms << " / " << e.noise_max
+      << ", Q8_1-vs-MMQ oracles " << e.cross_rms;
     Require(false, m.str());
   }
 }
@@ -480,6 +496,9 @@ inline std::string E2eText(const E2e& e) {
   std::ostringstream m;
   m << std::setprecision(3) << std::scientific << e.rms << " rms / " << e.max
     << " max vs Q8 noise " << e.noise_rms << " / " << e.noise_max;
+  if (e.cross_rms >= 0) {
+    m << ", Q8_1-vs-MMQ oracles " << e.cross_rms;
+  }
   return m.str();
 }
 
@@ -1106,6 +1125,267 @@ inline void PrintAttnCheck(const AttnCheckReport& r) {
               << E2eText(r.o);
   }
   std::cout << std::defaultfloat << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// FFN, head and the composed block
+// ---------------------------------------------------------------------------
+
+/// A device copy of the target's head (in 6e the resident DeviceModel's
+/// output() is passed instead), with ggml's 512-column row padding.
+class DeviceHead {
+public:
+  explicit DeviceHead(const ml::TensorRef& t) {
+    const std::size_t size = t.SizeBytes();
+    const std::size_t tail = t.RowBytes() * 512 / t.cols;
+    CheckHip(hipMalloc(&ptr_, size + tail), "hipMalloc head");
+    CheckHip(hipMemcpy(ptr_, t.data, size, hipMemcpyHostToDevice), "head");
+    CheckHip(hipMemset(static_cast<char*>(ptr_) + size, 0, tail), "head pad");
+    m_.data = ptr_;
+    m_.type = t.type;
+    m_.cols = static_cast<std::uint32_t>(t.cols);
+    m_.rows = static_cast<std::uint32_t>(t.rows);
+    m_.experts = 1;
+  }
+  ~DeviceHead() { (void)hipFree(ptr_); }
+  DeviceHead(const DeviceHead&) = delete;
+  DeviceHead& operator=(const DeviceHead&) = delete;
+  [[nodiscard]] const gpu::DeviceMatrix& matrix() const { return m_; }
+
+private:
+  void* ptr_{nullptr};
+  gpu::DeviceMatrix m_;
+};
+
+struct FfnCheckReport {
+  ProjStats proj;
+  double swiglu_rel{0};
+};
+
+/// Stages of one FFN call: gate and up against their captures (one
+/// quantization of the shared input when the layouts agree), SwiGLU from the
+/// GPU's own gate/up, down against its capture. Throws on any failure.
+inline void CheckFfnStages(const std::string& label, const TinyDrafter& fx,
+                           std::uint32_t layer,
+                           const std::vector<float>& normed, std::uint32_t T,
+                           bool vector, const Taps& taps, FfnCheckReport* rep) {
+  const ml::DFlashLayerWeights& lw = fx.drafter.layers[layer];
+  const std::string sfx = "-" + std::to_string(layer);
+  const auto gc =
+      StageCaptures(taps, "ffn_gate" + sfx, 1, lw.ffn_gate.type, vector, label);
+  const auto uc =
+      StageCaptures(taps, "ffn_up" + sfx, 1, lw.ffn_up.type, vector, label);
+  const std::string why = SharedInputMismatch({&gc[0], &uc[0]});
+  Require(why.empty(), label + ": ffn input" + sfx + ": " + why);
+  const auto& g = taps.F("ffn_gate" + sfx);
+  const auto& u = taps.F("ffn_up" + sfx);
+  CheckStage(label, "ffn_gate" + sfx, lw.ffn_gate, normed, T, g, gc[0],
+             &rep->proj);
+  CheckStage(label, "ffn_up" + sfx, lw.ffn_up, normed, T, u, uc[0], &rep->proj);
+  std::vector<float> act(g.size());
+  for (std::size_t i = 0; i < g.size(); ++i) {
+    act[i] = (g[i] / (1.0F + std::exp(-g[i]))) * u[i];
+  }
+  ExpectRelNear(taps.F("ffn_swiglu" + sfx), act, 1e-5, 1e-7, &rep->swiglu_rel,
+                label + " swiglu" + sfx);
+  const auto dc =
+      StageCaptures(taps, "ffn_out" + sfx, 1, lw.ffn_down.type, vector, label);
+  CheckStage(label, "ffn_down" + sfx, lw.ffn_down, taps.F("ffn_swiglu" + sfx),
+             T, taps.F("ffn_out" + sfx), dc[0], &rep->proj);
+}
+
+/// Top-1 agreement of GPU drafts with the oracle's, each disagreement
+/// explained by a near tie: in the oracle's logits the GPU's token must be
+/// within `tie` of the oracle's best.
+struct Top1 {
+  std::size_t rows{0};
+  std::size_t agree{0};
+  double worst_gap{0};  ///< largest oracle gap of a disagreement
+  std::vector<std::string> notes;
+};
+
+inline Top1 CompareDrafts(const std::vector<std::int32_t>& drafts,
+                          const std::vector<float>& gpu_logits,
+                          const std::vector<float>& oracle_logits,
+                          std::size_t vocab, double tie) {
+  Top1 t;
+  const auto best = ref::RowArgmax(oracle_logits, vocab);
+  t.rows = best.size();
+  Require(drafts.size() == t.rows, "CompareDrafts: rows");
+  for (std::size_t r = 0; r < t.rows; ++r) {
+    const auto gpu_best = static_cast<std::uint32_t>(drafts[r]);
+    if (gpu_best == best[r]) {
+      ++t.agree;
+      continue;
+    }
+    const float* o = oracle_logits.data() + r * vocab;
+    const double gap = static_cast<double>(o[best[r]]) - o[gpu_best];
+    t.worst_gap = std::max(t.worst_gap, gap);
+    std::ostringstream m;
+    m << "row " << r << ": gpu " << gpu_best << " oracle " << best[r]
+      << ", oracle gap " << gap << " (gpu gap "
+      << gpu_logits[r * vocab + gpu_best] - gpu_logits[r * vocab + best[r]]
+      << ")";
+    t.notes.push_back(m.str());
+    Require(gap <= tie, "draft disagrees with the oracle beyond a near tie: " +
+                            m.str() + ", tie bound " + std::to_string(tie));
+  }
+  return t;
+}
+
+/// Max |gpu - oracle| over all logits.
+inline double MaxAbs(const std::vector<float>& a, const std::vector<float>& b) {
+  return MaxAbsDiff(a, b);
+}
+
+struct HeadCheckReport {
+  ProjStats proj;
+  double norm_rel{0};
+};
+
+/// Head stages: result_norm from the GPU's input rows, the head projection
+/// against its capture, drafts equal to the argmax of the GPU's own logits.
+inline void CheckHeadStages(const std::string& label, const TinyDrafter& fx,
+                            const std::vector<float>& h, std::uint32_t B,
+                            bool vector, const Taps& taps,
+                            const std::vector<float>& logits,
+                            const std::vector<std::int32_t>& drafts,
+                            HeadCheckReport* rep) {
+  const ml::DFlashConfig& c = fx.config();
+  const std::size_t H = c.hidden_size;
+  const std::size_t V = fx.target.output.rows;
+  const auto out_w = Values(fx.drafter.output_norm);
+  const auto& normed = taps.F("result_norm");
+  CheckNorm(label + " result_norm", normed,
+            NormRows(h, H, out_w.data(), 1, c.rms_eps), &rep->norm_rel);
+  const std::vector<float> rows(normed.begin() + H, normed.end());
+  const auto hc = StageCaptures(taps, "result_output", 1, fx.target.output.type,
+                                vector, label);
+  CheckStage(label, "result_output", fx.target.output, rows, B - 1,
+             taps.F("result_output"), hc[0], &rep->proj);
+  Require(BitIdentical(taps.F("result_output"), logits),
+          label + ": logits differ from the result_output tap");
+  const auto best = ref::RowArgmax(logits, V);
+  for (std::size_t r = 0; r < best.size(); ++r) {
+    Require(drafts[r] == static_cast<std::int32_t>(best[r]),
+            label + ": draft " + std::to_string(r) +
+                " is not the argmax of its logits row");
+  }
+}
+
+/// The target's token_embd rows of `tokens` (no scale), as the executor
+/// gathers them.
+inline std::vector<float> Embeddings(const ml::ModelWeights& target,
+                                     const std::vector<std::int32_t>& tokens) {
+  const std::size_t H = target.token_embd.cols;
+  std::vector<float> e(tokens.size() * H);
+  for (std::size_t r = 0; r < tokens.size(); ++r) {
+    ref::DequantizeRow(
+        target.token_embd.type,
+        static_cast<const std::uint8_t*>(target.token_embd.data) +
+            static_cast<std::size_t>(tokens[r]) * target.token_embd.RowBytes(),
+        e.data() + r * H, H);
+  }
+  return e;
+}
+
+struct BlockReport {
+  std::string label;
+  AttnCheckReport attn;
+  FfnCheckReport ffn;
+  HeadCheckReport head;
+  double norm_rel{0};
+  std::vector<E2e> l_out;  ///< per layer vs the oracle
+  E2e logits;
+  double logit_abs{0};  ///< max |gpu - oracle| logit
+  Top1 top1;
+};
+
+/// Every stage of a tapped Block run from the GPU's own upstream stages
+/// (attention as CheckAttentionStages, FFN, residuals bitwise, head), then
+/// the layer outputs and logits end to end against the oracle and the drafts'
+/// top-1 agreement (disagreements must be near ties). Throws on any failure.
+inline BlockReport CheckBlock(
+    const std::string& label, const TinyDrafter& fx, const BlockSpec& b,
+    const std::vector<float>& embeddings, const Taps& taps, const KvRows& ring,
+    const std::vector<float>& logits, const std::vector<std::int32_t>& drafts,
+    const OracleTaps& matched, const OracleTaps& exact,
+    const OracleTaps& other_mode) {
+  BlockReport rep;
+  rep.label = label;
+  const ml::DFlashConfig& c = fx.config();
+  const std::size_t H = c.hidden_size;
+  Require(BitIdentical(taps.F("inp_noise_embd"), embeddings),
+          label + ": block input differs from the embeddings");
+  const std::vector<float>* h = &taps.F("inp_noise_embd");
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    const std::string sfx = "-" + std::to_string(il);
+    const ml::DFlashLayerWeights& lw = fx.drafter.layers[il];
+    const auto an = Values(lw.attn_norm);
+    const auto& noise = taps.F("noise_norm" + sfx);
+    CheckNorm(label + " noise_norm" + sfx, noise,
+              NormRows(*h, H, an.data(), 1, c.rms_eps), &rep.norm_rel);
+    BlockSpec lb = b;
+    lb.layer = il;
+    CheckAttentionStages(label, fx, lb, noise, taps, ring, &rep.attn);
+    const auto& o = taps.F("attn_o_proj" + sfx);
+    std::vector<float> sum(o.size());
+    for (std::size_t i = 0; i < sum.size(); ++i) {
+      sum[i] = o[i] + (*h)[i];
+    }
+    Require(BitIdentical(taps.F("ffn_inp" + sfx), sum),
+            label + ": ffn_inp" + sfx + " is not attn_o_proj + h");
+    const auto fnw = Values(lw.ffn_norm);
+    const auto& fn = taps.F("ffn_norm" + sfx);
+    CheckNorm(label + " ffn_norm" + sfx, fn,
+              NormRows(taps.F("ffn_inp" + sfx), H, fnw.data(), 1, c.rms_eps),
+              &rep.norm_rel);
+    CheckFfnStages(label, fx, il, fn, b.B, b.vector, taps, &rep.ffn);
+    const auto& f = taps.F("ffn_out" + sfx);
+    const auto& x = taps.F("ffn_inp" + sfx);
+    for (std::size_t i = 0; i < sum.size(); ++i) {
+      sum[i] = f[i] + x[i];
+    }
+    Require(BitIdentical(taps.F("l_out" + sfx), sum),
+            label + ": l_out" + sfx + " is not ffn_out + ffn_inp");
+    h = &taps.F("l_out" + sfx);
+    rep.l_out.push_back(
+        MeasureE2e(*h, matched.F("l_out" + sfx), exact.F("l_out" + sfx)));
+    rep.l_out.back().cross_rms =
+        RelRms(other_mode.F("l_out" + sfx), matched.F("l_out" + sfx));
+  }
+  CheckHeadStages(label, fx, *h, b.B, b.vector, taps, logits, drafts,
+                  &rep.head);
+  rep.logits = MeasureE2e(logits, matched.logits, exact.logits);
+  rep.logits.cross_rms = RelRms(other_mode.logits, matched.logits);
+  rep.logit_abs = MaxAbs(logits, matched.logits);
+  for (std::size_t il = 0; il < rep.l_out.size(); ++il) {
+    RequireE2e(label + " l_out-" + std::to_string(il), rep.l_out[il]);
+  }
+  RequireE2e(label + " logits", rep.logits);
+  // A disagreement is a near tie when the oracle's own gap is within twice the
+  // largest logit difference between the two sides.
+  rep.top1 = CompareDrafts(drafts, logits, matched.logits,
+                           fx.target.output.rows, 2.0 * rep.logit_abs);
+  return rep;
+}
+
+inline void PrintBlock(const BlockReport& r) {
+  std::cout << std::setprecision(3) << std::scientific << "  " << r.label
+            << ": proj " << r.attn.proj.over_bound << "/"
+            << r.ffn.proj.over_bound << "/" << r.head.proj.over_bound
+            << " of bound (attn/ffn/head), attn " << r.attn.attn_over_rms
+            << " (plain float " << r.attn.attn_float_over_rms << ")";
+  for (std::size_t il = 0; il < r.l_out.size(); ++il) {
+    std::cout << "\n    l_out-" << il << " " << E2eText(r.l_out[il]);
+  }
+  std::cout << "\n    logits " << E2eText(r.logits) << ", max abs "
+            << r.logit_abs << std::defaultfloat << "\n    top-1 "
+            << r.top1.agree << "/" << r.top1.rows;
+  for (const auto& n : r.top1.notes) {
+    std::cout << "; " << n;
+  }
+  std::cout << "\n";
 }
 
 }  // namespace gufo::testing::laguna

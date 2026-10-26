@@ -33,6 +33,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "tests/models/laguna/dflash_gpu.hpp"
@@ -887,6 +888,484 @@ void TestAttentionNegative() {
   ++g_cases;
 }
 
+// ---------------------------------------------------------------------------
+// FFN, head and the composed block
+// ---------------------------------------------------------------------------
+
+/// The oracle's dense SwiGLU of a drafter layer (DFlashModel calls the same).
+std::vector<float> OracleFfn(const TinyDrafter& fx, std::uint32_t layer,
+                             const std::vector<float>& x, std::size_t T,
+                             ref::ActivationQuant mode) {
+  ml::LayerWeights dense;
+  dense.moe = false;
+  dense.ffn_gate = fx.drafter.layers[layer].ffn_gate;
+  dense.ffn_up = fx.drafter.layers[layer].ffn_up;
+  dense.ffn_down = fx.drafter.layers[layer].ffn_down;
+  ml::Config config;
+  config.hidden_size = fx.config().hidden_size;
+  ref::Options o;
+  o.activation_quant = mode;
+  return ref::FfnForward(config, dense, x.data(), T, o, {}, -1);
+}
+
+void TestFfn() {
+  std::cout << "ffn\n";
+  for (const DrafterShape* shape : {&kDraftGeom, &kDraftOdd}) {
+    TinyDrafter fx(*shape, 0xFF0 + shape->hidden);
+    DrafterCtx ctx(fx.drafter);
+    const std::size_t H = fx.config().hidden_size;
+    for (std::uint32_t layer = 0; layer < fx.config().num_layers; ++layer) {
+      for (const gpu::Path path : {gpu::Path::kVector, gpu::Path::kBatched}) {
+        for (const std::uint32_t T : {1U, 5U, 16U, 32U}) {
+          std::vector<float> x = RandomRows(T, H, fx.rng());
+          AvoidTies(&x, T, H);
+          const bool vector = path == gpu::Path::kVector;
+          float* dx = ToDevice(x);
+          float* dout = nullptr;
+          CheckHip(hipMalloc(&dout, T * H * sizeof(float)), "alloc");
+          Taps taps;
+          std::string error;
+          bool ok = false;
+          {
+            TapScope scope(ctx.ops(), &taps);
+            ok = ctx.ops().Ffn(ctx.weights(), layer, dx, dout, T, path, &error);
+            CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+          }
+          Require(ok, "Ffn failed: " + error);
+          const auto out = ToHost(dout, T * H);
+          std::ostringstream l;
+          l << shape->name << " ffn L" << layer << " ("
+            << gufo::core::ToString(fx.drafter.layers[layer].ffn_down.type)
+            << " down) T=" << T << " " << PathName(path);
+          FfnCheckReport rep;
+          CheckFfnStages(l.str(), fx, layer, x, T, vector, taps, &rep);
+          Require(BitIdentical(out, taps.F("ffn_out-" + std::to_string(layer))),
+                  l.str() + ": output differs from the ffn_out tap");
+          const E2e e = MeasureE2e(
+              out, OracleFfn(fx, layer, x, T, ModeFor(vector)),
+              OracleFfn(fx, layer, x, T, ref::ActivationQuant::kNone));
+          RequireE2e(l.str(), e);
+          Require(
+              ctx.ops().Ffn(ctx.weights(), layer, dx, dout, T, path, &error),
+              "Ffn failed: " + error);
+          CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+          Require(BitIdentical(ToHost(dout, T * H), out),
+                  l.str() + ": untapped run differs");
+          if (T == 16 || T == 1) {
+            std::cout << std::setprecision(3) << std::scientific << "  "
+                      << l.str() << ": proj " << rep.proj.over_rms << " ("
+                      << rep.proj.over_bound << " of bound), swiglu "
+                      << rep.swiglu_rel << ", e2e " << E2eText(e)
+                      << std::defaultfloat << "\n";
+          }
+          (void)hipFree(dx);
+          (void)hipFree(dout);
+          ++g_cases;
+        }
+      }
+    }
+  }
+}
+
+void TestHead() {
+  std::cout << "head\n";
+  for (const DrafterShape* shape : {&kDraftGeom, &kDraftOdd}) {
+    TinyDrafter fx(*shape, 0x4EAD + shape->hidden);
+    DrafterCtx ctx(fx.drafter);
+    DeviceHead head(fx.target.output);
+    const ml::DFlashConfig& c = fx.config();
+    const std::size_t H = c.hidden_size;
+    const std::size_t V = fx.target.output.rows;
+    const auto out_w = Values(fx.drafter.output_norm);
+    for (const gpu::Path path : {gpu::Path::kVector, gpu::Path::kBatched}) {
+      for (const std::uint32_t B : {2U, 5U, 16U}) {
+        const bool vector = path == gpu::Path::kVector;
+        const std::vector<float> h = RandomRows(B, H, fx.rng());
+        float* dh = ToDevice(h);
+        float* dl = nullptr;
+        std::int32_t* dd = nullptr;
+        CheckHip(hipMalloc(&dl, (B - 1) * V * sizeof(float)), "alloc");
+        CheckHip(hipMalloc(&dd, (B - 1) * sizeof(std::int32_t)), "alloc");
+        Taps taps;
+        std::string error;
+        bool ok = false;
+        {
+          TapScope scope(ctx.ops(), &taps);
+          ok = ctx.ops().Head(ctx.weights(), head.matrix(), dh, B, dl, dd, path,
+                              &error);
+          CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+        }
+        Require(ok, "Head failed: " + error);
+        const auto logits = ToHost(dl, (B - 1) * V);
+        const auto drafts = ToHost(dd, B - 1);
+        std::ostringstream l;
+        l << shape->name << " head B=" << B << " " << PathName(path);
+        HeadCheckReport rep;
+        CheckHeadStages(l.str(), fx, h, B, vector, taps, logits, drafts, &rep);
+        // End to end: the oracle's norm and head product.
+        const auto normed = NormRows(h, H, out_w.data(), 1, c.rms_eps);
+        const auto oracle = [&](ref::ActivationQuant mode) {
+          std::vector<float> y((B - 1) * V);
+          ref::MatMulRows(fx.target.output, 0, normed.data() + H, B - 1,
+                          y.data(), OracleOptions(mode));
+          return y;
+        };
+        const auto want = oracle(ModeFor(vector));
+        const E2e e =
+            MeasureE2e(logits, want, oracle(ref::ActivationQuant::kNone));
+        RequireE2e(l.str(), e);
+        const Top1 t =
+            CompareDrafts(drafts, logits, want, V, 2.0 * MaxAbs(logits, want));
+        std::cout << std::setprecision(3) << std::scientific << "  " << l.str()
+                  << ": head " << rep.proj.over_rms << " ("
+                  << rep.proj.over_bound << " of bound), e2e " << E2eText(e)
+                  << std::defaultfloat << ", top-1 " << t.agree << "/" << t.rows
+                  << "\n";
+        Require(ctx.ops().Head(ctx.weights(), head.matrix(), dh, B, dl, dd,
+                               path, &error),
+                "Head failed: " + error);
+        CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+        Require(BitIdentical(ToHost(dl, (B - 1) * V), logits) &&
+                    ToHost(dd, B - 1) == drafts,
+                l.str() + ": untapped run differs");
+        (void)hipFree(dh);
+        (void)hipFree(dl);
+        (void)hipFree(dd);
+        ++g_cases;
+      }
+    }
+  }
+}
+
+struct BlockRun {
+  std::vector<float> logits;
+  std::vector<std::int32_t> drafts;
+  Taps taps;
+  KvRows ring;
+};
+
+BlockRun RunBlock(DrafterCtx& ctx, const gpu::DrafterWeights& w,
+                  const gpu::DeviceMatrix& head, gpu::DrafterKv& kv,
+                  const std::vector<float>& embeddings, std::uint32_t B,
+                  gpu::Path path, bool tapped) {
+  BlockRun run;
+  const std::size_t V = head.rows;
+  float* de = ToDevice(embeddings);
+  float* dl = nullptr;
+  std::int32_t* dd = nullptr;
+  CheckHip(hipMalloc(&dl, (B - 1) * V * sizeof(float)), "alloc");
+  CheckHip(hipMalloc(&dd, (B - 1) * sizeof(std::int32_t)), "alloc");
+  std::string error;
+  bool ok = false;
+  if (tapped) {
+    TapScope scope(ctx.ops(), &run.taps);
+    ok = ctx.ops().Block(w, head, kv, de, B, dl, dd, path, &error);
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+  } else {
+    ok = ctx.ops().Block(w, head, kv, de, B, dl, dd, path, &error);
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+  }
+  Require(ok, "Block failed: " + error);
+  Require(run.taps.capture_error.empty() && run.taps.pending.empty(),
+          "activation capture failed");
+  run.logits = ToHost(dl, (B - 1) * V);
+  run.drafts = ToHost(dd, B - 1);
+  const std::uint32_t n = kv.committed();
+  const std::uint32_t lo = n >= w.window ? n - w.window : 0U;
+  run.ring =
+      ReadRing(kv, std::max({lo, kv.floor(), kv.retained_begin()}), n + B);
+  (void)hipFree(de);
+  (void)hipFree(dl);
+  (void)hipFree(dd);
+  return run;
+}
+
+/// The composed block forward against the oracle, then: untapped bitwise,
+/// a repeated call bitwise (the block's own ring rows are rewritten), shorter
+/// blocks equal the prefix bit for bit, and injecting the next rows over the
+/// block rows gives the same next block as a ring that never held them.
+void BlockCase(TinyDrafter& fx, DrafterCtx& ctx, const gpu::DeviceMatrix& head,
+               const BlockSpec& b, std::uint32_t chunk,
+               const std::vector<std::uint32_t>& prefixes = {}) {
+  const ml::DFlashConfig& c = fx.config();
+  const gpu::Path path = b.vector ? gpu::Path::kVector : gpu::Path::kBatched;
+  Context cx = MakeContext(fx, ctx, ctx.weights(), b.floor, b.n, chunk, path);
+  const auto block =
+      BlockTokens(static_cast<std::int32_t>(fx.rng()() % c.vocab_size), b.B,
+                  static_cast<std::int32_t>(c.mask_token_id));
+  const auto ctx_pos = Iota(static_cast<std::int32_t>(b.floor), b.n - b.floor);
+  const OracleTaps matched =
+      RunDrafterOracle(fx, cx.features, ctx_pos, block,
+                       static_cast<std::int32_t>(b.n), ModeFor(b.vector));
+  const OracleTaps exact = RunDrafterOracle(fx, cx.features, ctx_pos, block,
+                                            static_cast<std::int32_t>(b.n),
+                                            ref::ActivationQuant::kNone);
+  const OracleTaps other_mode =
+      RunDrafterOracle(fx, cx.features, ctx_pos, block,
+                       static_cast<std::int32_t>(b.n), ModeFor(!b.vector));
+  const auto emb = Embeddings(fx.target, block);
+  std::ostringstream l;
+  l << fx.shape().name << " block n=" << b.n;
+  if (b.floor != 0) {
+    l << " floor=" << b.floor;
+  }
+  l << " B=" << b.B << " " << PathName(path);
+  const std::string label = l.str();
+  const BlockRun run =
+      RunBlock(ctx, ctx.weights(), head, *cx.kv, emb, b.B, path, true);
+  PrintBlock(CheckBlock(label, fx, b, emb, run.taps, run.ring, run.logits,
+                        run.drafts, matched, exact, other_mode));
+  Require(cx.kv->committed() == b.n && cx.kv->valid(),
+          label + ": the block moved committed()");
+  for (int rerun = 0; rerun < 2; ++rerun) {
+    const BlockRun again =
+        RunBlock(ctx, ctx.weights(), head, *cx.kv, emb, b.B, path, false);
+    Require(
+        BitIdentical(again.logits, run.logits) && again.drafts == run.drafts,
+        label + ": untapped or repeated block differs");
+  }
+  const std::size_t V = head.rows;
+  for (const std::uint32_t sb : prefixes) {
+    const std::vector<float> e(emb.begin(),
+                               emb.begin() + std::size_t{sb} * c.hidden_size);
+    const BlockRun shorter =
+        RunBlock(ctx, ctx.weights(), head, *cx.kv, e, sb, path, false);
+    Require(std::memcmp(shorter.logits.data(), run.logits.data(),
+                        (sb - 1) * V * sizeof(float)) == 0 &&
+                std::equal(shorter.drafts.begin(), shorter.drafts.end(),
+                           run.drafts.begin()),
+            label + ": a block of " + std::to_string(sb) +
+                " rows differs from the prefix");
+  }
+  if (!prefixes.empty()) {
+    std::cout << "    blocks of";
+    for (const auto pb : prefixes) {
+      std::cout << " " << pb;
+    }
+    std::cout << " rows: logits and drafts equal the prefix bit for bit\n";
+  }
+  // Next step: inject rows n .. n + 2 (over the block rows), draft at n + 3,
+  // against a ring that only ever held the context.
+  {
+    const auto more = RandomFeatures(3, c.tap_count(), c.hidden_size, fx.rng());
+    float* dm = ToDevice(more);
+    std::string error;
+    Require(ctx.ops().Inject(ctx.weights(), *cx.kv, dm, 3, b.n, path, &error),
+            "inject after block: " + error);
+    std::vector<float> all = cx.features;
+    all.insert(all.end(), more.begin(), more.end());
+    auto fresh = gpu::DrafterKv::Create(ctx.weights(), chunk, &error);
+    Require(fresh.has_value(), "kv: " + error);
+    fresh->Reset(b.floor);
+    float* da = ToDevice(all);
+    for (std::uint32_t p = b.floor; p < b.n + 3; p += chunk) {
+      const std::uint32_t rows = std::min(chunk, b.n + 3 - p);
+      Require(ctx.ops().Inject(
+                  ctx.weights(), *fresh,
+                  da + std::size_t{p - b.floor} * c.fused_input_width(), rows,
+                  p, path, &error),
+              "fresh inject: " + error);
+    }
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+    const BlockRun next =
+        RunBlock(ctx, ctx.weights(), head, *cx.kv, emb, b.B, path, false);
+    const BlockRun want =
+        RunBlock(ctx, ctx.weights(), head, *fresh, emb, b.B, path, false);
+    // The chunking of the two injections differs, which the per-row encoder
+    // and K/V do not see: the next block must agree bit for bit.
+    Require(
+        BitIdentical(next.logits, want.logits) && next.drafts == want.drafts,
+        label +
+            ": the next block after overwriting the block rows "
+            "differs from a ring that never held them");
+    (void)hipFree(dm);
+    (void)hipFree(da);
+  }
+  ++g_cases;
+}
+
+void TestBlock() {
+  std::cout << "block forward\n";
+  {
+    TinyDrafter fx(kDraftGeom, 0xB10C);
+    DrafterCtx ctx(fx.drafter);
+    DeviceHead head(fx.target.output);
+    for (const bool vector : {true, false}) {
+      BlockCase(fx, ctx, head.matrix(), {0, 0, 9, 16, vector}, 32);
+      BlockCase(fx, ctx, head.matrix(), {0, 0, 512, 16, vector}, 32,
+                {2, 4, 5, 8});
+      BlockCase(fx, ctx, head.matrix(), {0, 0, 513, 8, vector}, 32);
+      BlockCase(fx, ctx, head.matrix(), {0, 0, 700, 4, vector}, 32);
+      BlockCase(fx, ctx, head.matrix(), {0, 100, 300, 5, vector}, 32);
+    }
+  }
+  {
+    TinyDrafter fx(kDraftOdd, 0x0DDB10C);
+    DrafterCtx ctx(fx.drafter);
+    DeviceHead head(fx.target.output);
+    for (const bool vector : {true, false}) {
+      BlockCase(fx, ctx, head.matrix(), {0, 0, 37, 16, vector}, 16, {4, 8});
+      BlockCase(fx, ctx, head.matrix(), {0, 0, 100, 2, vector}, 16);
+    }
+  }
+}
+
+void TestBlockNegative() {
+  std::cout << "block negative\n";
+  TinyDrafter fx(kDraftGeom, 0xB10CBAD);
+  DrafterCtx ctx(fx.drafter);
+  DeviceHead head(fx.target.output);
+  const ml::DFlashConfig& c = fx.config();
+  Context cx =
+      MakeContext(fx, ctx, ctx.weights(), 0, 40, 32, gpu::Path::kVector);
+  const std::size_t H = c.hidden_size;
+  std::vector<float> emb(17 * H, 0.1F);
+  float* de = ToDevice(emb);
+  float* dl = nullptr;
+  std::int32_t* dd = nullptr;
+  CheckHip(hipMalloc(&dl, 16 * head.matrix().rows * sizeof(float)), "alloc");
+  CheckHip(hipMalloc(&dd, 16 * sizeof(std::int32_t)), "alloc");
+  std::string error;
+  const auto refuse = [&](const std::string& what, std::uint32_t B,
+                          const gpu::DeviceMatrix& hd) {
+    Require(!ctx.ops().Block(ctx.weights(), hd, *cx.kv, de, B, dl, dd,
+                             gpu::Path::kBatched, &error),
+            "accepted: " + what);
+    Require(cx.kv->valid() && cx.kv->committed() == 40,
+            what + ": refusal changed the ring");
+    std::cout << "  refused " << what << ": " << error << "\n";
+  };
+  refuse("a block of 17 rows (block_size 16)", 17, head.matrix());
+  refuse("a block of 1 row", 1, head.matrix());
+  gpu::DeviceMatrix bad = head.matrix();
+  bad.cols += 256;
+  refuse("a head of another hidden size", 4, bad);
+  // A failure in the last layer's FFN (after every K/V write) invalidates.
+  ctx.ops().SetFailAfterStage("ffn_up-2");
+  Require(!ctx.ops().Block(ctx.weights(), head.matrix(), *cx.kv, de, 4, dl, dd,
+                           gpu::Path::kVector, &error),
+          "injected failure did not fail");
+  ctx.ops().SetFailAfterStage("");
+  CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+  Require(!cx.kv->valid(), "a failure after the K/V writes left it valid");
+  std::cout << "  failure after the K/V writes invalidates: " << error << "\n";
+  (void)hipFree(de);
+  (void)hipFree(dl);
+  (void)hipFree(dd);
+  ++g_cases;
+}
+
+/// Two sessions on two streams (own DFlashOps, ring and scratch each) run
+/// injection and blocks concurrently from two threads, untapped, many times:
+/// every result must equal the same work run alone, bit for bit. A shared
+/// scratch (or qfn_mmq arena) between streams would race here.
+void TestConcurrentStreams() {
+  std::cout << "concurrent streams\n";
+  TinyDrafter fx(kDraftGeom, 0xC0C0);
+  const ml::DFlashConfig& c = fx.config();
+  DeviceHead head(fx.target.output);
+  struct Work {
+    std::vector<float> features;
+    std::vector<float> emb;
+    std::uint32_t n;
+    std::uint32_t B;
+    gpu::Path path;
+  };
+  std::vector<Work> work;
+  for (int i = 0; i < 2; ++i) {
+    Work w;
+    w.n = i == 0 ? 520 : 300;
+    w.B = i == 0 ? 16 : 8;
+    w.path = i == 0 ? gpu::Path::kVector : gpu::Path::kBatched;
+    w.features = RandomFeatures(w.n, c.tap_count(), c.hidden_size, fx.rng());
+    w.emb = Embeddings(
+        fx.target,
+        BlockTokens(7 + i, w.B, static_cast<std::int32_t>(c.mask_token_id)));
+    work.push_back(std::move(w));
+  }
+  // One session: inject the context in 32-row chunks, draft, repeat `reps`
+  // times (Reset in between). Returns the logits and drafts of every rep.
+  const auto session = [&](DrafterCtx& ctx, const Work& w, int reps,
+                           std::vector<float>* logits,
+                           std::vector<std::int32_t>* drafts) {
+    std::string error;
+    auto kv = gpu::DrafterKv::Create(ctx.weights(), 32, &error);
+    Require(kv.has_value(), "kv: " + error);
+    float* df = ToDevice(w.features);
+    float* de = ToDevice(w.emb);
+    const std::size_t V = head.matrix().rows;
+    float* dl = nullptr;
+    std::int32_t* dd = nullptr;
+    CheckHip(hipMalloc(&dl, (w.B - 1) * V * sizeof(float)), "alloc");
+    CheckHip(hipMalloc(&dd, (w.B - 1) * sizeof(std::int32_t)), "alloc");
+    for (int rep = 0; rep < reps; ++rep) {
+      kv->Reset(0);
+      for (std::uint32_t p = 0; p < w.n; p += 32) {
+        const std::uint32_t rows = std::min(32U, w.n - p);
+        Require(ctx.ops().Inject(ctx.weights(), *kv,
+                                 df + std::size_t{p} * c.fused_input_width(),
+                                 rows, p, gpu::Path::kVector, &error),
+                "inject: " + error);
+      }
+      Require(ctx.ops().Block(ctx.weights(), head.matrix(), *kv, de, w.B, dl,
+                              dd, w.path, &error),
+              "block: " + error);
+      CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+      const auto l = ToHost(dl, (w.B - 1) * V);
+      const auto d = ToHost(dd, w.B - 1);
+      logits->insert(logits->end(), l.begin(), l.end());
+      drafts->insert(drafts->end(), d.begin(), d.end());
+    }
+    (void)hipFree(df);
+    (void)hipFree(de);
+    (void)hipFree(dl);
+    (void)hipFree(dd);
+  };
+  constexpr int kReps = 6;
+  std::vector<float> solo_l[2];
+  std::vector<std::int32_t> solo_d[2];
+  {
+    DrafterCtx ctx(fx.drafter);
+    for (int i = 0; i < 2; ++i) {
+      session(ctx, work[i], 1, &solo_l[i], &solo_d[i]);
+    }
+  }
+  DrafterCtx ctx0(fx.drafter);
+  DrafterCtx ctx1(fx.drafter);
+  std::vector<float> par_l[2];
+  std::vector<std::int32_t> par_d[2];
+  std::string failure[2];
+  std::thread t1([&] {
+    try {
+      session(ctx1, work[1], kReps, &par_l[1], &par_d[1]);
+    } catch (const std::exception& e) {
+      failure[1] = e.what();
+    }
+  });
+  try {
+    session(ctx0, work[0], kReps, &par_l[0], &par_d[0]);
+  } catch (const std::exception& e) {
+    failure[0] = e.what();
+  }
+  t1.join();
+  for (int i = 0; i < 2; ++i) {
+    Require(failure[i].empty(), "concurrent session failed: " + failure[i]);
+    for (int rep = 0; rep < kReps; ++rep) {
+      const std::size_t nl = solo_l[i].size();
+      const std::size_t nd = solo_d[i].size();
+      Require(std::memcmp(par_l[i].data() + rep * nl, solo_l[i].data(),
+                          nl * sizeof(float)) == 0 &&
+                  std::equal(solo_d[i].begin(), solo_d[i].end(),
+                             par_d[i].begin() + rep * nd),
+              "concurrent session " + std::to_string(i) + " rep " +
+                  std::to_string(rep) + " differs from the solo run");
+    }
+  }
+  std::cout << "  2 streams x " << kReps
+            << " (inject + block, vector and batched) equal the solo runs\n";
+  ++g_cases;
+}
+
 }  // namespace
 
 int main() {
@@ -899,6 +1378,11 @@ int main() {
     TestInjectNegative();
     TestAttention();
     TestAttentionNegative();
+    TestFfn();
+    TestHead();
+    TestBlock();
+    TestBlockNegative();
+    TestConcurrentStreams();
     std::cout << "PASS: laguna.dflash_ops (" << g_cases << " cases)\n";
     return 0;
   } catch (const std::exception& e) {

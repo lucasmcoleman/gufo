@@ -383,6 +383,65 @@ __global__ void GateKernel(float* __restrict__ gate, float* __restrict__ attn) {
   }
 }
 
+/// act = silu(gate) * up, silu(g) = g / (1 + exp(-g)) (the oracle's).
+__global__ void SwiGluKernel(const float* __restrict__ gate,
+                             const float* __restrict__ up,
+                             float* __restrict__ act, std::size_t count) {
+  const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (i < count) {
+    const float g = gate[i];
+    act[i] = (g / (1.0F + expf(-g))) * up[i];
+  }
+}
+
+__global__ void AddKernel(const float* __restrict__ a,
+                          const float* __restrict__ b, float* __restrict__ out,
+                          std::size_t count) {
+  const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (i < count) {
+    out[i] = a[i] + b[i];
+  }
+}
+
+constexpr int kArgmaxThreads = 256;
+
+/// drafts[r] = the first index of the largest value of logits row r (NaN
+/// never wins; -1 when no element is larger than -inf). One block per row.
+__global__ void ArgmaxKernel(const float* __restrict__ logits,
+                             std::int32_t* __restrict__ drafts,
+                             std::uint32_t vocab) {
+  const float* row = logits + std::size_t{blockIdx.x} * vocab;
+  float best = -INFINITY;
+  std::int32_t arg = -1;
+  for (std::uint32_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+    if (row[i] > best) {  // strict: the first maximum of this thread wins
+      best = row[i];
+      arg = static_cast<std::int32_t>(i);
+    }
+  }
+  __shared__ float value[kArgmaxThreads];
+  __shared__ std::int32_t index[kArgmaxThreads];
+  value[threadIdx.x] = best;
+  index[threadIdx.x] = arg;
+  __syncthreads();
+  for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const float v = value[threadIdx.x + stride];
+      const std::int32_t j = index[threadIdx.x + stride];
+      const std::int32_t i = index[threadIdx.x];
+      if (j >= 0 && (i < 0 || v > value[threadIdx.x] ||
+                     (v == value[threadIdx.x] && j < i))) {
+        value[threadIdx.x] = v;
+        index[threadIdx.x] = j;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    drafts[blockIdx.x] = index[0];
+  }
+}
+
 // ---- Upload ----------------------------------------------------------------
 
 /// Copies `t` to the device (appending the allocation to `owned`). Quantized
@@ -645,8 +704,8 @@ DFlashOps::DFlashOps(hipStream_t stream)
 
 DFlashOps::~DFlashOps() {
   (void)hipStreamSynchronize(stream_);
-  for (Scratch* s :
-       {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_, &q_, &gate_, &attn_}) {
+  for (Scratch* s : {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_, &q_, &gate_,
+                     &attn_, &fg_, &fu_, &fa_, &h_, &n_, &o_, &r_}) {
     Free(s);
   }
 }
@@ -654,7 +713,8 @@ DFlashOps::~DFlashOps() {
 std::size_t DFlashOps::scratch_bytes() const noexcept {
   std::size_t total = 0;
   for (const Scratch* s :
-       {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_, &q_, &gate_, &attn_}) {
+       {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_, &q_, &gate_, &attn_, &fg_,
+        &fu_, &fa_, &h_, &n_, &o_, &r_}) {
     total += s->capacity;
   }
   return total;
@@ -1098,6 +1158,184 @@ bool DFlashOps::AttentionImpl(const DrafterWeights& w, std::uint32_t layer,
     kv.retained_begin_ = std::max(kv.retained_begin_, n + rows - kv.capacity_);
   }
   return true;
+}
+
+bool DFlashOps::Ffn(const DrafterWeights& w, std::uint32_t layer,
+                    const float* normed, float* out, std::uint32_t rows,
+                    Path path, std::string* error_msg) {
+  bool vector = false;
+  if (!Ready(path, rows, &vector, error_msg)) {
+    return false;
+  }
+  if (!GeometryConsistent(w) || layer >= w.layers.size()) {
+    Assign(error_msg, "laguna dflash: inconsistent drafter weights or layer");
+    return false;
+  }
+  if (normed == nullptr || out == nullptr) {
+    Assign(error_msg, "laguna dflash: null ffn input or output");
+    return false;
+  }
+  return FfnImpl(w, layer, normed, out, rows, vector, error_msg);
+}
+
+bool DFlashOps::FfnImpl(const DrafterWeights& w, std::uint32_t layer,
+                        const float* normed, float* out, std::uint32_t rows,
+                        bool vector, std::string* error_msg) {
+  const DrafterLayer& l = w.layers[layer];
+  const int il = static_cast<int>(layer);
+  const std::size_t count = std::size_t{rows} * w.ffn;
+  if (!PrepareIds(rows, error_msg) ||
+      !Reserve(&fg_, count * sizeof(float), error_msg) ||
+      !Reserve(&fu_, count * sizeof(float), error_msg) ||
+      !Reserve(&fa_, count * sizeof(float), error_msg)) {
+    return false;
+  }
+  float* gate = static_cast<float*>(fg_.ptr);
+  float* up = static_cast<float*>(fu_.ptr);
+  float* act = static_cast<float*>(fa_.ptr);
+  if (!Project(l.ffn_gate, normed, gate, rows, vector, error_msg) ||
+      !Emit("ffn_gate", il, gate, count, error_msg) ||
+      !Project(l.ffn_up, normed, up, rows, vector, error_msg) ||
+      !Emit("ffn_up", il, up, count, error_msg)) {
+    return false;
+  }
+  SwiGluKernel<<<(count + 255) / 256, 256, 0, stream_>>>(gate, up, act, count);
+  return CheckHip(hipGetLastError(), "swiglu launch", error_msg) &&
+         Emit("ffn_swiglu", il, act, count, error_msg) &&
+         Project(l.ffn_down, act, out, rows, vector, error_msg) &&
+         Emit("ffn_out", il, out, std::size_t{rows} * w.hidden, error_msg);
+}
+
+bool DFlashOps::Head(const DrafterWeights& w, const DeviceMatrix& head,
+                     const float* h, std::uint32_t rows, float* logits,
+                     std::int32_t* drafts, Path path, std::string* error_msg) {
+  bool vector = false;
+  if (!Ready(path, rows, &vector, error_msg)) {
+    return false;
+  }
+  if (rows < 2 || w.output_norm == nullptr || w.hidden == 0) {
+    Assign(error_msg, "laguna dflash head: bad rows or weights");
+    return false;
+  }
+  if (!ProjectionType(head.type) || head.experts != 1 || head.data == nullptr ||
+      head.cols != w.hidden || head.rows == 0) {
+    Assign(error_msg, "laguna dflash head: the target head does not match");
+    return false;
+  }
+  if (h == nullptr || logits == nullptr || drafts == nullptr) {
+    Assign(error_msg, "laguna dflash head: null input or output");
+    return false;
+  }
+  return HeadImpl(w, head, h, rows, logits, drafts, vector, error_msg);
+}
+
+bool DFlashOps::HeadImpl(const DrafterWeights& w, const DeviceMatrix& head,
+                         const float* h, std::uint32_t rows, float* logits,
+                         std::int32_t* drafts, bool vector,
+                         std::string* error_msg) {
+  const std::size_t H = w.hidden;
+  if (!PrepareIds(rows, error_msg) ||
+      !Reserve(&n_, rows * H * sizeof(float), error_msg)) {
+    return false;
+  }
+  float* normed = static_cast<float*>(n_.ptr);
+  RmsNormKernel<<<rows, kNormThreads, 0, stream_>>>(h, w.output_norm, normed,
+                                                    w.hidden, 1, w.eps);
+  // Row 0 (the anchor) is normalized for the tap but not projected.
+  if (!CheckHip(hipGetLastError(), "output norm launch", error_msg) ||
+      !Emit("result_norm", -1, normed, rows * H, error_msg) ||
+      !Project(head, normed + H, logits, rows - 1, vector, error_msg) ||
+      !Emit("result_output", -1, logits, std::size_t{rows - 1} * head.rows,
+            error_msg)) {
+    return false;
+  }
+  ArgmaxKernel<<<rows - 1, kArgmaxThreads, 0, stream_>>>(logits, drafts,
+                                                         head.rows);
+  return CheckHip(hipGetLastError(), "argmax launch", error_msg);
+}
+
+bool DFlashOps::Block(const DrafterWeights& w, const DeviceMatrix& head,
+                      DrafterKv& kv, const float* embeddings,
+                      std::uint32_t rows, float* logits, std::int32_t* drafts,
+                      Path path, std::string* error_msg) {
+  bool vector = false;
+  if (!Ready(path, rows, &vector, error_msg) ||
+      !CheckAttention(w, 0, kv, rows, error_msg)) {
+    return false;
+  }
+  if (rows < 2 || rows > w.block_size || w.output_norm == nullptr) {
+    Assign(error_msg, "laguna dflash: a block has 2 to block_size rows");
+    return false;
+  }
+  if (!ProjectionType(head.type) || head.experts != 1 || head.data == nullptr ||
+      head.cols != w.hidden || head.rows == 0) {
+    Assign(error_msg, "laguna dflash head: the target head does not match");
+    return false;
+  }
+  if (embeddings == nullptr || logits == nullptr || drafts == nullptr) {
+    Assign(error_msg, "laguna dflash: null block input or output");
+    return false;
+  }
+  const std::size_t count = std::size_t{rows} * w.hidden;
+  // Reserve the residual buffers before anything is written; the stage
+  // helpers reserve their own scratch the same way.
+  if (!Reserve(&h_, count * sizeof(float), error_msg) ||
+      !Reserve(&r_, count * sizeof(float), error_msg) ||
+      !Reserve(&o_, count * sizeof(float), error_msg) ||
+      !Reserve(&n_, count * sizeof(float), error_msg)) {
+    return false;
+  }
+  float* h = static_cast<float*>(h_.ptr);
+  float* x = static_cast<float*>(r_.ptr);  // ffn_inp
+  float* o = static_cast<float*>(o_.ptr);
+  float* n = static_cast<float*>(n_.ptr);
+  if (!CheckHip(hipMemcpyAsync(h, embeddings, count * sizeof(float),
+                               hipMemcpyDeviceToDevice, stream_),
+                "embedding copy", error_msg) ||
+      !Emit("inp_noise_embd", -1, h, count, error_msg)) {
+    return false;
+  }
+  const unsigned add_blocks = static_cast<unsigned>((count + 255) / 256);
+  // After layer 0's attention the block's K/V are in the ring: a later
+  // failure invalidates it.
+  const auto invalidate = [&kv] {
+    kv.valid_ = false;
+    kv.committed_ = kv.floor_;
+    kv.retained_begin_ = kv.floor_;
+    return false;
+  };
+  for (std::uint32_t il = 0; il < w.layers.size(); ++il) {
+    const DrafterLayer& l = w.layers[il];
+    const int layer = static_cast<int>(il);
+    RmsNormKernel<<<rows, kNormThreads, 0, stream_>>>(h, l.attn_norm, n,
+                                                      w.hidden, 1, w.eps);
+    if (!CheckHip(hipGetLastError(), "noise norm launch", error_msg) ||
+        !Emit("noise_norm", layer, n, count, error_msg) ||
+        !AttentionImpl(w, il, kv, n, rows, o, vector, error_msg)) {
+      // AttentionImpl invalidates the ring itself once it has written; a
+      // failure before layer 0's write leaves it untouched.
+      return il == 0 ? false : invalidate();
+    }
+    AddKernel<<<add_blocks, 256, 0, stream_>>>(o, h, x, count);
+    if (!CheckHip(hipGetLastError(), "residual launch", error_msg) ||
+        !Emit("ffn_inp", layer, x, count, error_msg)) {
+      return invalidate();
+    }
+    RmsNormKernel<<<rows, kNormThreads, 0, stream_>>>(x, l.ffn_norm, n,
+                                                      w.hidden, 1, w.eps);
+    if (!CheckHip(hipGetLastError(), "ffn norm launch", error_msg) ||
+        !Emit("ffn_norm", layer, n, count, error_msg) ||
+        !FfnImpl(w, il, n, o, rows, vector, error_msg)) {
+      return invalidate();
+    }
+    AddKernel<<<add_blocks, 256, 0, stream_>>>(o, x, h, count);
+    if (!CheckHip(hipGetLastError(), "residual launch", error_msg) ||
+        !Emit("l_out", layer, h, count, error_msg)) {
+      return invalidate();
+    }
+  }
+  return HeadImpl(w, head, h, rows, logits, drafts, vector, error_msg) ||
+         invalidate();
 }
 
 }  // namespace gufo::models::laguna::rocm
