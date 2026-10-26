@@ -107,6 +107,12 @@ if (ENGINE_ENABLE_HIP)
   # sessions. Nothing is skipped.
   add_laguna_test(speculative gufo_laguna "hip;gpu;gfx1151")
   set_tests_properties(laguna.speculative PROPERTIES TIMEOUT 1800)
+  # The same exact-greedy matrix on the real target and drafter, plus the
+  # smoke A/B (speculative vs plain) as a CLI mode. Without the files it exits
+  # 77 and CTest reports a skip, which verifies nothing.
+  add_laguna_test(speculative_real gufo_laguna "hip;gpu;gfx1151;external-model")
+  set_tests_properties(laguna.speculative_real PROPERTIES SKIP_RETURN_CODE 77
+    TIMEOUT 7200)
   # CLI: the drafter's per-pass wall time (DFLASH 6d item 6). Not a test: it
   # needs the real drafter and the target's head.
   add_executable(laguna_dflash_cost dflash_cost_cli.cpp)
