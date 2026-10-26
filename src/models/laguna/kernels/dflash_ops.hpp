@@ -223,6 +223,30 @@ public:
                             std::uint32_t start, Path path = Path::kAuto,
                             std::string* error_msg = nullptr);
 
+  /// Attention block of drafter layer `layer` for B block rows at positions
+  /// n .. n + B - 1, n = kv.committed(), on their post-attn_norm rows
+  /// `normed` ([B][hidden]):
+  ///
+  ///   q, k, v, g = normed Wq, Wk, Wv, Wg        Q4_K/Q6_K, zero-id qfn_mmq
+  ///   q, k       per-head RMSNorm, NeoX RoPE at the row's position
+  ///   k, v       F16 into the ring at the block positions
+  ///   a          softmax(q K^T / sqrt(128)) V, GQA; row r at p = n + r sees
+  ///              keys j with max(p + 1 - window, kv.floor()) <= j <= p
+  ///              (the 511 - r context rows and block rows 0..r) or, with
+  ///              causal_block false, up to n + B - 1
+  ///   out        (a * softplus(g) per head) Wo
+  ///
+  /// committed() is unchanged (the block rows are overwritten by the next
+  /// injection); retained_begin() records what the block rows evicted. B is
+  /// at most kv.max_rows() (32 on Path::kVector), and the context keys the
+  /// rows read must still be retained. Fails without touching the ring on a
+  /// bad argument; a failure after the K/V write invalidates it.
+  [[nodiscard]] bool Attention(const DrafterWeights& w, std::uint32_t layer,
+                               DrafterKv& kv, const float* normed,
+                               std::uint32_t rows, float* out,
+                               Path path = Path::kAuto,
+                               std::string* error_msg = nullptr);
+
   /// Debug tap for stage-by-stage checks: the operator synchronizes the stream
   /// after each stage and calls `tap` with the stage name (the oracle's tap
   /// names, see DFlashModel::Forward, plus the raw projections), a device
@@ -230,7 +254,10 @@ public:
   /// runs untapped. Encoder stages: enc_aux_norm, fc_out, enc_norm_out.
   /// Injection stages per layer N: kv_inp_normed-N, Kproj_injected-N (x Wk),
   /// Vcur_injected-N (x Wv), then kv_stored-N (null pointer, count 0: the
-  /// rows are in the ring).
+  /// rows are in the ring). Attention stages per layer N: Qproj-N, Kproj-N,
+  /// Vcur-N, attn_gate_proj-N (projections), Qcur-N (q after norm and rope;
+  /// the block's K/V are in the ring from here), attn_out-N (before the gate),
+  /// attn_gate_softplus-N, attn_gated-N, attn_o_proj-N.
   using TapFn = std::function<void(std::string_view name, const float* device,
                                    std::size_t count)>;
   void SetTap(TapFn tap) { tap_ = std::move(tap); }
@@ -262,6 +289,12 @@ private:
   bool InjectImpl(const DrafterWeights& w, DrafterKv& kv, const float* fused,
                   std::uint32_t rows, std::uint32_t start, bool vector,
                   std::string* error_msg);
+  bool CheckAttention(const DrafterWeights& w, std::uint32_t layer,
+                      const DrafterKv& kv, std::uint32_t rows,
+                      std::string* error_msg) const;
+  bool AttentionImpl(const DrafterWeights& w, std::uint32_t layer,
+                     DrafterKv& kv, const float* normed, std::uint32_t rows,
+                     float* out, bool vector, std::string* error_msg);
   bool CheckInject(const DrafterWeights& w, const DrafterKv& kv,
                    std::uint32_t rows, std::uint32_t start,
                    std::string* error_msg) const;
@@ -271,7 +304,7 @@ private:
   TapFn tap_;
   std::string fail_after_;
   bool initialized_{false};
-  Scratch ids_, aux_, u_, fused_, x_, k_, v_;
+  Scratch ids_, aux_, u_, fused_, x_, k_, v_, q_, gate_, attn_;
 };
 
 }  // namespace gufo::models::laguna::rocm

@@ -28,8 +28,10 @@
 //
 // Negative tests mutate the input or the device view (swapped taps, wrong
 // norm row) and require the same checks to fail.
+#include <algorithm>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -566,6 +568,325 @@ void TestInjectNegative() {
   ++g_cases;
 }
 
+// ---------------------------------------------------------------------------
+// Block attention
+// ---------------------------------------------------------------------------
+
+/// Context injected into a fresh ring for a block case.
+struct Context {
+  std::vector<float> features;  ///< [n - floor][taps*hidden]
+  std::unique_ptr<gpu::DrafterKv> kv;
+};
+
+/// Injects random context rows [floor, n) in chunks of `chunk` rows.
+Context MakeContext(TinyDrafter& fx, DrafterCtx& ctx,
+                    const gpu::DrafterWeights& w, std::uint32_t floor,
+                    std::uint32_t n, std::uint32_t chunk, gpu::Path path) {
+  const ml::DFlashConfig& c = fx.config();
+  Context out;
+  out.features =
+      RandomFeatures(n - floor, c.tap_count(), c.hidden_size, fx.rng());
+  std::string error;
+  auto kv = gpu::DrafterKv::Create(w, chunk, &error);
+  Require(kv.has_value(), "kv: " + error);
+  out.kv = std::make_unique<gpu::DrafterKv>(std::move(*kv));
+  out.kv->Reset(floor);
+  float* df = ToDevice(out.features);
+  for (std::uint32_t p = floor; p < n; p += chunk) {
+    const std::uint32_t rows = std::min(chunk, n - p);
+    Require(ctx.ops().Inject(
+                w, *out.kv, df + std::size_t{p - floor} * c.fused_input_width(),
+                rows, p, path, &error),
+            "context inject: " + error);
+  }
+  CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+  (void)hipFree(df);
+  return out;
+}
+
+struct AttnRun {
+  std::vector<float> out;
+  Taps taps;
+  KvRows ring;
+};
+
+AttnRun RunAttention(DrafterCtx& ctx, const gpu::DrafterWeights& w,
+                     gpu::DrafterKv& kv, const BlockSpec& b,
+                     const std::vector<float>& normed, bool tapped) {
+  AttnRun run;
+  const std::size_t H = w.hidden;
+  float* dn = ToDevice(normed);
+  float* dout = nullptr;
+  CheckHip(hipMalloc(&dout, std::size_t{b.B} * H * sizeof(float)), "alloc");
+  const gpu::Path path = b.vector ? gpu::Path::kVector : gpu::Path::kBatched;
+  std::string error;
+  bool ok = false;
+  if (tapped) {
+    TapScope scope(ctx.ops(), &run.taps);
+    ok = ctx.ops().Attention(w, b.layer, kv, dn, b.B, dout, path, &error);
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+  } else {
+    ok = ctx.ops().Attention(w, b.layer, kv, dn, b.B, dout, path, &error);
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+  }
+  Require(ok, "Attention failed: " + error);
+  Require(run.taps.capture_error.empty() && run.taps.pending.empty(),
+          "activation capture failed");
+  run.out = ToHost(dout, std::size_t{b.B} * H);
+  const std::uint32_t lo =
+      b.n >= w.window ? b.n - w.window : 0U;  // one key past the window
+  run.ring =
+      ReadRing(kv, std::max({lo, kv.floor(), kv.retained_begin()}), b.n + b.B);
+  (void)hipFree(dn);
+  (void)hipFree(dout);
+  return run;
+}
+
+std::string BlockLabel(const TinyDrafter& fx, const BlockSpec& b) {
+  std::ostringstream l;
+  l << fx.shape().name << " attn L" << b.layer << " n=" << b.n;
+  if (b.floor != 0) {
+    l << " floor=" << b.floor;
+  }
+  l << " B=" << b.B << " " << (b.vector ? "vector" : "batched");
+  return l.str();
+}
+
+/// One block attention case: tapped and checked against the oracle, then
+/// untapped (bitwise equal, ring context and bookkeeping unchanged), then the
+/// shorter blocks in `prefixes`, whose rows must equal this block's first
+/// rows bit for bit.
+void AttentionCase(TinyDrafter& fx, DrafterCtx& ctx, const BlockSpec& b,
+                   std::uint32_t chunk,
+                   const std::vector<std::uint32_t>& prefixes = {}) {
+  const ml::DFlashConfig& c = fx.config();
+  const gpu::Path path = b.vector ? gpu::Path::kVector : gpu::Path::kBatched;
+  Context cx = MakeContext(fx, ctx, ctx.weights(), b.floor, b.n, chunk, path);
+  const auto block =
+      BlockTokens(static_cast<std::int32_t>(fx.rng()() % c.vocab_size), b.B,
+                  static_cast<std::int32_t>(c.mask_token_id));
+  const auto ctx_pos = Iota(static_cast<std::int32_t>(b.floor), b.n - b.floor);
+  const OracleTaps matched =
+      RunDrafterOracle(fx, cx.features, ctx_pos, block,
+                       static_cast<std::int32_t>(b.n), ModeFor(b.vector));
+  const OracleTaps exact = RunDrafterOracle(fx, cx.features, ctx_pos, block,
+                                            static_cast<std::int32_t>(b.n),
+                                            ref::ActivationQuant::kNone);
+  const auto& normed = matched.F("noise_norm-" + std::to_string(b.layer));
+  const std::string label = BlockLabel(fx, b);
+  const std::uint32_t committed = cx.kv->committed();
+  // The context rows the block can read; rows below the window may be
+  // evicted by the block's own writes (retained_begin records it).
+  const std::uint32_t visible =
+      std::max({b.n + 1 > c.sliding_window ? b.n + 1 - c.sliding_window : 0U,
+                b.floor, cx.kv->retained_begin()});
+  const std::uint32_t retained_after =
+      b.n + b.B > cx.kv->capacity()
+          ? std::max(cx.kv->retained_begin(), b.n + b.B - cx.kv->capacity())
+          : cx.kv->retained_begin();
+  const KvRows context_before = ReadRing(*cx.kv, visible, b.n);
+  const AttnRun run = RunAttention(ctx, ctx.weights(), *cx.kv, b, normed, true);
+  AttnCheckReport rep;
+  rep.label = label;
+  CheckAttentionStages(label, fx, b, normed, run.taps, run.ring, &rep);
+  Require(BitIdentical(run.out,
+                       run.taps.F("attn_o_proj-" + std::to_string(b.layer))),
+          label + ": output differs from the attn_o_proj tap");
+  CheckAttentionEndToEnd(label, b, run.taps, matched, exact, &rep);
+  PrintAttnCheck(rep);
+  Require(cx.kv->committed() == committed && cx.kv->valid() &&
+              cx.kv->retained_begin() == retained_after,
+          label + ": block pass bookkeeping (committed " +
+              std::to_string(cx.kv->committed()) + ", retained " +
+              std::to_string(cx.kv->retained_begin()) + ")");
+  Require(SameRows(ReadRing(*cx.kv, context_before.begin, b.n), context_before),
+          label + ": the block pass changed context rows");
+  const AttnRun plain =
+      RunAttention(ctx, ctx.weights(), *cx.kv, b, normed, false);
+  Require(BitIdentical(plain.out, run.out),
+          label + ": untapped run differs from the tapped run");
+  const std::size_t H = c.hidden_size;
+  for (const std::uint32_t short_b : prefixes) {
+    BlockSpec s = b;
+    s.B = short_b;
+    const std::vector<float> head(normed.begin(),
+                                  normed.begin() + std::size_t{short_b} * H);
+    const AttnRun shorter =
+        RunAttention(ctx, ctx.weights(), *cx.kv, s, head, false);
+    Require(std::memcmp(shorter.out.data(), run.out.data(),
+                        shorter.out.size() * sizeof(float)) == 0,
+            label + ": a block of " + std::to_string(short_b) +
+                " rows differs from the prefix of the longer block");
+  }
+  if (!prefixes.empty()) {
+    std::cout << "    blocks of";
+    for (const auto pb : prefixes) {
+      std::cout << " " << pb;
+    }
+    std::cout << " rows equal the prefix bit for bit\n";
+  }
+  ++g_cases;
+}
+
+void TestAttention() {
+  std::cout << "block attention\n";
+  {
+    TinyDrafter fx(kDraftGeom, 0xA77E);
+    DrafterCtx ctx(fx.drafter);
+    for (const bool vector : {true, false}) {
+      for (const std::uint32_t n : {9U, 511U, 512U, 513U}) {
+        AttentionCase(fx, ctx, {0, 0, n, 16, vector}, 32,
+                      n == 512 ? std::vector<std::uint32_t>{2, 4, 5, 8}
+                               : std::vector<std::uint32_t>{});
+      }
+      // Last layer: Q6_K attn_v.
+      AttentionCase(fx, ctx, {2, 0, 513, 8, vector}, 32, {4});
+      // Ring wrapped (capacity 544): context 188..699 from slots reused.
+      AttentionCase(fx, ctx, {1, 0, 700, 16, vector}, 32);
+      // Session starting at 200: row r sees only 320 + r context rows.
+      AttentionCase(fx, ctx, {0, 200, 520, 5, vector}, 32);
+      // A block of one row (anchor only) and of two.
+      AttentionCase(fx, ctx, {0, 0, 600, 2, vector}, 32, {1});
+    }
+  }
+  {
+    TinyDrafter fx(kDraftOdd, 0x0DDA77);
+    DrafterCtx ctx(fx.drafter);
+    for (const bool vector : {true, false}) {
+      for (const std::uint32_t n : {36U, 37U, 38U}) {
+        AttentionCase(fx, ctx, {0, 0, n, 16, vector}, 16,
+                      n == 37 ? std::vector<std::uint32_t>{4, 8}
+                              : std::vector<std::uint32_t>{});
+      }
+      // Capacity 53: the ring wraps several times.
+      AttentionCase(fx, ctx, {1, 0, 100, 16, vector}, 16);
+    }
+  }
+}
+
+/// Mutations of the device view must fail the attention checks; bad
+/// arguments are refused without touching the ring; a failure after the
+/// block's K/V write invalidates the ring.
+void TestAttentionNegative() {
+  std::cout << "block attention negative\n";
+  TinyDrafter fx(kDraftGeom, 0xA77EBAD);
+  DrafterCtx ctx(fx.drafter);
+  const ml::DFlashConfig& c = fx.config();
+  for (const bool vector : {true, false}) {
+    const gpu::Path path = vector ? gpu::Path::kVector : gpu::Path::kBatched;
+    const BlockSpec b{0, 0, 513, 16, vector};
+    const auto run_mutated = [&](const std::string& what,
+                                 const gpu::DrafterWeights& w) {
+      Context cx = MakeContext(fx, ctx, w, b.floor, b.n, 32, path);
+      const auto block =
+          BlockTokens(5, b.B, static_cast<std::int32_t>(c.mask_token_id));
+      const OracleTaps matched =
+          RunDrafterOracle(fx, cx.features, Iota(0, b.n), block,
+                           static_cast<std::int32_t>(b.n), ModeFor(vector));
+      const auto& normed = matched.F("noise_norm-0");
+      const AttnRun run = RunAttention(ctx, w, *cx.kv, b, normed, true);
+      AttnCheckReport rep;
+      CheckAttentionStages(what, fx, b, normed, run.taps, run.ring, &rep);
+    };
+    const std::string p = std::string(", ") + PathName(path);
+    run_mutated("baseline" + p, ctx.weights());  // must pass
+    for (const int delta : {-1, 1}) {
+      gpu::DrafterWeights w = ctx.weights();
+      w.window = static_cast<std::uint32_t>(static_cast<int>(w.window) + delta);
+      MustFail("window " + std::to_string(w.window) + p,
+               [&] { run_mutated("window", w); });
+    }
+    {
+      gpu::DrafterWeights w = ctx.weights();
+      w.causal_block = false;
+      MustFail("non-causal block" + p, [&] { run_mutated("non-causal", w); });
+    }
+    {
+      gpu::DrafterWeights w = ctx.weights();
+      ref::RopeParams rp;
+      rp.n_rot = 128;
+      rp.freq_base = 10000.0F;
+      w.rope.theta_scale = ref::MakeRopeSetup(rp).theta_scale;
+      MustFail("rope theta 10000" + p, [&] { run_mutated("theta", w); });
+    }
+    {
+      gpu::DrafterWeights w = ctx.weights();
+      std::swap(w.layers[0].k, w.layers[0].v);
+      MustFail("K and V swapped" + p, [&] { run_mutated("swapped", w); });
+    }
+    ++g_cases;
+  }
+
+  // Refusals.
+  const std::size_t H = c.hidden_size;
+  std::vector<float> normed(16 * H, 0.5F);
+  float* dn = ToDevice(normed);
+  float* dout = nullptr;
+  CheckHip(hipMalloc(&dout, 17 * H * sizeof(float)), "alloc");
+  std::string error;
+  Context cx =
+      MakeContext(fx, ctx, ctx.weights(), 0, 700, 32, gpu::Path::kVector);
+  Require(cx.kv->retained_begin() == 156, "wrapped ring retained_begin");
+  const auto refuse = [&](const std::string& what, std::uint32_t layer,
+                          std::uint32_t rows, gpu::Path path) {
+    const std::uint32_t committed = cx.kv->committed();
+    const std::uint32_t retained = cx.kv->retained_begin();
+    Require(!ctx.ops().Attention(ctx.weights(), layer, *cx.kv, dn, rows, dout,
+                                 path, &error),
+            "accepted: " + what);
+    Require(cx.kv->valid() && cx.kv->committed() == committed &&
+                cx.kv->retained_begin() == retained,
+            what + ": refusal changed the ring");
+    std::cout << "  refused " << what << ": " << error << "\n";
+  };
+  refuse("a block longer than the ring's spare rows (33 > 32)", 0, 33,
+         gpu::Path::kBatched);
+  refuse("layer 3 of 3", 3, 4, gpu::Path::kVector);
+  // Rewind into evicted history: rows 300..315 rewritten, then a block at
+  // 316 would read keys from 0, but 0..155 were overwritten.
+  {
+    float* df =
+        ToDevice(RandomFeatures(16, c.tap_count(), c.hidden_size, fx.rng()));
+    Require(ctx.ops().Inject(ctx.weights(), *cx.kv, df, 16, 300,
+                             gpu::Path::kVector, &error),
+            "rewind inject: " + error);
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+    (void)hipFree(df);
+    Require(cx.kv->committed() == 316 && cx.kv->retained_begin() == 156,
+            "rewind bookkeeping");
+    refuse("a block reading evicted keys", 0, 4, gpu::Path::kVector);
+  }
+  // A failure after the block's K/V write invalidates the ring.
+  {
+    Context fresh =
+        MakeContext(fx, ctx, ctx.weights(), 0, 40, 32, gpu::Path::kVector);
+    ctx.ops().SetFailAfterStage("Qcur-0");
+    Require(!ctx.ops().Attention(ctx.weights(), 0, *fresh.kv, dn, 4, dout,
+                                 gpu::Path::kVector, &error),
+            "injected failure did not fail");
+    ctx.ops().SetFailAfterStage("");
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+    Require(!fresh.kv->valid(), "a failure after the K/V write left it valid");
+    Require(!ctx.ops().Attention(ctx.weights(), 0, *fresh.kv, dn, 4, dout,
+                                 gpu::Path::kVector, &error),
+            "an invalid ring accepted a block");
+    std::cout << "  invalidated ring refuses: " << error << "\n";
+    // A failure before the write leaves it valid.
+    Context other =
+        MakeContext(fx, ctx, ctx.weights(), 0, 40, 32, gpu::Path::kVector);
+    ctx.ops().SetFailAfterStage("Vcur-0");
+    Require(!ctx.ops().Attention(ctx.weights(), 0, *other.kv, dn, 4, dout,
+                                 gpu::Path::kVector, &error),
+            "injected failure did not fail");
+    ctx.ops().SetFailAfterStage("");
+    Require(other.kv->valid() && other.kv->committed() == 40,
+            "a failure before the K/V write changed the ring");
+  }
+  (void)hipFree(dn);
+  (void)hipFree(dout);
+  ++g_cases;
+}
+
 }  // namespace
 
 int main() {
@@ -576,6 +897,8 @@ int main() {
     TestInject();
     TestInjectOverwrite();
     TestInjectNegative();
+    TestAttention();
+    TestAttentionNegative();
     std::cout << "PASS: laguna.dflash_ops (" << g_cases << " cases)\n";
     return 0;
   } catch (const std::exception& e) {

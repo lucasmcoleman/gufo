@@ -180,6 +180,209 @@ __global__ void QkNormRopeStoreKernel(
   }
 }
 
+__device__ __forceinline__ float WaveMax(float v) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    v = fmaxf(v, __shfl_xor(v, offset));
+  }
+  return v;
+}
+__device__ __forceinline__ float WaveSum(float v) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    v += __shfl_xor(v, offset);
+  }
+  return v;
+}
+
+constexpr int kMaxWaves = kHeadDim / 32;
+
+/// grid (kv_heads, rows), block 128: the target's attention kernel
+/// (kernels/attention.hip.cpp) with the drafter's key range. A block serves
+/// the kGroup query heads of one KV head for block row t at p = start + t.
+/// Visible keys: first <= j <= last with first = max(p + 1 - window, floor)
+/// and last = p (causal) or start + rows - 1. Keys stream in tiles of 128
+/// from `first`: thread t scores key t of the tile for every head, the
+/// tile's max and sum are reduced over the block, then thread d adds the
+/// tile's V column d with online-softmax rescaling. The tile boundaries
+/// depend only on p, so a row's sum order does not depend on the block length.
+template<int kGroup>
+__global__ void BlockAttentionKernel(
+    const float* __restrict__ q, const __half* __restrict__ k_ring,
+    const __half* __restrict__ v_ring, float* __restrict__ out,
+    std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t window,
+    std::uint32_t floor, std::uint32_t start, std::uint32_t rows,
+    std::uint32_t capacity, bool causal, float scale) {
+  const std::uint32_t kvh = blockIdx.x;
+  const std::uint32_t t = blockIdx.y;
+  const std::uint32_t d = threadIdx.x;
+  const std::uint32_t p = start + t;
+  const std::uint32_t lo = p + 1 <= window ? 0 : p + 1 - window;
+  const std::uint32_t first = lo > floor ? lo : floor;
+  const std::uint32_t last = causal ? p : start + rows - 1;
+  const std::size_t kv_width = std::size_t{kv_heads} * kHeadDim;
+  __shared__ float qs[kGroup][kHeadDim];
+  __shared__ float probs[kGroup][kHeadDim];
+  __shared__ float red[kMaxWaves][kGroup];
+  const int wave = d / warpSize;
+  const int lane = d % warpSize;
+  const int waves = kHeadDim / warpSize;
+#pragma unroll
+  for (int g = 0; g < kGroup; ++g) {
+    qs[g][d] = q[(std::size_t{t} * heads + kvh * kGroup + g) * kHeadDim + d];
+  }
+  __syncthreads();
+  float m[kGroup];
+  float l[kGroup];
+  float acc[kGroup];
+#pragma unroll
+  for (int g = 0; g < kGroup; ++g) {
+    m[g] = -INFINITY;
+    l[g] = 0.0F;
+    acc[g] = 0.0F;
+  }
+  for (std::uint32_t ts = first; ts <= last; ts += kHeadDim) {
+    const std::uint32_t j = ts + d;
+    const bool valid = j <= last;
+    float s[kGroup];
+#pragma unroll
+    for (int g = 0; g < kGroup; ++g) {
+      s[g] = 0.0F;
+    }
+    if (valid) {
+      const uint4* krow = reinterpret_cast<const uint4*>(
+          k_ring + std::size_t{j % capacity} * kv_width + kvh * kHeadDim);
+      for (int c = 0; c < static_cast<int>(kHeadDim) / 8; ++c) {
+        const uint4 raw = krow[c];
+        const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
+        float kf[8];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const float2 f = __half22float2(h2[e]);
+          kf[2 * e] = f.x;
+          kf[2 * e + 1] = f.y;
+        }
+#pragma unroll
+        for (int g = 0; g < kGroup; ++g) {
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            s[g] = fmaf(qs[g][c * 8 + e], kf[e], s[g]);
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int g = 0; g < kGroup; ++g) {
+      s[g] = valid ? s[g] * scale : -INFINITY;
+    }
+#pragma unroll
+    for (int g = 0; g < kGroup; ++g) {
+      const float w = WaveMax(s[g]);
+      if (lane == 0) {
+        red[wave][g] = w;
+      }
+    }
+    __syncthreads();
+    float alpha[kGroup];
+#pragma unroll
+    for (int g = 0; g < kGroup; ++g) {
+      float tile_max = red[0][g];
+      for (int i = 1; i < waves; ++i) {
+        tile_max = fmaxf(tile_max, red[i][g]);
+      }
+      const float m_new = fmaxf(m[g], tile_max);
+      alpha[g] = expf(m[g] - m_new);
+      m[g] = m_new;
+      s[g] = valid ? expf(s[g] - m_new) : 0.0F;
+      probs[g][d] = s[g];
+    }
+    __syncthreads();  // red is rewritten below
+#pragma unroll
+    for (int g = 0; g < kGroup; ++g) {
+      const float w = WaveSum(s[g]);
+      if (lane == 0) {
+        red[wave][g] = w;
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < kGroup; ++g) {
+      float tile_sum = red[0][g];
+      for (int i = 1; i < waves; ++i) {
+        tile_sum += red[i][g];
+      }
+      l[g] = l[g] * alpha[g] + tile_sum;
+      acc[g] *= alpha[g];
+    }
+    const std::uint32_t count = min(kHeadDim, last - ts + 1);
+    for (std::uint32_t jj = 0; jj < count; ++jj) {
+      const float vv =
+          __half2float(v_ring[std::size_t{(ts + jj) % capacity} * kv_width +
+                              kvh * kHeadDim + d]);
+#pragma unroll
+      for (int g = 0; g < kGroup; ++g) {
+        acc[g] = fmaf(probs[g][jj], vv, acc[g]);
+      }
+    }
+    __syncthreads();  // probs and red are rewritten by the next tile
+  }
+#pragma unroll
+  for (int g = 0; g < kGroup; ++g) {
+    out[(std::size_t{t} * heads + kvh * kGroup + g) * kHeadDim + d] =
+        acc[g] / l[g];
+  }
+}
+
+struct AttentionArgs {
+  const float* q;
+  const __half* k;
+  const __half* v;
+  float* out;
+  std::uint32_t heads, kv_heads, window, floor, start, rows, capacity;
+  bool causal;
+  float scale;
+};
+
+bool DispatchAttention(std::uint32_t group, const AttentionArgs& a,
+                       hipStream_t stream) {
+#define LAGUNA_DFLASH_ATTN_CASE(G)                                        \
+  case G:                                                                 \
+    BlockAttentionKernel<G>                                               \
+        <<<dim3(a.kv_heads, a.rows), kHeadDim, 0, stream>>>(              \
+            a.q, a.k, a.v, a.out, a.heads, a.kv_heads, a.window, a.floor, \
+            a.start, a.rows, a.capacity, a.causal, a.scale);              \
+    return true;
+  switch (group) {
+    LAGUNA_DFLASH_ATTN_CASE(1)
+    LAGUNA_DFLASH_ATTN_CASE(2)
+    LAGUNA_DFLASH_ATTN_CASE(3)
+    LAGUNA_DFLASH_ATTN_CASE(4)
+    LAGUNA_DFLASH_ATTN_CASE(6)
+    LAGUNA_DFLASH_ATTN_CASE(8)
+    LAGUNA_DFLASH_ATTN_CASE(9)
+    LAGUNA_DFLASH_ATTN_CASE(12)
+    default:
+      return false;
+  }
+#undef LAGUNA_DFLASH_ATTN_CASE
+}
+
+bool SupportedGroup(std::uint32_t group) {
+  return group == 1 || group == 2 || group == 3 || group == 4 || group == 6 ||
+         group == 8 || group == 9 || group == 12;
+}
+
+/// gate = softplus(gate) (x > 20 ? x : log(1 + exp(x)), llama.cpp's form);
+/// attn[t][h][:] *= gate[t][h]. One block of 128 per (row, head).
+__global__ void GateKernel(float* __restrict__ gate, float* __restrict__ attn) {
+  const std::size_t idx = blockIdx.x;  // t * heads + h
+  const float g = gate[idx];
+  const float sp = g > 20.0F ? g : logf(1.0F + expf(g));
+  attn[idx * kHeadDim + threadIdx.x] *= sp;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    gate[idx] = sp;
+  }
+}
+
 // ---- Upload ----------------------------------------------------------------
 
 /// Copies `t` to the device (appending the allocation to `owned`). Quantized
@@ -442,14 +645,16 @@ DFlashOps::DFlashOps(hipStream_t stream)
 
 DFlashOps::~DFlashOps() {
   (void)hipStreamSynchronize(stream_);
-  for (Scratch* s : {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_}) {
+  for (Scratch* s :
+       {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_, &q_, &gate_, &attn_}) {
     Free(s);
   }
 }
 
 std::size_t DFlashOps::scratch_bytes() const noexcept {
   std::size_t total = 0;
-  for (const Scratch* s : {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_}) {
+  for (const Scratch* s :
+       {&ids_, &aux_, &u_, &fused_, &x_, &k_, &v_, &q_, &gate_, &attn_}) {
     total += s->capacity;
   }
   return total;
@@ -757,6 +962,141 @@ bool DFlashOps::InjectImpl(const DrafterWeights& w, DrafterKv& kv,
   }
   kv.retained_begin_ = retained;
   kv.committed_ = end;
+  return true;
+}
+
+bool DFlashOps::CheckAttention(const DrafterWeights& w, std::uint32_t layer,
+                               const DrafterKv& kv, std::uint32_t rows,
+                               std::string* error_msg) const {
+  if (!GeometryConsistent(w) || layer >= w.layers.size()) {
+    Assign(error_msg, "laguna dflash: inconsistent drafter weights or layer");
+    return false;
+  }
+  if (kv.k_.size() != w.layers.size() || kv.kv_heads_ != w.kv_heads ||
+      kv.window_ != w.window) {
+    Assign(error_msg, "laguna dflash: kv rings do not match the drafter");
+    return false;
+  }
+  if (!kv.valid_) {
+    Assign(error_msg,
+           "laguna dflash: kv invalidated by a failed call; Reset() it");
+    return false;
+  }
+  if (rows > kv.max_rows() ||
+      std::uint64_t{kv.committed_} + rows > UINT32_MAX) {
+    Assign(error_msg, "laguna dflash: block exceeds the ring");
+    return false;
+  }
+  // The first context key row 0 reads must still be in its slot.
+  const std::uint32_t n = kv.committed_;
+  const std::uint32_t lo = n + 1 <= w.window ? 0 : n + 1 - w.window;
+  if (std::max(lo, kv.floor_) < kv.retained_begin_) {
+    Assign(error_msg,
+           "laguna dflash: context keys the block needs were overwritten");
+    return false;
+  }
+  return true;
+}
+
+bool DFlashOps::Attention(const DrafterWeights& w, std::uint32_t layer,
+                          DrafterKv& kv, const float* normed,
+                          std::uint32_t rows, float* out, Path path,
+                          std::string* error_msg) {
+  bool vector = false;
+  if (!Ready(path, rows, &vector, error_msg) ||
+      !CheckAttention(w, layer, kv, rows, error_msg)) {
+    return false;
+  }
+  if (normed == nullptr || out == nullptr) {
+    Assign(error_msg, "laguna dflash: null attention input or output");
+    return false;
+  }
+  return AttentionImpl(w, layer, kv, normed, rows, out, vector, error_msg);
+}
+
+bool DFlashOps::AttentionImpl(const DrafterWeights& w, std::uint32_t layer,
+                              DrafterKv& kv, const float* normed,
+                              std::uint32_t rows, float* out, bool vector,
+                              std::string* error_msg) {
+  const DrafterLayer& l = w.layers[layer];
+  const int il = static_cast<int>(layer);
+  const std::size_t qd = std::size_t{w.heads} * kHeadDim;
+  const std::size_t kvd = std::size_t{w.kv_heads} * kHeadDim;
+  if (!PrepareIds(rows, error_msg) ||
+      !Reserve(&q_, rows * qd * sizeof(float), error_msg) ||
+      !Reserve(&k_, rows * kvd * sizeof(float), error_msg) ||
+      !Reserve(&v_, rows * kvd * sizeof(float), error_msg) ||
+      !Reserve(&gate_, std::size_t{rows} * w.heads * sizeof(float),
+               error_msg) ||
+      !Reserve(&attn_, rows * qd * sizeof(float), error_msg)) {
+    return false;
+  }
+  float* q = static_cast<float*>(q_.ptr);
+  float* k = static_cast<float*>(k_.ptr);
+  float* v = static_cast<float*>(v_.ptr);
+  float* gate = static_cast<float*>(gate_.ptr);
+  float* attn = static_cast<float*>(attn_.ptr);
+  // Each stage is emitted right after its projection, so a tap (and the
+  // activation capture of tests) sees each projection under its own name.
+  if (!Project(l.q, normed, q, rows, vector, error_msg) ||
+      !Emit("Qproj", il, q, rows * qd, error_msg) ||
+      !Project(l.k, normed, k, rows, vector, error_msg) ||
+      !Emit("Kproj", il, k, rows * kvd, error_msg) ||
+      !Project(l.v, normed, v, rows, vector, error_msg) ||
+      !Emit("Vcur", il, v, rows * kvd, error_msg) ||
+      !Project(l.gate, normed, gate, rows, vector, error_msg) ||
+      !Emit("attn_gate_proj", il, gate, std::size_t{rows} * w.heads,
+            error_msg)) {
+    return false;
+  }
+  // From here on the block's K/V may be in the ring.
+  const auto invalidate = [&kv] {
+    kv.valid_ = false;
+    kv.committed_ = kv.floor_;
+    kv.retained_begin_ = kv.floor_;
+    return false;
+  };
+  const std::uint32_t n = kv.committed_;
+  QkNormRopeStoreKernel<<<dim3(rows, w.heads + 2 * w.kv_heads), kHeadDim, 0,
+                          stream_>>>(
+      q, k, v, l.q_norm, l.k_norm, static_cast<__half*>(kv.k_[layer]),
+      static_cast<__half*>(kv.v_[layer]), w.heads, w.kv_heads, w.eps, n,
+      kv.capacity_, ToArgs(w.rope));
+  if (!CheckHip(hipGetLastError(), "qk norm rope launch", error_msg) ||
+      !Emit("Qcur", il, q, rows * qd, error_msg)) {
+    return invalidate();
+  }
+  const AttentionArgs args{q,
+                           static_cast<const __half*>(kv.k_[layer]),
+                           static_cast<const __half*>(kv.v_[layer]),
+                           attn,
+                           w.heads,
+                           w.kv_heads,
+                           w.window,
+                           kv.floor_,
+                           n,
+                           rows,
+                           kv.capacity_,
+                           w.causal_block,
+                           1.0F / std::sqrt(static_cast<float>(kHeadDim))};
+  if (!DispatchAttention(w.heads / w.kv_heads, args, stream_) ||
+      !CheckHip(hipGetLastError(), "attention launch", error_msg) ||
+      !Emit("attn_out", il, attn, rows * qd, error_msg)) {
+    return invalidate();
+  }
+  GateKernel<<<std::size_t{rows} * w.heads, kHeadDim, 0, stream_>>>(gate, attn);
+  if (!CheckHip(hipGetLastError(), "gate launch", error_msg) ||
+      !Emit("attn_gate_softplus", il, gate, std::size_t{rows} * w.heads,
+            error_msg) ||
+      !Emit("attn_gated", il, attn, rows * qd, error_msg) ||
+      !Project(l.o, attn, out, rows, vector, error_msg) ||
+      !Emit("attn_o_proj", il, out, std::size_t{rows} * w.hidden, error_msg)) {
+    return invalidate();
+  }
+  // The block rows evicted every position below n + rows - capacity.
+  if (n + rows > kv.capacity_) {
+    kv.retained_begin_ = std::max(kv.retained_begin_, n + rows - kv.capacity_);
+  }
   return true;
 }
 
