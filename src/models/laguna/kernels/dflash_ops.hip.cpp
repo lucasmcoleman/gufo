@@ -1338,4 +1338,138 @@ bool DFlashOps::Block(const DrafterWeights& w, const DeviceMatrix& head,
          invalidate();
 }
 
+// ---- DrafterSession --------------------------------------------------------
+
+DrafterSession::DrafterSession(const DrafterWeights& w,
+                               const DeviceMatrix& head,
+                               const TensorRef& token_embd,
+                               std::int32_t mask_token, hipStream_t stream)
+    : w_(w),
+      head_(head),
+      token_embd_(token_embd),
+      mask_token_(mask_token),
+      stream_(stream),
+      ops_(stream) {}
+
+DrafterSession::~DrafterSession() {
+  (void)hipStreamSynchronize(stream_);
+  for (void* p :
+       {static_cast<void*>(features_), static_cast<void*>(embeddings_),
+        static_cast<void*>(logits_), static_cast<void*>(drafts_)}) {
+    if (p != nullptr) {
+      (void)hipFree(p);
+    }
+  }
+}
+
+std::unique_ptr<DrafterSession> DrafterSession::Create(
+    const DrafterWeights& w, const DeviceMatrix& head,
+    const TensorRef& token_embd, std::int32_t mask_token,
+    std::uint32_t max_inject_rows, hipStream_t stream, std::string* error_msg) {
+  if (!GeometryConsistent(w) || w.block_size < 2 || max_inject_rows == 0) {
+    Assign(error_msg, "laguna dflash session: inconsistent drafter");
+    return nullptr;
+  }
+  if (!ProjectionType(head.type) || head.data == nullptr ||
+      head.cols != w.hidden || head.experts != 1 ||
+      token_embd.cols != w.hidden || token_embd.rows != head.rows ||
+      token_embd.data == nullptr || mask_token < 0 ||
+      static_cast<std::uint64_t>(mask_token) >= token_embd.rows) {
+    Assign(error_msg,
+           "laguna dflash session: target head or embedding does not match");
+    return nullptr;
+  }
+  std::unique_ptr<DrafterSession> s(
+      new DrafterSession(w, head, token_embd, mask_token, stream));
+  auto kv = DrafterKv::Create(w, max_inject_rows, error_msg);
+  if (!kv.has_value()) {
+    return nullptr;
+  }
+  s->kv_ = std::move(*kv);
+  s->max_inject_rows_ = max_inject_rows;
+  const std::size_t H = w.hidden;
+  const std::size_t B = w.block_size;
+  // A failure leaves `s` owning what was allocated; its destructor frees it.
+  if (!CheckHip(hipMalloc(&s->features_, std::size_t{max_inject_rows} * w.taps *
+                                             H * sizeof(float)),
+                "hipMalloc features", error_msg) ||
+      !CheckHip(hipMalloc(&s->embeddings_, B * H * sizeof(float)),
+                "hipMalloc embeddings", error_msg) ||
+      !CheckHip(hipMalloc(&s->logits_, (B - 1) * head.rows * sizeof(float)),
+                "hipMalloc logits", error_msg) ||
+      !CheckHip(hipMalloc(&s->drafts_, (B - 1) * sizeof(std::int32_t)),
+                "hipMalloc drafts", error_msg)) {
+    return nullptr;
+  }
+  return s;
+}
+
+bool DrafterSession::Inject(std::span<const float> features,
+                            std::uint32_t start, Path path,
+                            std::string* error_msg) {
+  const std::size_t width = std::size_t{w_.taps} * w_.hidden;
+  if (features.empty() || features.size() % width != 0 ||
+      features.size() / width > max_inject_rows_) {
+    Assign(error_msg, "laguna dflash session: bad feature rows");
+    return false;
+  }
+  const auto rows = static_cast<std::uint32_t>(features.size() / width);
+  // The copy is ordered after earlier work on the stream (which may still
+  // read the buffer); waiting for it releases the caller's memory.
+  if (!CheckHip(hipMemcpyAsync(features_, features.data(),
+                               features.size() * sizeof(float),
+                               hipMemcpyHostToDevice, stream_),
+                "feature upload", error_msg) ||
+      !CheckHip(hipStreamSynchronize(stream_), "feature upload sync",
+                error_msg)) {
+    return false;
+  }
+  return ops_.Inject(w_, kv_, features_, rows, start, path, error_msg);
+}
+
+bool DrafterSession::Propose(std::int32_t anchor, std::uint32_t block_rows,
+                             std::vector<std::int32_t>* drafts,
+                             std::vector<float>* logits, Path path,
+                             std::string* error_msg) {
+  if (drafts == nullptr || block_rows < 2 || block_rows > w_.block_size ||
+      anchor < 0 || static_cast<std::uint64_t>(anchor) >= token_embd_.rows) {
+    Assign(error_msg, "laguna dflash session: bad anchor or block length");
+    return false;
+  }
+  const std::size_t H = w_.hidden;
+  host_embed_.resize(block_rows * H);
+  for (std::uint32_t r = 0; r < block_rows; ++r) {
+    const std::int32_t token = r == 0 ? anchor : mask_token_;
+    reference::DequantizeRow(
+        token_embd_.type,
+        static_cast<const std::uint8_t*>(token_embd_.data) +
+            static_cast<std::size_t>(token) * token_embd_.RowBytes(),
+        host_embed_.data() + r * H, H);
+  }
+  const std::size_t rows = block_rows - 1;
+  drafts->resize(rows);
+  if (logits != nullptr) {
+    logits->resize(rows * head_.rows);
+  }
+  const bool ok = CheckHip(hipMemcpyAsync(embeddings_, host_embed_.data(),
+                                          host_embed_.size() * sizeof(float),
+                                          hipMemcpyHostToDevice, stream_),
+                           "embedding upload", error_msg) &&
+                  ops_.Block(w_, head_, kv_, embeddings_, block_rows, logits_,
+                             drafts_, path, error_msg) &&
+                  CheckHip(hipMemcpyAsync(drafts->data(), drafts_,
+                                          rows * sizeof(std::int32_t),
+                                          hipMemcpyDeviceToHost, stream_),
+                           "draft download", error_msg) &&
+                  (logits == nullptr ||
+                   CheckHip(hipMemcpyAsync(logits->data(), logits_,
+                                           logits->size() * sizeof(float),
+                                           hipMemcpyDeviceToHost, stream_),
+                            "logit download", error_msg));
+  // Wait in every case: the host buffers must outlive the copies.
+  const bool synced =
+      CheckHip(hipStreamSynchronize(stream_), "propose sync", error_msg);
+  return ok && synced;
+}
+
 }  // namespace gufo::models::laguna::rocm

@@ -55,6 +55,16 @@ inline constexpr DrafterShape kDraftGeom{"geom", 512, 768, 18,   2,
 inline constexpr DrafterShape kDraftOdd{"odd", 768, 512, 12,  3,
                                         2,     37,  2,   777, 10000.0F};
 
+/// What the checks need of a drafter: its weights and the target's
+/// embedding and head (a TinyDrafter or the real files).
+struct DraftModel {
+  const ml::DFlashWeights& drafter;
+  const ml::ModelWeights& target;
+  [[nodiscard]] const ml::DFlashConfig& config() const {
+    return drafter.config;
+  }
+};
+
 /// A random drafter (every tensor random; the last layer carries Q6_K attn_v
 /// and ffn_down as layers 2 and 5 of the real file do) plus a tiny target that
 /// supplies token_embd (Q8_0) and the head (Q6_K).
@@ -156,6 +166,8 @@ public:
   [[nodiscard]] const ml::DFlashConfig& config() const {
     return drafter.config;
   }
+  // NOLINTNEXTLINE(google-explicit-constructor): the checks take either.
+  operator DraftModel() const { return {drafter, target}; }
 
 private:
   struct Mats {
@@ -294,7 +306,7 @@ inline ref::Options OracleOptions(ref::ActivationQuant mode) {
   return o;
 }
 
-inline OracleTaps RunDrafterOracle(const TinyDrafter& fx,
+inline OracleTaps RunDrafterOracle(const DraftModel& fx,
                                    const std::vector<float>& features,
                                    const std::vector<std::int32_t>& ctx_pos,
                                    const std::vector<std::int32_t>& block,
@@ -521,7 +533,7 @@ struct EncoderReport {
 /// The encoder's stages of one tapped run against the oracle's building
 /// blocks (the GPU's own upstream stage as input). Fills the stage fields of
 /// `rep`; throws on any failure.
-inline void CheckEncoderStages(const std::string& label, const TinyDrafter& fx,
+inline void CheckEncoderStages(const std::string& label, const DraftModel& fx,
                                const std::vector<float>& features,
                                std::uint32_t T, bool vector, const Taps& taps,
                                EncoderReport* rep) {
@@ -548,7 +560,7 @@ inline void CheckEncoderStages(const std::string& label, const TinyDrafter& fx,
 /// stage and end to end against the oracle. `features` are what the oracle
 /// is given (a mutated GPU input must therefore fail). Throws on any failure.
 inline EncoderReport CheckEncoder(const std::string& label,
-                                  const TinyDrafter& fx,
+                                  const DraftModel& fx,
                                   const std::vector<float>& features,
                                   std::uint32_t T, bool vector,
                                   const Taps& taps,
@@ -701,7 +713,7 @@ inline std::vector<float> NormHeads(const std::vector<float>& x,
 /// Stages of one injection chunk (rows at positions pos .. pos + T - 1,
 /// features `features`) from its taps, and the ring rows it stored (`ring`,
 /// read right after the call). Throws on any failure.
-inline void CheckInjectChunk(const std::string& label, const TinyDrafter& fx,
+inline void CheckInjectChunk(const std::string& label, const DraftModel& fx,
                              const std::vector<float>& features,
                              std::uint32_t T, std::uint32_t pos, bool vector,
                              const Taps& taps, const KvRows& ring,
@@ -755,7 +767,7 @@ inline void CheckInjectChunk(const std::string& label, const TinyDrafter& fx,
 /// Stored K/V of positions [0, N) (rows `hist`) against the oracle's
 /// Kcur_injected / Vcur_injected for the same features (same activation mode)
 /// and against the F32 oracle (the quantization noise).
-inline void CheckInjectEndToEnd(const std::string& label, const TinyDrafter& fx,
+inline void CheckInjectEndToEnd(const std::string& label, const DraftModel& fx,
                                 const std::vector<float>& features,
                                 std::uint32_t N, bool vector,
                                 const KvRows& hist, InjectReport* rep) {
@@ -923,8 +935,8 @@ struct AttnCheckReport {
 /// the double oracle over the ring as stored (with window and causality
 /// probes), the softplus gate, and the output projection. `ring` holds the
 /// rows [ring.begin, n + B) read after the call. Throws on any failure.
-inline void CheckAttentionStages(const std::string& label,
-                                 const TinyDrafter& fx, const BlockSpec& b,
+inline void CheckAttentionStages(const std::string& label, const DraftModel& fx,
+                                 const BlockSpec& b,
                                  const std::vector<float>& normed,
                                  const Taps& taps, const KvRows& ring,
                                  AttnCheckReport* rep) {
@@ -1165,7 +1177,7 @@ struct FfnCheckReport {
 /// Stages of one FFN call: gate and up against their captures (one
 /// quantization of the shared input when the layouts agree), SwiGLU from the
 /// GPU's own gate/up, down against its capture. Throws on any failure.
-inline void CheckFfnStages(const std::string& label, const TinyDrafter& fx,
+inline void CheckFfnStages(const std::string& label, const DraftModel& fx,
                            std::uint32_t layer,
                            const std::vector<float>& normed, std::uint32_t T,
                            bool vector, const Taps& taps, FfnCheckReport* rep) {
@@ -1245,7 +1257,7 @@ struct HeadCheckReport {
 
 /// Head stages: result_norm from the GPU's input rows, the head projection
 /// against its capture, drafts equal to the argmax of the GPU's own logits.
-inline void CheckHeadStages(const std::string& label, const TinyDrafter& fx,
+inline void CheckHeadStages(const std::string& label, const DraftModel& fx,
                             const std::vector<float>& h, std::uint32_t B,
                             bool vector, const Taps& taps,
                             const std::vector<float>& logits,
@@ -1306,7 +1318,7 @@ struct BlockReport {
 /// the layer outputs and logits end to end against the oracle and the drafts'
 /// top-1 agreement (disagreements must be near ties). Throws on any failure.
 inline BlockReport CheckBlock(
-    const std::string& label, const TinyDrafter& fx, const BlockSpec& b,
+    const std::string& label, const DraftModel& fx, const BlockSpec& b,
     const std::vector<float>& embeddings, const Taps& taps, const KvRows& ring,
     const std::vector<float>& logits, const std::vector<std::int32_t>& drafts,
     const OracleTaps& matched, const OracleTaps& exact,
@@ -1386,6 +1398,49 @@ inline void PrintBlock(const BlockReport& r) {
     std::cout << "; " << n;
   }
   std::cout << "\n";
+}
+
+struct BlockRun {
+  std::vector<float> logits;
+  std::vector<std::int32_t> drafts;
+  Taps taps;
+  KvRows ring;
+};
+
+inline BlockRun RunBlock(DrafterCtx& ctx, const gpu::DrafterWeights& w,
+                         const gpu::DeviceMatrix& head, gpu::DrafterKv& kv,
+                         const std::vector<float>& embeddings, std::uint32_t B,
+                         gpu::Path path, bool tapped) {
+  BlockRun run;
+  const std::size_t V = head.rows;
+  float* de = ToDevice(embeddings);
+  float* dl = nullptr;
+  std::int32_t* dd = nullptr;
+  CheckHip(hipMalloc(&dl, (B - 1) * V * sizeof(float)), "alloc");
+  CheckHip(hipMalloc(&dd, (B - 1) * sizeof(std::int32_t)), "alloc");
+  std::string error;
+  bool ok = false;
+  if (tapped) {
+    TapScope scope(ctx.ops(), &run.taps);
+    ok = ctx.ops().Block(w, head, kv, de, B, dl, dd, path, &error);
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+  } else {
+    ok = ctx.ops().Block(w, head, kv, de, B, dl, dd, path, &error);
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+  }
+  Require(ok, "Block failed: " + error);
+  Require(run.taps.capture_error.empty() && run.taps.pending.empty(),
+          "activation capture failed");
+  run.logits = ToHost(dl, (B - 1) * V);
+  run.drafts = ToHost(dd, B - 1);
+  const std::uint32_t n = kv.committed();
+  const std::uint32_t lo = n >= w.window ? n - w.window : 0U;
+  run.ring =
+      ReadRing(kv, std::max({lo, kv.floor(), kv.retained_begin()}), n + B);
+  (void)hipFree(de);
+  (void)hipFree(dl);
+  (void)hipFree(dd);
+  return run;
 }
 
 }  // namespace gufo::testing::laguna

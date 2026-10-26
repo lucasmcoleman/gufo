@@ -1037,49 +1037,6 @@ void TestHead() {
   }
 }
 
-struct BlockRun {
-  std::vector<float> logits;
-  std::vector<std::int32_t> drafts;
-  Taps taps;
-  KvRows ring;
-};
-
-BlockRun RunBlock(DrafterCtx& ctx, const gpu::DrafterWeights& w,
-                  const gpu::DeviceMatrix& head, gpu::DrafterKv& kv,
-                  const std::vector<float>& embeddings, std::uint32_t B,
-                  gpu::Path path, bool tapped) {
-  BlockRun run;
-  const std::size_t V = head.rows;
-  float* de = ToDevice(embeddings);
-  float* dl = nullptr;
-  std::int32_t* dd = nullptr;
-  CheckHip(hipMalloc(&dl, (B - 1) * V * sizeof(float)), "alloc");
-  CheckHip(hipMalloc(&dd, (B - 1) * sizeof(std::int32_t)), "alloc");
-  std::string error;
-  bool ok = false;
-  if (tapped) {
-    TapScope scope(ctx.ops(), &run.taps);
-    ok = ctx.ops().Block(w, head, kv, de, B, dl, dd, path, &error);
-    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
-  } else {
-    ok = ctx.ops().Block(w, head, kv, de, B, dl, dd, path, &error);
-    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
-  }
-  Require(ok, "Block failed: " + error);
-  Require(run.taps.capture_error.empty() && run.taps.pending.empty(),
-          "activation capture failed");
-  run.logits = ToHost(dl, (B - 1) * V);
-  run.drafts = ToHost(dd, B - 1);
-  const std::uint32_t n = kv.committed();
-  const std::uint32_t lo = n >= w.window ? n - w.window : 0U;
-  run.ring =
-      ReadRing(kv, std::max({lo, kv.floor(), kv.retained_begin()}), n + B);
-  (void)hipFree(de);
-  (void)hipFree(dl);
-  (void)hipFree(dd);
-  return run;
-}
-
 /// The composed block forward against the oracle, then: untapped bitwise,
 /// a repeated call bitwise (the block's own ring rows are rewritten), shorter
 /// blocks equal the prefix bit for bit, and injecting the next rows over the

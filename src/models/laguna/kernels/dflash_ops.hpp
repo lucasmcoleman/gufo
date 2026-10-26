@@ -26,7 +26,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -348,6 +350,67 @@ private:
   bool initialized_{false};
   Scratch ids_, aux_, u_, fused_, x_, k_, v_, q_, gate_, attn_;
   Scratch fg_, fu_, fa_, h_, n_, o_, r_;
+};
+
+/// The composed drafter forward of one session, without the target: owns
+/// its DFlashOps (on the caller's stream), ring and device buffers. Context
+/// features arrive from the host (6c; device-side tap capture is phase 6d),
+/// the block's embeddings are gathered on the host from the target's
+/// token_embd (as the target executor does), and Propose returns the drafts.
+/// One session per stream; nothing here is shared between sessions.
+class DrafterSession {
+public:
+  /// `w`, `head` (the target's output matrix on the device) and
+  /// `token_embd` (the target's mapped embedding) must outlive the session;
+  /// injections carry at most `max_inject_rows` rows. Nullptr with a message
+  /// on a HIP failure or a head/embedding that does not match the drafter.
+  [[nodiscard]] static std::unique_ptr<DrafterSession> Create(
+      const DrafterWeights& w, const DeviceMatrix& head,
+      const TensorRef& token_embd, std::int32_t mask_token,
+      std::uint32_t max_inject_rows, hipStream_t stream,
+      std::string* error_msg = nullptr);
+  ~DrafterSession();
+  DrafterSession(const DrafterSession&) = delete;
+  DrafterSession& operator=(const DrafterSession&) = delete;
+
+  /// Injects the context rows at positions start .. start + rows - 1
+  /// (`features` [rows][taps*hidden], host). See DFlashOps::Inject. Returns
+  /// once the features are copied (the injection itself may still run).
+  [[nodiscard]] bool Inject(std::span<const float> features,
+                            std::uint32_t start, Path path = Path::kAuto,
+                            std::string* error_msg = nullptr);
+
+  /// Drafts block_rows - 1 tokens after `anchor` (the sampled token at
+  /// position kv().committed(), not yet given to the target): the block
+  /// [anchor, MASK x (block_rows - 1)] through DFlashOps::Block. Fills
+  /// `drafts` (and, if not null, `logits` [block_rows - 1][vocab]) and
+  /// returns after the stream has finished.
+  [[nodiscard]] bool Propose(std::int32_t anchor, std::uint32_t block_rows,
+                             std::vector<std::int32_t>* drafts,
+                             std::vector<float>* logits = nullptr,
+                             Path path = Path::kAuto,
+                             std::string* error_msg = nullptr);
+
+  [[nodiscard]] DrafterKv& kv() noexcept { return kv_; }
+  [[nodiscard]] DFlashOps& ops() noexcept { return ops_; }
+
+private:
+  DrafterSession(const DrafterWeights& w, const DeviceMatrix& head,
+                 const TensorRef& token_embd, std::int32_t mask_token,
+                 hipStream_t stream);
+  const DrafterWeights& w_;
+  DeviceMatrix head_;
+  const TensorRef& token_embd_;
+  std::int32_t mask_token_;
+  hipStream_t stream_;
+  DFlashOps ops_;
+  DrafterKv kv_;
+  std::uint32_t max_inject_rows_{0};
+  float* features_{nullptr};
+  float* embeddings_{nullptr};
+  float* logits_{nullptr};
+  std::int32_t* drafts_{nullptr};
+  std::vector<float> host_embed_;
 };
 
 }  // namespace gufo::models::laguna::rocm

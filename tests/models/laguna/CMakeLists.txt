@@ -75,6 +75,13 @@ if (ENGINE_ENABLE_HIP)
   # on tiny random drafters: encoder, K/V injection, block attention, gate,
   # FFN and head, both projection paths. Nothing is skipped.
   add_laguna_test(dflash_ops gufo_laguna "hip;gpu;gfx1151")
+  # The composed drafter forward on the real drafter (0.61 GiB) and the
+  # target's head and embedding (mapped; no target forward), fed the CPU
+  # oracle's recorded taps. Without the files or the tap fixture it exits 77
+  # and CTest reports a skip, which verifies nothing.
+  add_laguna_test(dflash_gpu_real gufo_laguna "hip;gpu;gfx1151;external-model")
+  set_tests_properties(laguna.dflash_gpu_real PROPERTIES SKIP_RETURN_CODE 77
+    TIMEOUT 3600)
 
   # Full-model GPU executor (phase 4) on random tiny models: the oracle match,
   # chunk-split and decode bit-identity, reset, untapped reruns and the
