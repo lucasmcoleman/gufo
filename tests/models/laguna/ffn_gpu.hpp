@@ -8,6 +8,8 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -15,9 +17,12 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "src/models/laguna/kernels/ffn.hpp"
@@ -393,9 +398,26 @@ inline ref::ActivationQuant ModeFor(bool vector) {
                 : ref::ActivationQuant::kGpuMmq;
 }
 
+/// One buffer as qfn_mmq handed it to the capture hook.
+struct Capture {
+  int layout{QFN_MMQ_ACT_Q8_1};
+  std::size_t rows{0};
+  std::size_t k{0};
+  std::size_t k_padded{0};
+  std::vector<std::uint8_t> bytes;
+  std::vector<std::int32_t> src;  ///< input row per buffer row; empty: same
+  std::vector<std::int32_t> dst;  ///< output row per buffer row; empty: none
+};
+
 struct Taps {
   std::map<std::string, std::vector<float>> f32;
   std::map<std::string, std::vector<std::int32_t>> i32;
+  /// Activation buffers captured since the previous tap, then filed under
+  /// the next stage the operator emits (the stage whose projection read
+  /// them: "gate" for gate/up, "down", "<prefix>_gate", "<prefix>_out").
+  std::vector<Capture> pending;
+  std::map<std::string, std::vector<Capture>> captures;
+  std::string capture_error;
   const std::vector<float>& F(const std::string& name) const {
     const auto it = f32.find(name);
     Require(it != f32.end(), "missing tap " + name);
@@ -406,31 +428,84 @@ struct Taps {
     Require(it != i32.end(), "missing tap " + name);
     return it->second;
   }
+  const std::vector<Capture>& C(const std::string& name) const {
+    static const std::vector<Capture> kNone;
+    const auto it = captures.find(name);
+    return it != captures.end() ? it->second : kNone;
+  }
 };
 
+/// qfn_mmq capture hook: copies the packed buffer (and its row maps) while
+/// qfn_mmq still holds it. Errors are recorded, not thrown through qfn_mmq.
+inline void OnActivationCapture(void* user, int layout, const void* data,
+                                std::size_t bytes, int rows, int k,
+                                int k_padded, const std::int32_t* row_src,
+                                const std::int32_t* row_dst,
+                                hipStream_t stream) {
+  auto* taps = static_cast<Taps*>(user);
+  const auto ok = [&](hipError_t e) {
+    if (e != hipSuccess && taps->capture_error.empty()) {
+      taps->capture_error = hipGetErrorString(e);
+    }
+    return e == hipSuccess;
+  };
+  Capture c;
+  c.layout = layout;
+  c.rows = static_cast<std::size_t>(rows);
+  c.k = static_cast<std::size_t>(k);
+  c.k_padded = static_cast<std::size_t>(k_padded);
+  c.bytes.resize(bytes);
+  if (!ok(hipStreamSynchronize(stream)) ||
+      !ok(hipMemcpy(c.bytes.data(), data, bytes, hipMemcpyDeviceToHost))) {
+    return;
+  }
+  for (const auto& [device, host] :
+       {std::pair{row_src, &c.src}, std::pair{row_dst, &c.dst}}) {
+    if (device != nullptr) {
+      host->resize(c.rows);
+      if (!ok(hipMemcpy(host->data(), device, c.rows * sizeof(std::int32_t),
+                        hipMemcpyDeviceToHost))) {
+        return;
+      }
+    }
+  }
+  taps->pending.push_back(std::move(c));
+}
+
+/// Taps every stage of `ops` into `taps` and captures the activation buffers
+/// qfn_mmq quantizes meanwhile. Remove with RemoveTap.
 inline void InstallTap(gpu::FfnOps& ops, Taps* taps) {
+  qfn_mmq_set_activation_capture(OnActivationCapture, taps);
   ops.SetTap([taps](std::string_view name, const void* device,
                     std::size_t count, bool is_int32) {
+    const std::string key(name);
     if (is_int32) {
-      taps->i32[std::string(name)] =
-          ToHost(static_cast<const std::int32_t*>(device), count);
+      taps->i32[key] = ToHost(static_cast<const std::int32_t*>(device), count);
     } else {
-      taps->f32[std::string(name)] =
-          ToHost(static_cast<const float*>(device), count);
+      taps->f32[key] = ToHost(static_cast<const float*>(device), count);
     }
+    auto& filed = taps->captures[key];
+    for (auto& c : taps->pending) {
+      filed.push_back(std::move(c));
+    }
+    taps->pending.clear();
   });
 }
 
-/// The GPU's quantizer computes its scale and 1/scale with approximate
-/// reciprocals, a few ulps (about 2e-5 in units of one Q8 code at the largest
-/// codes) from the correctly rounded value; a margin of twice that is searched.
+inline void RemoveTap(gpu::FfnOps& ops) {
+  ops.SetTap({});
+  qfn_mmq_set_activation_capture(nullptr, nullptr);
+}
+
+/// Distance (in Q8 codes) that AvoidTies keeps the elements of a test input
+/// from a rounding boundary of their first quantization, so the end-to-end
+/// comparison against ref::FfnForward is not dominated by a flip in the first
+/// projection. The stage checks do not rely on it: they consume the GPU's own
+/// quantized activations (CheckCapturedProjection).
 inline constexpr double kTieMargin = 4e-5;
 
-/// Both sides quantize each 32-element block with scale amax/127. A value
-/// whose x * 127 / amax sits within `margin` of a rounding boundary can round
-/// differently on the GPU, whose division is not correctly rounded
-/// (-ffast-math reciprocal), without any arithmetic being wrong. Returns the
-/// elements of `row` (length `cols`) that close to a boundary.
+/// Elements of `row` (length `cols`) whose x * 127 / amax lies within `margin`
+/// of a rounding boundary of their 32-element block.
 inline std::vector<std::size_t> NearTies(const float* row, std::size_t cols,
                                          double margin) {
   std::vector<std::size_t> out;
@@ -455,9 +530,9 @@ inline std::vector<std::size_t> NearTies(const float* row, std::size_t cols,
 }
 
 /// Moves every element of the rows `x` ([rows][cols]) that lies within
-/// kTieMargin of a Q8 rounding boundary a few percent of a code away from it,
-/// so the first quantization of a test input is unambiguous (intermediate rows
-/// are produced by the operator and cannot be treated this way).
+/// 4 * kTieMargin of a Q8 rounding boundary a few percent of a code away from
+/// it, so the first quantization of a test input is unambiguous (intermediate
+/// rows are produced by the operator and cannot be treated this way).
 inline void AvoidTies(std::vector<float>* x, std::size_t rows,
                       std::size_t cols) {
   for (std::size_t r = 0; r < rows; ++r) {
@@ -476,21 +551,575 @@ inline void AvoidTies(std::vector<float>* x, std::size_t rows,
   }
 }
 
-struct StageStats {
-  double max_over_rms{0};  ///< worst unexplained |gpu - oracle| / oracle rms
-  double ref_rms{0};
+// ---------------------------------------------------------------------------
+// Captured activations: the packed buffer each GPU projection actually read
+// (qfn_mmq_set_activation_capture), decoded, validated against the float
+// input it was quantized from, then used as the exact input of the oracle's
+// matrix product.
+// ---------------------------------------------------------------------------
+
+/// A decoded capture: codes [rows][k], and per 32-element group the stored
+/// scale d and (Q8_1, MMQ DS4) the stored sum d * sum(q), as float values.
+struct QuantRows {
+  int layout{QFN_MMQ_ACT_Q8_1};
   std::size_t rows{0};
-  std::size_t flip_rows{0};   ///< rows whose mismatch is one-LSB tie flips
-  std::size_t scale_rows{0};  ///< rows explained by one fp16 scale boundary
-  std::size_t unexplained{0};
+  std::size_t k{0};
+  bool has_sum{false};
+  std::vector<std::int8_t> q;
+  std::vector<float> d;
+  std::vector<float> s;
+  std::vector<std::int32_t> src;
+  std::vector<std::int32_t> dst;
 };
 
-/// Compares a projection's GPU output (`gpu_out[rows][M]`) with the oracle's
-/// product of the same input rows (`in[rows][K]`) and weights, matrix
-/// `expert_of_row[row]`, in activation mode `mode`. Rows whose error exceeds
-/// `tol` (relative to the oracle rms) are accepted only if flipping the
-/// rounding of some of their near-tie input elements reproduces the GPU row
-/// to `tol`; anything else counts as unexplained.
+inline const char* LayoutName(int layout) {
+  switch (layout) {
+    case QFN_MMQ_ACT_Q8_1:
+      return "Q8_1";
+    case QFN_MMQ_ACT_MMQ_D4:
+      return "MMQ D4";
+    case QFN_MMQ_ACT_MMQ_DS4:
+      return "MMQ DS4";
+    default:
+      return "MMQ D2S6";
+  }
+}
+
+/// The layout each path's projection of `type` weights quantizes into
+/// (mmq_get_q8_1_ds_layout for the MMQ tile kernels).
+inline int ExpectedLayout(GgmlType type, bool vector) {
+  if (vector) {
+    return QFN_MMQ_ACT_Q8_1;
+  }
+  return type == GgmlType::kQ4_K || type == GgmlType::kQ5_K
+             ? QFN_MMQ_ACT_MMQ_DS4
+             : QFN_MMQ_ACT_MMQ_D4;
+}
+
+inline float HalfAt(const std::uint8_t* p) {
+  _Float16 h;
+  std::memcpy(&h, p, sizeof(h));
+  return static_cast<float>(h);
+}
+
+/// Round to nearest even fp16, from a double (no double rounding via float).
+inline float RoundHalf(double v) {
+  return static_cast<float>(static_cast<_Float16>(v));
+}
+
+inline QuantRows DecodeCapture(const Capture& c) {
+  Require(c.k % 32 == 0 && c.k <= c.k_padded && c.rows > 0,
+          "capture: bad shape");
+  QuantRows out;
+  out.layout = c.layout;
+  out.rows = c.rows;
+  out.k = c.k;
+  out.src = c.src;
+  out.dst = c.dst;
+  const std::size_t groups = c.k / 32;
+  out.q.resize(c.rows * c.k);
+  out.d.resize(c.rows * groups);
+  out.s.assign(c.rows * groups, std::nanf(""));
+  if (c.layout == QFN_MMQ_ACT_Q8_1) {
+    // block_q8_1: half2 {d, d * sum(q)}, then 32 int8 codes.
+    out.has_sum = true;
+    const std::size_t row_blocks = c.k_padded / 32;
+    Require(c.bytes.size() >= c.rows * row_blocks * 36,
+            "capture: Q8_1 buffer too small");
+    for (std::size_t r = 0; r < c.rows; ++r) {
+      for (std::size_t g = 0; g < groups; ++g) {
+        const std::uint8_t* p = c.bytes.data() + (r * row_blocks + g) * 36;
+        out.d[r * groups + g] = HalfAt(p);
+        out.s[r * groups + g] = HalfAt(p + 2);
+        std::memcpy(out.q.data() + r * c.k + g * 32, p + 4, 32);
+      }
+    }
+    return out;
+  }
+  Require(c.layout == QFN_MMQ_ACT_MMQ_D4 || c.layout == QFN_MMQ_ACT_MMQ_DS4,
+          std::string("capture: unsupported layout ") + LayoutName(c.layout));
+  // block_q8_1_mmq: 16 scale bytes (D4: float d[4]; DS4: half2 {d, sum}[4]),
+  // then 128 codes; block (column / 128) * rows + row.
+  out.has_sum = c.layout == QFN_MMQ_ACT_MMQ_DS4;
+  Require(c.k_padded % 128 == 0 &&
+              c.bytes.size() >= c.k_padded / 128 * c.rows * 144,
+          "capture: MMQ buffer too small");
+  for (std::size_t r = 0; r < c.rows; ++r) {
+    for (std::size_t g = 0; g < groups; ++g) {
+      const std::size_t col = g * 32;
+      const std::uint8_t* p = c.bytes.data() + (col / 128 * c.rows + r) * 144;
+      const std::size_t gi = col % 128 / 32;
+      if (out.has_sum) {
+        out.d[r * groups + g] = HalfAt(p + 4 * gi);
+        out.s[r * groups + g] = HalfAt(p + 4 * gi + 2);
+      } else {
+        std::memcpy(&out.d[r * groups + g], p + 4 * gi, 4);
+      }
+      std::memcpy(out.q.data() + r * c.k + col, p + 16 + col % 128, 32);
+    }
+  }
+  return out;
+}
+
+/// Relative error bounds of the GPU quantizers, in units of u = 2^-24 (float
+/// unit roundoff), per layout. Both kernels are built with -ffast-math, so a
+/// division may be a v_rcp_f32 reciprocal (at most 1 ulp = 2u, RDNA3 ISA)
+/// times a correctly rounded multiply (u). amax is exact (fabs/max).
+///
+///  Q8_1 (quantize_q8_1, MMVQ decode):
+///    d = amax / 127            -> rcp + mul                         3u
+///    q = roundf(x / d) = x * rcp(d): multiplier 1/d off by 3u + 2u  5u
+///      plus the product's rounding                              -> 6u
+///    stored d  = half(d);  stored sum = half(d * sum(q)): 3u + u    4u
+///  MMQ D4/DS4 (quantize_mmq_q8_1, prefill tiles):
+///    d_inv = 127 / amax        -> rcp + mul                         3u
+///    q = roundf(x * d_inv)     -> plus the product's rounding       4u
+///    d = 1 / d_inv             -> 3u + rcp 2u                       5u
+///    D4 stores that float d; DS4 stores half(d) and half(d * sum(q)) 6u
+///
+/// Each bound below adds 1u for second-order terms and the double evaluation
+/// of the exact quantities. `multiplier` is the code bound without the
+/// product's own rounding (which differs per element).
+struct QuantBounds {
+  double code;        ///< |x * m - x * 127 / amax| / |x * 127 / amax|
+  double multiplier;  ///< |m - 127 / amax| / (127 / amax), m shared per block
+  double scale;       ///< |d_unrounded - amax / 127| / (amax / 127)
+  double sum;         ///< |sum_unrounded - amax / 127 * sum(q)| / same
+  bool half_scale;    ///< d is stored as fp16 (else float)
+};
+
+inline QuantBounds BoundsFor(int layout) {
+  constexpr double u = 0x1p-24;
+  if (layout == QFN_MMQ_ACT_Q8_1) {
+    return {7 * u, 6 * u, 4 * u, 5 * u, true};
+  }
+  return {5 * u, 4 * u, 6 * u, 7 * u, layout == QFN_MMQ_ACT_MMQ_DS4};
+}
+
+/// What validating captured quantizations found. Raw statistics are kept for
+/// every block, not only failing ones.
+struct QuantStats {
+  std::size_t blocks{0};
+  std::size_t boundary_codes{0};  ///< codes != round(x * 127 / amax)
+  double worst_boundary_gap{0};   ///< max |frac(|v|) - 0.5| of those codes
+  double max_scale_rel{0};        ///< max |d_stored - amax/127| / (amax/127)
+  std::size_t violations{0};
+  std::string first;  ///< first violation, for the failure message
+};
+
+inline void Violation(QuantStats* st, const std::string& why) {
+  if (st->violations++ == 0) {
+    st->first = why;
+  }
+}
+
+/// Checks one 32-element block of captured codes `q`, stored scale `d` and,
+/// when `has_sum`, stored sum `s` against the float input `x` it was
+/// quantized from. A code is accepted only if (1) it is within the derived
+/// error of round(x * 127 / amax): a code other than the nearest one needs
+/// x * 127 / amax within `code` (relative) of a .5 boundary; (2) equal
+/// inputs have equal codes and larger inputs no smaller codes (one shared
+/// multiplier and a monotone rounding); and (3) one multiplier within the
+/// derived interval reproduces every code of the block jointly. The scale
+/// and sum must be the fp16 (or float) rounding of a value within the derived
+/// error of the unrounded amax / 127 and amax / 127 * sum(q).
+inline void ValidateBlock(const float* x, const std::int8_t* q, float d,
+                          float s, bool has_sum, int layout, QuantStats* st) {
+  const QuantBounds b = BoundsFor(layout);
+  constexpr double u = 0x1p-24;
+  ++st->blocks;
+  float amax = 0.0F;
+  for (int j = 0; j < 32; ++j) {
+    amax = std::max(amax, std::fabs(x[j]));
+  }
+  std::ostringstream why;
+  why << LayoutName(layout) << " block (amax " << amax << "): ";
+  if (amax == 0.0F) {
+    bool ok = d == 0.0F && (!has_sum || s == 0.0F);
+    for (int j = 0; j < 32; ++j) {
+      ok = ok && q[j] == 0;
+    }
+    if (!ok) {
+      why << "an all-zero block must have zero codes, scale and sum";
+      Violation(st, why.str());
+    }
+    return;
+  }
+  const double t = static_cast<double>(amax) / 127.0;
+  const double scale = 127.0 / static_cast<double>(amax);
+  int sumq = 0;
+  double rho_lo = 1.0 - b.multiplier;
+  double rho_hi = 1.0 + b.multiplier;
+  for (int j = 0; j < 32; ++j) {
+    const double v = static_cast<double>(x[j]) * scale;
+    const double lo = std::round(v - std::fabs(v) * b.code);
+    const double hi = std::round(v + std::fabs(v) * b.code);
+    sumq += q[j];
+    if (q[j] < lo || q[j] > hi) {
+      why << "element " << j << " x=" << x[j] << " (x*127/amax=" << v
+          << ") has code " << int{q[j]} << ", outside [" << lo << ", " << hi
+          << "]";
+      Violation(st, why.str());
+      return;
+    }
+    if (q[j] != std::round(v)) {
+      ++st->boundary_codes;
+      const double av = std::fabs(v);
+      st->worst_boundary_gap = std::max(st->worst_boundary_gap,
+                                        std::fabs(av - std::floor(av) - 0.5));
+    }
+    if (v != 0.0) {
+      // |x| * m * (1 + delta), |delta| <= u, must round to |q|.
+      const double av = std::fabs(v);
+      const double aq = std::abs(int{q[j]});
+      rho_lo = std::max(rho_lo, (aq - 0.5) / (av * (1.0 + u)));
+      rho_hi = std::min(rho_hi, (aq + 0.5) / (av * (1.0 - u)));
+    }
+  }
+  std::array<int, 32> order{};
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(),
+            [&](int a, int c) { return x[a] < x[c]; });
+  for (int i = 1; i < 32; ++i) {
+    const int a = order[i - 1];
+    const int c = order[i];
+    if ((x[a] == x[c] && q[a] != q[c]) || (x[a] < x[c] && q[a] > q[c])) {
+      why << "elements " << a << " and " << c << " (x=" << x[a] << ", " << x[c]
+          << ") have codes " << int{q[a]} << ", " << int{q[c]}
+          << ": no shared monotone rounding gives these";
+      Violation(st, why.str());
+      return;
+    }
+  }
+  if (rho_lo > rho_hi) {
+    why << "no single multiplier within " << b.multiplier / u
+        << "u of 127/amax reproduces every code of the block";
+    Violation(st, why.str());
+    return;
+  }
+  st->max_scale_rel = std::max(st->max_scale_rel, std::fabs(d - t) / t);
+  const double d_lo = t * (1.0 - b.scale);
+  const double d_hi = t * (1.0 + b.scale);
+  const bool d_ok = b.half_scale ? d >= RoundHalf(d_lo) && d <= RoundHalf(d_hi)
+                                 : d >= d_lo && d <= d_hi;
+  if (!d_ok) {
+    why << "stored scale " << std::setprecision(10) << d
+        << " is not the rounding of amax/127 = " << t << " within "
+        << b.scale / u << "u";
+    Violation(st, why.str());
+    return;
+  }
+  if (has_sum) {
+    const double ts = t * sumq;
+    const double e = std::fabs(ts) * b.sum;
+    const bool s_ok = sumq == 0
+                          ? s == 0.0F
+                          : s >= RoundHalf(ts - e) && s <= RoundHalf(ts + e);
+    if (!s_ok) {
+      why << "stored sum " << std::setprecision(10) << s
+          << " is not the fp16 rounding of amax/127 * sum(q) = " << ts
+          << " within " << b.sum / u << "u";
+      Violation(st, why.str());
+    }
+  }
+}
+
+/// Validates every row of `qr` against the float rows `in` ([in_rows][k]):
+/// buffer row i was quantized from input row src[i] (or i).
+inline QuantStats ValidateQuantRows(const QuantRows& qr,
+                                    const std::vector<float>& in,
+                                    std::size_t in_rows) {
+  Require(in.size() == in_rows * qr.k, "ValidateQuantRows: shape mismatch");
+  QuantStats st;
+  const std::size_t groups = qr.k / 32;
+  for (std::size_t i = 0; i < qr.rows; ++i) {
+    const std::size_t src =
+        qr.src.empty() ? i : static_cast<std::size_t>(qr.src[i]);
+    if (src >= in_rows) {
+      Violation(&st, "capture row maps to a missing input row");
+      continue;
+    }
+    for (std::size_t g = 0; g < groups; ++g) {
+      ValidateBlock(in.data() + src * qr.k + g * 32,
+                    qr.q.data() + i * qr.k + g * 32, qr.d[i * groups + g],
+                    qr.s[i * groups + g], qr.has_sum, qr.layout, &st);
+    }
+  }
+  return st;
+}
+
+/// Projections that share one input must have consumed one quantization of
+/// it: every buffer row (of every listed capture) quantized from the same
+/// input row must hold the same codes, scales and sums, bit for bit. Returns
+/// the empty string when they agree.
+inline std::string SharedInputMismatch(
+    const std::vector<const QuantRows*>& captures) {
+  std::map<std::int32_t, std::pair<const QuantRows*, std::size_t>> first;
+  for (const QuantRows* qr : captures) {
+    const std::size_t groups = qr->k / 32;
+    for (std::size_t i = 0; i < qr->rows; ++i) {
+      const std::int32_t src =
+          qr->src.empty() ? static_cast<std::int32_t>(i) : qr->src[i];
+      const auto [it, inserted] = first.try_emplace(src, qr, i);
+      if (inserted) {
+        continue;
+      }
+      const QuantRows* a = it->second.first;
+      const std::size_t ai = it->second.second;
+      if (a->layout != qr->layout || a->k != qr->k ||
+          std::memcmp(a->q.data() + ai * a->k, qr->q.data() + i * qr->k,
+                      qr->k) != 0 ||
+          std::memcmp(a->d.data() + ai * groups, qr->d.data() + i * groups,
+                      groups * sizeof(float)) != 0 ||
+          (qr->has_sum &&
+           std::memcmp(a->s.data() + ai * groups, qr->s.data() + i * groups,
+                       groups * sizeof(float)) != 0)) {
+        return "input row " + std::to_string(src) +
+               " was quantized differently for projections that share it";
+      }
+    }
+  }
+  return {};
+}
+
+template<class Fn>
+void ParallelFor(std::size_t count, const Fn& fn) {
+  const std::size_t workers = std::min<std::size_t>(
+      std::max(1U, std::thread::hardware_concurrency()), count);
+  std::atomic<std::size_t> next{0};
+  const auto work = [&] {
+    for (std::size_t i = next++; i < count; i = next++) {
+      fn(i);
+    }
+  };
+  std::vector<std::thread> pool;
+  for (std::size_t i = 1; i < workers; ++i) {
+    pool.emplace_back(work);
+  }
+  work();
+  for (auto& t : pool) {
+    t.join();
+  }
+}
+
+/// Oracle product of captured activations: y[n][m] = W[expert][m] . x'_n in
+/// double, where x'_n is buffer row rows[n] with x' = q * d per group (exact
+/// in double), and sabs[n][m] the sum of the magnitudes of the terms. MMQ
+/// tiles for Q4_K/Q5_K weights (DS4 layout) are modelled as the tile kernel
+/// computes them: per 32-element sub-block, x_dm.x * d8 * sum(qw * qx) +
+/// x_dm.y * s8 with x_dm = half2(d * sc, -dmin * m) and the captured fp16 d8
+/// and s8 (see ref::MatMulRows, kGpuMmq).
+inline void CapturedProduct(const ml::TensorRef& w, std::uint64_t expert,
+                            const QuantRows& qr,
+                            const std::vector<std::size_t>& rows, double* y,
+                            double* sabs) {
+  const std::size_t K = w.cols;
+  const std::size_t M = w.rows;
+  const std::size_t groups = K / 32;
+  const std::uint8_t* base = w.Expert(expert);
+  const std::size_t row_bytes = w.RowBytes();
+  const bool kquant_tiles =
+      qr.layout == QFN_MMQ_ACT_MMQ_DS4 &&
+      (w.type == GgmlType::kQ4_K || w.type == GgmlType::kQ5_K);
+  if (qr.layout == QFN_MMQ_ACT_MMQ_DS4) {
+    Require(kquant_tiles, "CapturedProduct: DS4 activations need Q4_K/Q5_K");
+  }
+  if (kquant_tiles) {
+    const bool q5 = w.type == GgmlType::kQ5_K;
+    const std::size_t block_bytes = q5 ? 176 : 144;
+    ParallelFor(M, [&](std::size_t m) {
+      for (std::size_t n = 0; n < rows.size(); ++n) {
+        const std::size_t r = rows[n];
+        double acc = 0.0;
+        double mag = 0.0;
+        for (std::size_t b = 0; b < K / 256; ++b) {
+          const std::uint8_t* blk = base + m * row_bytes + b * block_bytes;
+          const float dw = HalfAt(blk);
+          const float dmin = HalfAt(blk + 2);
+          const std::uint8_t* scales = blk + 4;
+          const std::uint8_t* qh = q5 ? blk + 16 : nullptr;
+          const std::uint8_t* qs = blk + (q5 ? 48 : 16);
+          for (int j = 0; j < 8; ++j) {
+            int sc = 0;
+            int mn = 0;
+            if (j < 4) {
+              sc = scales[j] & 63;
+              mn = scales[j + 4] & 63;
+            } else {
+              sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+              mn = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+            }
+            const double dm_x = RoundHalf(dw * static_cast<float>(sc));
+            const double dm_y = -RoundHalf(dmin * static_cast<float>(mn));
+            long dot = 0;
+            const std::int8_t* qx = qr.q.data() + r * K + b * 256 + j * 32;
+            for (int l = 0; l < 32; ++l) {
+              const std::uint8_t byte = qs[32 * (j / 2) + l];
+              int qw = (j & 1) != 0 ? (byte >> 4) : (byte & 0xF);
+              if (q5 && ((qh[l] >> j) & 1) != 0) {
+                qw += 16;
+              }
+              dot += static_cast<long>(qw) * qx[l];
+            }
+            const std::size_t g = b * 8 + j;
+            const double t1 =
+                dm_x * qr.d[r * groups + g] * static_cast<double>(dot);
+            const double t2 = dm_y * qr.s[r * groups + g];
+            acc += t1 + t2;
+            mag += std::fabs(t1) + std::fabs(t2);
+          }
+        }
+        y[n * M + m] = acc;
+        sabs[n * M + m] = mag;
+      }
+    });
+    return;
+  }
+  std::vector<double> xq(rows.size() * K);
+  for (std::size_t n = 0; n < rows.size(); ++n) {
+    for (std::size_t c = 0; c < K; ++c) {
+      xq[n * K + c] = static_cast<double>(qr.q[rows[n] * K + c]) *
+                      qr.d[rows[n] * groups + c / 32];
+    }
+  }
+  ParallelFor(M, [&](std::size_t m) {
+    std::vector<float> wrow(K);
+    ref::DequantizeRow(w.type, base + m * row_bytes, wrow.data(), K);
+    for (std::size_t n = 0; n < rows.size(); ++n) {
+      double acc = 0.0;
+      double mag = 0.0;
+      for (std::size_t c = 0; c < K; ++c) {
+        const double term = static_cast<double>(wrow[c]) * xq[n * K + c];
+        acc += term;
+        mag += std::fabs(term);
+      }
+      y[n * M + m] = acc;
+      sabs[n * M + m] = mag;
+    }
+  });
+}
+
+/// Float-accumulation bound of a GPU projection output against the exact
+/// product of the same quantized operands, as a multiple of u times the sum
+/// of the terms' magnitudes (Higham's gamma_n for recursive summation): at
+/// most one float term per 16 activations (Q6_K's 16-element scale groups
+/// are the finest among Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS), each formed with
+/// up to 3 roundings, summed with at most 8 tree-reduction levels (16), plus
+/// 2 for the weights' own float dequantization in the oracle (d * sc * q).
+inline double AccumulationUnits(std::size_t k) {
+  return static_cast<double>(k) / 16.0 + 18.0;
+}
+
+struct StageStats {
+  /// Worst |gpu - oracle| / oracle rms over every output (accepted ones
+  /// included): the raw discrepancy.
+  double max_over_rms{0};
+  /// Worst |gpu - oracle| / accumulation bound (<= 1 passes).
+  double max_over_bound{0};
+  double ref_rms{0};
+  std::size_t rows{0};
+  std::size_t unexplained{0};  ///< outputs beyond the bound
+  /// Legacy fields of the tolerance-search checker; always 0 now.
+  std::size_t flip_rows{0};
+  std::size_t scale_rows{0};
+  QuantStats quant;
+  std::string first;  ///< first failing output, for the failure message
+};
+
+/// Checks one projection stage against its captured activations. `in`
+/// ([in_rows][K]) is the float input the GPU quantized, `gpu_out` ([R][M])
+/// its output, row r computed with matrix expert_of_row[r]. Buffer row i
+/// feeds output row dst[i] (or, without dst, output rows i * fan_out ..
+/// i * fan_out + fan_out - 1: the vector path's gate/up read one row per token
+/// for every slot). The capture is validated first (ValidateQuantRows); only
+/// a valid capture is used as the oracle's input, and every output must then
+/// match the exact product of those quantized values within the float
+/// accumulation bound. Nothing is searched or nudged.
+inline StageStats CheckCapturedProjection(
+    const ml::TensorRef& w, const std::vector<std::int32_t>& expert_of_row,
+    const std::vector<float>& in, std::size_t in_rows,
+    const std::vector<float>& gpu_out, const QuantRows& qr,
+    std::size_t fan_out = 1) {
+  const std::size_t K = w.cols;
+  const std::size_t M = w.rows;
+  const std::size_t R = expert_of_row.size();
+  Require(qr.k == K && in.size() == in_rows * K && gpu_out.size() == R * M,
+          "CheckCapturedProjection: shape mismatch");
+  StageStats stats;
+  stats.rows = R;
+  stats.quant = ValidateQuantRows(qr, in, in_rows);
+  if (stats.quant.violations != 0) {
+    return stats;
+  }
+  // Output row -> buffer row.
+  std::vector<std::size_t> quant_of(R, SIZE_MAX);
+  if (!qr.dst.empty()) {
+    for (std::size_t i = 0; i < qr.rows; ++i) {
+      const auto d = static_cast<std::size_t>(qr.dst[i]);
+      const auto s = static_cast<std::size_t>(qr.src[i]);
+      Require(d < R && quant_of[d] == SIZE_MAX && s == d / fan_out,
+              "capture: output row map is not a permutation of the slots");
+      quant_of[d] = i;
+    }
+  } else {
+    Require(qr.rows * fan_out == R && qr.rows == in_rows,
+            "capture: row count does not match the projection");
+    for (std::size_t r = 0; r < R; ++r) {
+      quant_of[r] = r / fan_out;
+    }
+  }
+  std::vector<double> expected(R * M);
+  std::vector<double> magnitude(R * M);
+  std::map<std::int32_t, std::vector<std::size_t>> by_expert;
+  for (std::size_t r = 0; r < R; ++r) {
+    by_expert[expert_of_row[r]].push_back(r);
+  }
+  for (const auto& [e, list] : by_expert) {
+    std::vector<std::size_t> rows(list.size());
+    for (std::size_t i = 0; i < list.size(); ++i) {
+      rows[i] = quant_of[list[i]];
+    }
+    std::vector<double> y(list.size() * M);
+    std::vector<double> mag(list.size() * M);
+    CapturedProduct(w, static_cast<std::uint64_t>(e), qr, rows, y.data(),
+                    mag.data());
+    for (std::size_t i = 0; i < list.size(); ++i) {
+      std::copy_n(y.data() + i * M, M, expected.data() + list[i] * M);
+      std::copy_n(mag.data() + i * M, M, magnitude.data() + list[i] * M);
+    }
+  }
+  double sq = 0;
+  for (const double v : expected) {
+    sq += v * v;
+  }
+  stats.ref_rms = std::sqrt(sq / static_cast<double>(expected.size()));
+  const double units = AccumulationUnits(K) * 0x1p-24;
+  for (std::size_t i = 0; i < R * M; ++i) {
+    Require(std::isfinite(gpu_out[i]), "GPU stage output is not finite");
+    const double err = std::fabs(gpu_out[i] - expected[i]);
+    // The floor covers outputs whose terms are all zero (denormal results).
+    const double bound = units * magnitude[i] + 1e-30;
+    stats.max_over_rms = std::max(
+        stats.max_over_rms, stats.ref_rms > 0 ? err / stats.ref_rms : err);
+    stats.max_over_bound = std::max(stats.max_over_bound, err / bound);
+    if (err > bound) {
+      if (stats.unexplained++ == 0) {
+        std::ostringstream m;
+        m << "row " << i / M << " col " << i % M << " expert "
+          << expert_of_row[i / M] << ": gpu " << gpu_out[i] << " oracle "
+          << expected[i] << ", error " << err << " > bound " << bound;
+        stats.first = m.str();
+      }
+    }
+  }
+  return stats;
+}
+
+/// Legacy strict check without captured activations, kept for callers that
+/// have not moved to CheckCapturedProjection: compares with the oracle's own
+/// quantization in `mode` and counts every row whose error exceeds `tol`
+/// (relative to the oracle rms) as unexplained. It explains nothing away, so
+/// a genuine rounding-boundary difference also fails here.
 inline StageStats CheckProjection(
     const ml::TensorRef& w, const std::vector<std::int32_t>& expert_of_row,
     const std::vector<float>& in, const std::vector<float>& gpu_out,
@@ -526,123 +1155,48 @@ inline StageStats CheckProjection(
     sq += static_cast<double>(v) * v;
   }
   stats.ref_rms = std::sqrt(sq / static_cast<double>(expected.size()));
-  const double tol_abs = tol * stats.ref_rms;
-  const auto row_error = [&](const float* a, const float* b) {
+  for (std::size_t r = 0; r < R; ++r) {
     double worst = 0;
     for (std::size_t c = 0; c < M; ++c) {
-      Require(std::isfinite(a[c]), "GPU stage output is not finite");
-      worst = std::max(worst, std::fabs(static_cast<double>(a[c]) - b[c]));
+      Require(std::isfinite(gpu_out[r * M + c]),
+              "GPU stage output is not finite");
+      worst =
+          std::max(worst, std::fabs(static_cast<double>(gpu_out[r * M + c]) -
+                                    expected[r * M + c]));
     }
-    return worst;
-  };
-  for (std::size_t r = 0; r < R; ++r) {
-    const double err =
-        row_error(gpu_out.data() + r * M, expected.data() + r * M);
-    if (err <= tol_abs) {
-      stats.max_over_rms = std::max(stats.max_over_rms, err / stats.ref_rms);
-      continue;
-    }
-    // Try to explain the row by rounding flips of near-tie inputs.
-    const auto ties = NearTies(in.data() + r * K, K, kTieMargin);
-    bool explained = false;
-    if (!ties.empty() && ties.size() <= 6) {
-      for (std::uint32_t subset = 1; subset < (1U << ties.size()) && !explained;
-           ++subset) {
-        std::vector<float> variant(in.begin() + r * K,
-                                   in.begin() + (r + 1) * K);
-        for (std::size_t i = 0; i < ties.size(); ++i) {
-          if (((subset >> i) & 1U) == 0) {
-            continue;
-          }
-          const std::size_t j = ties[i];
-          const std::size_t b = j / 32 * 32;
-          float amax = 0.0F;
-          for (std::size_t k = 0; k < 32; ++k) {
-            amax = std::max(amax, std::fabs(variant[b + k]));
-          }
-          // The value sits on a rounding boundary: its two candidate codes are
-          // floor(|v|) and floor(|v|) + 1. The oracle chose one in float
-          // arithmetic of the mode; the variant takes the other.
-          const double v =
-              std::fabs(static_cast<double>(variant[j])) * (127.0 / amax);
-          const double lo = std::floor(v);
-          const float scale = mode == ref::ActivationQuant::kGpuMmq
-                                  ? 127.0F / amax
-                                  : 1.0F / (amax / 127.0F);
-          const double oracle_code = std::fabs(std::round(variant[j] * scale));
-          const double alt = oracle_code == lo ? lo + 1 : lo;
-          variant[j] = static_cast<float>((variant[j] < 0 ? -alt : alt) *
-                                          (amax / 127.0));
-        }
-        std::vector<float> y(M);
-        ref::MatMulRows(w, static_cast<std::uint64_t>(expert_of_row[r]),
-                        variant.data(), 1, y.data(), options);
-        const double verr = row_error(gpu_out.data() + r * M, y.data());
-        if (verr <= tol_abs) {
-          explained = true;
-        }
-      }
-    }
-    bool scale_boundary = false;
-    if (!explained) {
-      // Or one stored fp16 scale (or block sum) that rounded the other way.
-      const bool kquant_mmq =
-          mode == ref::ActivationQuant::kGpuMmq &&
-          (w.type == GgmlType::kQ4_K || w.type == GgmlType::kQ5_K);
-      if (mode == ref::ActivationQuant::kGpuQ8_1 || kquant_mmq) {
-        for (int g = 0; g < static_cast<int>(K / 32) && !scale_boundary; ++g) {
-          for (int kind = 0; kind < (kquant_mmq ? 2 : 1) && !scale_boundary;
-               ++kind) {
-            for (const int steps : {-1, 1}) {
-              ref::Options nudged = options;
-              nudged.nudge = ref::ScaleNudge{g, kind, steps};
-              std::vector<float> y(M);
-              ref::MatMulRows(w, static_cast<std::uint64_t>(expert_of_row[r]),
-                              in.data() + r * K, 1, y.data(), nudged);
-              if (row_error(gpu_out.data() + r * M, y.data()) <= tol_abs) {
-                scale_boundary = true;
-                break;
-              }
-            }
-          }
-        }
-      }
-    }
-    if (scale_boundary) {
-      ++stats.scale_rows;
-    } else if (explained) {
-      ++stats.flip_rows;
-    } else {
-      std::cerr << "  unexplained row " << r << " expert " << expert_of_row[r]
-                << " error/rms " << err / stats.ref_rms << " near-ties "
-                << ties.size();
-      for (const std::size_t j : ties) {
-        std::cerr << " [" << j << "]";
-      }
-      std::cerr << "\n";
+    stats.max_over_rms = std::max(stats.max_over_rms, worst / stats.ref_rms);
+    if (worst > tol * stats.ref_rms) {
       ++stats.unexplained;
-      stats.max_over_rms = std::max(stats.max_over_rms, err / stats.ref_rms);
     }
   }
   return stats;
 }
+
+/// One projection stage's measurements, kept for every case.
+struct StageReport {
+  double over_rms{0};    ///< worst raw |gpu - oracle| / oracle rms
+  double over_bound{0};  ///< worst |gpu - oracle| / accumulation bound
+  std::size_t blocks{0};
+  std::size_t boundary_codes{0};
+  double max_scale_rel{0};
+};
 
 /// What one operator case measured.
 struct CaseReport {
   std::string label;
   double e2e_over_rms{0};    ///< final output vs FfnForward, / oracle rms
   double f32_over_rms{0};    ///< final output vs the F32 oracle (Q8 noise)
-  double stage_over_rms{0};  ///< worst unexplained stage error / rms
+  double stage_over_rms{0};  ///< worst projection-stage error / rms
+  double stage_over_bound{0};
   double e2e_abs{0};
-  std::size_t flip_rows{0};
-  std::size_t scale_rows{0};
+  std::size_t boundary_codes{0};  ///< captured codes not the nearest one
+  std::map<std::string, StageReport> stages;
   double margin{-1};  ///< router selection margin (MoE)
 };
 
 struct CaseOptions {
   bool expect_tie{false};    ///< the selection boundary is an exact tie
   bool expect_clamp{false};  ///< the 2^-14 clamp must engage
-  double stage_tol{2e-5};    ///< see CheckProjection
   double e2e_tol{5e-3};      ///< see the ffn_ops_test header comment
   double min_margin{1e-6};   ///< router decision margin needed to compare ids
   bool f32_reference{true};  ///< also run the F32 oracle (Q8 noise level)
@@ -664,11 +1218,13 @@ inline void ExpectNear(const std::vector<float>& got,
   }
 }
 
-/// Runs the operator once on `x`, tapped, and checks it stage by stage
-/// against the oracle's building blocks, then end to end against
-/// ref::FfnForward in the matching activation mode; then reruns untapped (the
-/// result must be bit-identical) and returns the measurements. Throws on any
-/// failed check.
+/// Runs the operator once on `x`, tapped and with its quantized activations
+/// captured, and checks it stage by stage: router stages against the oracle,
+/// each projection against the oracle's product of the captured (and
+/// independently validated) quantized input, SwiGLU and combine from the
+/// GPU's own stage outputs. Then end to end against ref::FfnForward in the
+/// matching activation mode; then reruns untapped (the result must be
+/// bit-identical) and returns the measurements. Throws on any failed check.
 inline CaseReport RunOperatorCase(
     const std::string& label, const ml::Config& config,
     const ml::LayerWeights& lw, const gpu::LayerFfn& device,
@@ -695,12 +1251,21 @@ inline CaseReport RunOperatorCase(
     Require(ok, label + ": operator failed: " + error);
   };
 
-  // Tapped run.
+  // Tapped run, with every quantized activation buffer captured.
   Taps taps;
-  InstallTap(ctx.ops(), &taps);
-  launch();
-  CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
-  ctx.ops().SetTap({});
+  {
+    struct Guard {
+      gpu::FfnOps& ops;
+      ~Guard() { RemoveTap(ops); }
+    } guard{ctx.ops()};
+    InstallTap(ctx.ops(), &taps);
+    launch();
+    CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+  }
+  Require(taps.capture_error.empty(),
+          label + ": activation capture failed: " + taps.capture_error);
+  Require(taps.pending.empty(),
+          label + ": activation buffers captured after the last stage");
   const auto tapped = ToHost(dout, x.size());
 
   // Oracle end to end (matching mode) and F32 oracle (Q8 noise reference).
@@ -716,29 +1281,72 @@ inline CaseReport RunOperatorCase(
     report.f32_over_rms = Compare(tapped, exact.out).max_over_rms;
   }
 
-  const auto stage = [&](const char* name, const StageStats& s) {
+  // The captures a stage's projections read: `count` buffers in the layout
+  // the path uses for `type` weights.
+  const auto captured = [&](const std::string& stage, std::size_t count,
+                            GgmlType type) {
+    const auto& list = taps.C(stage);
+    std::ostringstream m;
+    m << label << ": stage " << stage << " captured " << list.size()
+      << " activation buffers, expected " << count;
+    Require(list.size() == count, m.str());
+    std::vector<QuantRows> out;
+    for (const Capture& c : list) {
+      Require(c.layout == ExpectedLayout(type, vector),
+              label + ": stage " + stage + " read " + LayoutName(c.layout) +
+                  " activations, expected " +
+                  LayoutName(ExpectedLayout(type, vector)));
+      out.push_back(DecodeCapture(c));
+    }
+    return out;
+  };
+  const auto stage = [&](const std::string& name, const StageStats& s) {
+    if (s.quant.violations != 0) {
+      std::ostringstream m;
+      m << label << ": stage " << name << " captured activations fail "
+        << "validation (" << s.quant.violations
+        << " blocks): " << s.quant.first;
+      Require(false, m.str());
+    }
+    StageReport& r = report.stages[name];
+    r.over_rms = s.max_over_rms;
+    r.over_bound = s.max_over_bound;
+    r.blocks = s.quant.blocks;
+    r.boundary_codes = s.quant.boundary_codes;
+    r.max_scale_rel = s.quant.max_scale_rel;
     report.stage_over_rms = std::max(report.stage_over_rms, s.max_over_rms);
-    report.flip_rows += s.flip_rows;
-    report.scale_rows += s.scale_rows;
+    report.stage_over_bound =
+        std::max(report.stage_over_bound, s.max_over_bound);
+    report.boundary_codes += s.quant.boundary_codes;
     if (s.unexplained != 0) {
       std::ostringstream m;
       m << label << ": stage " << name << " has " << s.unexplained
-        << " unexplained mismatching rows, worst " << s.max_over_rms
-        << " of rms";
+        << " outputs beyond the accumulation bound (worst " << s.max_over_bound
+        << " of the bound, " << s.max_over_rms
+        << " of rms); first: " << s.first;
       Require(false, m.str());
     }
   };
-  // Dense expert-less stages (layer 0 or the shared expert).
+  const auto shared = [&](const std::string& what,
+                          const std::vector<const QuantRows*>& list) {
+    const std::string why = SharedInputMismatch(list);
+    Require(why.empty(), label + ": " + what + ": " + why);
+  };
+  // Dense expert-less stages (layer 0 or the shared expert): gate and up each
+  // quantize x (two buffers that must agree), down quantizes the act tap.
+  std::vector<QuantRows> x_captures;  // every quantization of x
   const auto dense_stages = [&](const char* prefix, const ml::TensorRef& gate,
                                 const ml::TensorRef& up,
                                 const ml::TensorRef& down) {
     const std::string p = prefix;
     const std::vector<std::int32_t> zeros(tokens, 0);
-    stage((p + "_gate").c_str(),
-          CheckProjection(gate, zeros, x, taps.F(p + "_gate"), mode,
-                          opt.stage_tol));
-    stage((p + "_up").c_str(), CheckProjection(up, zeros, x, taps.F(p + "_up"),
-                                               mode, opt.stage_tol));
+    const auto gu = captured(p + "_gate", 2, gate.type);
+    shared(p + " gate/up input", {&gu[0], &gu[1]});
+    stage(p + "_gate", CheckCapturedProjection(gate, zeros, x, tokens,
+                                               taps.F(p + "_gate"), gu[0]));
+    stage(p + "_up", CheckCapturedProjection(up, zeros, x, tokens,
+                                             taps.F(p + "_up"), gu[1]));
+    x_captures.insert(x_captures.end(), gu.begin(), gu.end());
     const auto& g = taps.F(p + "_gate");
     const auto& u = taps.F(p + "_up");
     std::vector<float> act(g.size());
@@ -746,9 +1354,10 @@ inline CaseReport RunOperatorCase(
       act[i] = (g[i] / (1.0F + std::exp(-g[i]))) * u[i];
     }
     ExpectNear(taps.F(p + "_act"), act, 1e-5, 1e-7, p + " swiglu");
-    stage((p + "_out").c_str(),
-          CheckProjection(down, zeros, taps.F(p + "_act"), taps.F(p + "_out"),
-                          mode, opt.stage_tol));
+    const auto dn = captured(p + "_out", 1, down.type);
+    stage(p + "_down",
+          CheckCapturedProjection(down, zeros, taps.F(p + "_act"), tokens,
+                                  taps.F(p + "_out"), dn[0]));
   };
 
   if (!device.moe()) {
@@ -758,7 +1367,6 @@ inline CaseReport RunOperatorCase(
   } else {
     const std::size_t E = config.num_experts;
     const std::size_t U = config.num_experts_used;
-    const std::size_t F = config.expert_ff;
     // Router: logits, then the selection and weights.
     ExpectNear(taps.F("router_logits"), matched.logits, 2e-5, 5e-5,
                "router logits");
@@ -784,16 +1392,23 @@ inline CaseReport RunOperatorCase(
         Require(sum < 6.103515625e-5, label + ": clamp not engaged");
       }
     }
-    // Routed experts. Each (token, slot) row is one projection row.
-    std::vector<std::int32_t> expert_of_slot(ids.begin(), ids.end());
-    std::vector<float> slot_x(tokens * U * H);
-    for (std::size_t slot = 0; slot < tokens * U; ++slot) {
-      std::copy_n(x.data() + (slot / U) * H, H, slot_x.data() + slot * H);
+    // Routed experts. Each (token, slot) row is one projection row. The
+    // vector path quantizes x once for gate and up (one row per token, read
+    // by every slot); the batched path quantizes one gathered row per slot
+    // for each of the two projections.
+    const std::vector<std::int32_t> expert_of_slot(ids.begin(), ids.end());
+    const GgmlType rt = lw.ffn_gate_exps.type;
+    const auto gu = captured("gate", vector ? 1 : 2, rt);
+    const QuantRows& gq = gu[0];
+    const QuantRows& uq = vector ? gu[0] : gu[1];
+    if (!vector) {
+      shared("routed gate/up input", {&gu[0], &gu[1]});
     }
-    stage("gate", CheckProjection(lw.ffn_gate_exps, expert_of_slot, slot_x,
-                                  taps.F("gate"), mode, opt.stage_tol));
-    stage("up", CheckProjection(lw.ffn_up_exps, expert_of_slot, slot_x,
-                                taps.F("up"), mode, opt.stage_tol));
+    stage("gate", CheckCapturedProjection(lw.ffn_gate_exps, expert_of_slot, x,
+                                          tokens, taps.F("gate"), gq, U));
+    stage("up", CheckCapturedProjection(lw.ffn_up_exps, expert_of_slot, x,
+                                        tokens, taps.F("up"), uq, U));
+    x_captures.insert(x_captures.end(), gu.begin(), gu.end());
     const auto& g = taps.F("gate");
     const auto& u = taps.F("up");
     std::vector<float> act(g.size());
@@ -801,10 +1416,10 @@ inline CaseReport RunOperatorCase(
       act[i] = (g[i] / (1.0F + std::exp(-g[i]))) * u[i];
     }
     ExpectNear(taps.F("act"), act, 1e-5, 1e-7, "routed swiglu");
-    stage("down",
-          CheckProjection(lw.ffn_down_exps, expert_of_slot, taps.F("act"),
-                          taps.F("down"), mode, opt.stage_tol));
-    (void)F;
+    const auto dq = captured("down", 1, rt);
+    stage("down", CheckCapturedProjection(lw.ffn_down_exps, expert_of_slot,
+                                          taps.F("act"), tokens * U,
+                                          taps.F("down"), dq[0]));
     dense_stages("shared", lw.ffn_gate_shexp, lw.ffn_up_shexp,
                  lw.ffn_down_shexp);
     // Combine: sum_s w_s * down_s, left to right, plus the shared expert.
@@ -820,6 +1435,16 @@ inline CaseReport RunOperatorCase(
       }
     }
     ExpectNear(tapped, combined, 1e-5, 1e-6, "combine");
+  }
+  // Every quantization of x in one layout (routed and shared expert alike)
+  // must be the same: one deterministic quantizer, one input.
+  std::map<int, std::vector<const QuantRows*>> by_layout;
+  for (const QuantRows& q : x_captures) {
+    by_layout[q.layout].push_back(&q);
+  }
+  for (const auto& [layout, list] : by_layout) {
+    shared(std::string("every ") + LayoutName(layout) + " quantization of x",
+           list);
   }
 
   if (e2e.max_over_rms > opt.e2e_tol) {
@@ -858,9 +1483,9 @@ inline std::string CaseLabel(const std::string& what, std::uint32_t tokens,
 inline void PrintReport(const CaseReport& r) {
   std::cout << std::setprecision(3) << std::scientific << "  " << r.label
             << ": e2e " << r.e2e_over_rms << " of rms (abs " << r.e2e_abs
-            << "), stage " << r.stage_over_rms << ", Q8 noise "
-            << r.f32_over_rms << ", tie-flip rows " << r.flip_rows
-            << ", scale-boundary rows " << r.scale_rows;
+            << "), stage " << r.stage_over_rms << " of rms ("
+            << r.stage_over_bound << " of bound), Q8 noise " << r.f32_over_rms
+            << ", boundary codes " << r.boundary_codes;
   if (r.margin >= 0) {
     std::cout << ", margin " << std::defaultfloat << r.margin;
   }

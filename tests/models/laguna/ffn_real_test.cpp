@@ -4,7 +4,8 @@
 // expert. Each layer's tensors (about 2 GiB for the routed ones) are uploaded
 // alone and freed before the next. Without the GGUF the test exits 77 and
 // CTest reports a skip, which verifies nothing. The checks and tolerances are
-// those of ffn_ops_test.cpp, which also describes them.
+// those of ffn_ops_test.cpp (captured, validated activations per stage),
+// which also describes them.
 #include <iostream>
 #include <memory>
 
@@ -47,8 +48,9 @@ struct Case {
 };
 
 struct Worst {
-  double e2e{0}, abs{0}, stage{0};
-  std::size_t cases{0}, flips{0}, scale{0};
+  double e2e{0}, abs{0};
+  std::size_t cases{0}, boundary{0};
+  std::map<std::string, StageReport> stages;
 };
 std::map<std::string, Worst> g_worst;
 
@@ -75,9 +77,14 @@ void Run(const std::string& type, const ml::ModelWeights& weights,
     Worst& w = g_worst[type];
     w.e2e = std::max(w.e2e, report.e2e_over_rms);
     w.abs = std::max(w.abs, report.e2e_abs);
-    w.stage = std::max(w.stage, report.stage_over_rms);
-    w.flips += report.flip_rows;
-    w.scale += report.scale_rows;
+    for (const auto& [name, st] : report.stages) {
+      StageReport& ws = w.stages[name];
+      ws.over_rms = std::max(ws.over_rms, st.over_rms);
+      ws.over_bound = std::max(ws.over_bound, st.over_bound);
+      ws.boundary_codes += st.boundary_codes;
+      ws.blocks += st.blocks;
+    }
+    w.boundary += report.boundary_codes;
     ++w.cases;
   }
 }
@@ -148,9 +155,12 @@ int main() {
     for (const auto& [type, w] : g_worst) {
       std::cout << "  " << type << ": " << w.cases
                 << " cases, worst end-to-end " << w.e2e << " of rms (abs "
-                << w.abs << "), worst unexplained stage " << w.stage
-                << ", tie-flip rows " << w.flips << ", scale-boundary rows "
-                << w.scale << "\n";
+                << w.abs << "), boundary codes " << w.boundary << "\n";
+      for (const auto& [name, st] : w.stages) {
+        std::cout << "    " << name << ": worst " << st.over_rms << " of rms, "
+                  << st.over_bound << " of bound; " << st.boundary_codes
+                  << " boundary codes in " << st.blocks << " blocks\n";
+      }
     }
     return 0;
   } catch (const std::exception& e) {

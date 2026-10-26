@@ -259,7 +259,12 @@ void LayerFfn::Release() noexcept {
 namespace {
 
 /// Copies `t` to the device (appending the allocation to `owned`) and
-/// returns its descriptor.
+/// returns its descriptor. Quantized matrices get 512 zeroed columns' worth
+/// of bytes after the last row, as ggml's MATRIX_ROW_PADDING allocation
+/// does: the MMQ tile loaders read whole 512-column tiles, so a row length
+/// that is not a multiple of 512 (the shared expert's 320) would otherwise
+/// read past the allocation in the last row, and a non-finite value there
+/// poisons that output (then sanitized to 0).
 bool UploadTensor(const TensorRef& t, std::vector<void*>* owned,
                   std::size_t* bytes, DeviceMatrix* out,
                   std::string* error_msg) {
@@ -267,15 +272,21 @@ bool UploadTensor(const TensorRef& t, std::vector<void*>* owned,
     Assign(error_msg, "laguna ffn upload: missing tensor");
     return false;
   }
+  constexpr std::size_t kRowPadding = 512;  // ggml MATRIX_ROW_PADDING
   const std::size_t size = t.SizeBytes();
+  const std::size_t tail =
+      t.type == GgmlType::kF32 ? 0 : t.RowBytes() * kRowPadding / t.cols;
   void* device = nullptr;
-  if (!CheckHip(hipMalloc(&device, size), "hipMalloc", error_msg)) {
+  if (!CheckHip(hipMalloc(&device, size + tail), "hipMalloc", error_msg)) {
     return false;
   }
   owned->push_back(device);
-  *bytes += size;
+  *bytes += size + tail;
   if (!CheckHip(hipMemcpy(device, t.data, size, hipMemcpyHostToDevice),
-                "hipMemcpy", error_msg)) {
+                "hipMemcpy", error_msg) ||
+      (tail != 0 &&
+       !CheckHip(hipMemset(static_cast<char*>(device) + size, 0, tail),
+                 "hipMemset", error_msg))) {
     return false;
   }
   out->data = device;
@@ -387,7 +398,17 @@ bool LayerFfn::ReplaceRouter(const std::vector<float>& values,
 // ---- FfnOps
 // ------------------------------------------------------------------
 
-FfnOps::FfnOps(hipStream_t stream) : stream_(stream) {
+namespace {
+hipError_t DefaultAlloc(void** ptr, std::size_t bytes) {
+  return hipMalloc(ptr, bytes);
+}
+hipError_t DefaultFree(void* ptr) {
+  return hipFree(ptr);
+}
+}  // namespace
+
+FfnOps::FfnOps(hipStream_t stream)
+    : stream_(stream), alloc_(DefaultAlloc), free_(DefaultFree) {
   int device = 0;
   initialized_ =
       hipGetDevice(&device) == hipSuccess && qfn_mmq_init(device) == 0;
@@ -401,30 +422,44 @@ FfnOps::~FfnOps() {
         static_cast<void*>(up_), static_cast<void*>(act_),
         static_cast<void*>(down_), static_cast<void*>(shared_), q8_}) {
     if (p != nullptr) {
-      (void)hipFree(p);
+      (void)free_(p);
     }
   }
 }
 
-bool FfnOps::Reserve(void** ptr, std::size_t* capacity, std::size_t bytes,
+std::size_t FfnOps::scratch_bytes() const noexcept {
+  return logits_cap_ + ids_cap_ + weights_cap_ + gate_cap_ + up_cap_ +
+         act_cap_ + down_cap_ + shared_cap_ + q8_cap_;
+}
+
+void FfnOps::SetAllocatorForTesting(DeviceAlloc alloc, DeviceFree release) {
+  alloc_ = alloc != nullptr ? alloc : DefaultAlloc;
+  free_ = release != nullptr ? release : DefaultFree;
+}
+
+template<class T>
+bool FfnOps::Reserve(T** ptr, std::size_t* capacity, std::size_t bytes,
                      std::string* error_msg) {
   if (bytes <= *capacity) {
     return true;
   }
-  // Growth waits for the stream, then frees: nothing else uses this scratch.
-  // Preallocate to the largest call to keep pointers stable.
+  // Allocate the replacement first: on failure the owner keeps its old,
+  // still valid buffer and capacity. Growth waits for the stream before
+  // freeing the old buffer (nothing else uses this scratch). Preallocate to
+  // the largest call to keep pointers stable.
+  void* fresh = nullptr;
+  if (!CheckHip(alloc_(&fresh, bytes), "hipMalloc scratch", error_msg)) {
+    return false;
+  }
   if (!CheckHip(hipStreamSynchronize(stream_), "hipStreamSynchronize",
                 error_msg)) {
+    (void)free_(fresh);
     return false;
   }
   if (*ptr != nullptr) {
-    (void)hipFree(*ptr);
-    *ptr = nullptr;
-    *capacity = 0;
+    (void)free_(static_cast<void*>(*ptr));
   }
-  if (!CheckHip(hipMalloc(ptr, bytes), "hipMalloc scratch", error_msg)) {
-    return false;
-  }
+  *ptr = static_cast<T*>(fresh);
   *capacity = bytes;
   return true;
 }
@@ -456,23 +491,13 @@ bool FfnOps::Route(const MoeFfnWeights& w, const float* x, std::uint32_t hidden,
     return false;
   }
   const std::size_t e = w.experts;
-  void* p = logits_;
-  if (!Reserve(&p, &logits_cap_, tokens * e * sizeof(float), error_msg)) {
+  if (!Reserve(&logits_, &logits_cap_, tokens * e * sizeof(float), error_msg) ||
+      !Reserve(&ids_, &ids_cap_, std::size_t{tokens} * w.used * sizeof(int),
+               error_msg) ||
+      !Reserve(&weights_, &weights_cap_,
+               std::size_t{tokens} * w.used * sizeof(float), error_msg)) {
     return false;
   }
-  logits_ = static_cast<float*>(p);
-  p = ids_;
-  if (!Reserve(&p, &ids_cap_, std::size_t{tokens} * w.used * sizeof(int),
-               error_msg)) {
-    return false;
-  }
-  ids_ = static_cast<std::int32_t*>(p);
-  p = weights_;
-  if (!Reserve(&p, &weights_cap_, std::size_t{tokens} * w.used * sizeof(float),
-               error_msg)) {
-    return false;
-  }
-  weights_ = static_cast<float*>(p);
   RouterLogitsKernel<<<dim3(w.experts, tokens), kLogitThreads, 0, stream_>>>(
       x, w.router, logits_, hidden, w.experts);
   RouterTopKKernel<<<tokens, kRouterThreads, 0, stream_>>>(
@@ -497,11 +522,9 @@ bool FfnOps::ProjectDense(const DeviceMatrix& w, const float* x, float* out,
   const int N = static_cast<int>(tokens);
   int rc = 0;
   if (vector) {
-    void* p = q8_;
-    if (!Reserve(&p, &q8_cap_, qfn_mmq_q8_1_bytes(N, K), error_msg)) {
+    if (!Reserve(&q8_, &q8_cap_, qfn_mmq_q8_1_bytes(N, K), error_msg)) {
       return false;
     }
-    q8_ = p;
     rc = qfn_mmq_quantize_q8_1(x, q8_, N, K, stream_);
     if (rc == 0) {
       rc = qfn_mmq_q8_0_dense_vec_preq(w.data, nullptr, q8_, out, M, N, K,
@@ -527,21 +550,11 @@ bool FfnOps::DenseImpl(const DenseFfnWeights& w, const float* x, float* out,
     return false;
   }
   const std::size_t bytes = tokens * ff * sizeof(float);
-  void* p = gate_;
-  if (!Reserve(&p, &gate_cap_, bytes, error_msg)) {
+  if (!Reserve(&gate_, &gate_cap_, bytes, error_msg) ||
+      !Reserve(&up_, &up_cap_, bytes, error_msg) ||
+      !Reserve(&act_, &act_cap_, bytes, error_msg)) {
     return false;
   }
-  gate_ = static_cast<float*>(p);
-  p = up_;
-  if (!Reserve(&p, &up_cap_, bytes, error_msg)) {
-    return false;
-  }
-  up_ = static_cast<float*>(p);
-  p = act_;
-  if (!Reserve(&p, &act_cap_, bytes, error_msg)) {
-    return false;
-  }
-  act_ = static_cast<float*>(p);
   const std::size_t count = tokens * ff;
   if (!ProjectDense(w.gate, x, gate_, tokens, vector, error_msg) ||
       !ProjectDense(w.up, x, up_, tokens, vector, error_msg) ||
@@ -629,10 +642,7 @@ bool FfnOps::Moe(const MoeFfnWeights& w, const float* x, float* out,
   const std::size_t slots = std::size_t{tokens} * w.used;
   const auto reserve = [&](float** buffer, std::size_t* capacity,
                            std::size_t floats) {
-    void* p = *buffer;
-    const bool ok = Reserve(&p, capacity, floats * sizeof(float), error_msg);
-    *buffer = static_cast<float*>(p);
-    return ok;
+    return Reserve(buffer, capacity, floats * sizeof(float), error_msg);
   };
   if (!reserve(&gate_, &gate_cap_, slots * ff) ||
       !reserve(&up_, &up_cap_, slots * ff) ||

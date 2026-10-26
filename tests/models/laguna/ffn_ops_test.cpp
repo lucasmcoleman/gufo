@@ -7,28 +7,30 @@
 // expert, shared expert, combine) in the activation mode of the path taken,
 // compares the final output with ref::FfnForward, then reruns untapped (two
 // queued calls, no synchronization in between) and requires a bit-identical
-// result. Tolerances:
+// result. Checks and tolerances:
 //
-//  * Stage checks (5e-5 of the oracle's rms): the integer dot products are
-//    exact and both sides apply the same Q8 rounding, so only float summation
-//    order differs: about 1e-6 observed, up to 2e-5 on real Q5_K weights,
-//    whose tiles add d*sc*dot and an opposing min term in float32 and so
-//    amplify the rounding by their cancellation. The oracle models each path's
-//    activation rounding exactly: MMVQ Q8_1 scales are fp16, MMQ's D4 layout
-//    (Q8_0, Q6_K, IQ4_XS) keeps a float scale, and MMQ Q4_K/Q5_K tiles also
-//    round d*sc, dmin*m and the block sum to fp16 (ref::MatMulRows).
-//  * A stage row may differ more only when an input element lies within 4e-5
-//    (kTieMargin, in Q8 codes) of a Q8 rounding boundary: the GPU's
-//    quantization uses a reciprocal that is not correctly rounded, so it can
-//    round that element the other way (a one-LSB change of one activation).
-//    CheckProjection accepts such a row only if re-rounding some of those
-//    near-tie elements reproduces the GPU row to the same 5e-5. The other
-//    source is a stored fp16 scale (or Q5_K block sum) within an ulp of a
-//    rounding boundary: the GPU forms scales with approximate reciprocals, so
-//    it can round to the neighbouring fp16 value (relative change 2^-11 of one
-//    block's contribution). A row passes that way only if moving exactly one
-//    such scale by one fp16 step reproduces the GPU row to 5e-5. Anything else
-//    is unexplained and fails.
+//  * Projection stages consume the GPU's own quantized activations: qfn_mmq
+//    hands the test the packed buffer each projection kernel reads
+//    (qfn_mmq_set_activation_capture). Each block is first validated against
+//    the float input independently (ValidateBlock): every code within the
+//    derived reciprocal error of round(x * 127 / amax), so a code other than
+//    the nearest one is allowed only within that error (a few 1e-7 relative)
+//    of a .5 boundary; equal inputs with equal codes and one shared
+//    multiplier reproducing the whole block; the stored scale and sum the
+//    fp16 (or, MMQ D4, float) rounding of a value within the derived error of
+//    the unrounded amax / 127 and amax / 127 * sum(q). The bounds are derived
+//    per layout (Q8_1 for MMVQ decode, MMQ D4 and DS4 for prefill tiles) in
+//    ffn_gpu.hpp (BoundsFor). Projections sharing one input (gate/up, routed
+//    and shared expert) must have read bitwise-identical quantizations.
+//    The validated codes and scales then feed the oracle's product, which
+//    must match every output within the float accumulation bound
+//    (AccumulationUnits: (K / 16 + 18) u times the sum of the terms'
+//    magnitudes). Nothing is searched: there are no flip subsets or scale
+//    nudges, and raw errors are reported for every output.
+//  * CPU-only checker tests (TestCheckerRejects) feed fabricated captures:
+//    an off-boundary scale, inconsistent codes for equal inputs, a wrong code
+//    far from any boundary and a jointly unrealizable block must be
+//    rejected; a genuine near-boundary code must pass.
 //  * End to end (5e-3 of rms): inputs are moved off Q8 rounding boundaries
 //    (AvoidTies), but the oracle's intermediate activations still differ from
 //    the GPU's by float rounding, so a near-tie element of an intermediate row
@@ -37,10 +39,13 @@
 //    about 1e-3 on the tiny layers, against Q8 noise of 3e-2 to 1e-1 (printed
 //    as "Q8 noise"); a wiring or weighting defect is far larger. The stage
 //    checks are the exactness claim.
+//  * Scratch growth survives allocation failure (TestReserveFailure): a
+//    mocked failing allocator leaves every buffer and capacity untouched.
 #include <iostream>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <set>
 
 #include "tests/models/laguna/ffn_gpu.hpp"
 
@@ -51,22 +56,314 @@ namespace {
 struct Totals {
   std::map<std::string, double> worst_e2e;  // per quant type, / rms
   std::map<std::string, double> worst_abs;
-  std::map<std::string, double> worst_stage;
+  // per quant type and stage: worst raw error / rms, / accumulation bound
+  std::map<std::string, std::map<std::string, StageReport>> stages;
   std::size_t cases{0};
-  std::size_t flip_rows{0};
-  std::size_t scale_rows{0};
+  std::size_t boundary_codes{0};
+  std::size_t blocks{0};
 };
 Totals g_totals;
 
 void Record(const std::string& type, const CaseReport& r) {
   g_totals.worst_e2e[type] = std::max(g_totals.worst_e2e[type], r.e2e_over_rms);
   g_totals.worst_abs[type] = std::max(g_totals.worst_abs[type], r.e2e_abs);
-  g_totals.worst_stage[type] =
-      std::max(g_totals.worst_stage[type], r.stage_over_rms);
-  g_totals.flip_rows += r.flip_rows;
-  g_totals.scale_rows += r.scale_rows;
+  for (const auto& [name, st] : r.stages) {
+    StageReport& w = g_totals.stages[type][name];
+    w.over_rms = std::max(w.over_rms, st.over_rms);
+    w.over_bound = std::max(w.over_bound, st.over_bound);
+    w.max_scale_rel = std::max(w.max_scale_rel, st.max_scale_rel);
+    w.boundary_codes += st.boundary_codes;
+    w.blocks += st.blocks;
+    g_totals.blocks += st.blocks;
+  }
+  g_totals.boundary_codes += r.boundary_codes;
   ++g_totals.cases;
   PrintReport(r);
+}
+
+// ---- Checker tests on fabricated captures (CPU only) ----------------------
+
+/// A Q8_0 matrix of `sel.size()` rows and 32 columns: row r has weight 1 at
+/// column sel[r] and 0 elsewhere (scale 1).
+struct OneHot {
+  std::vector<std::uint8_t> bytes;
+  ml::TensorRef w;
+};
+OneHot MakeOneHot(const std::vector<int>& sel) {
+  OneHot m;
+  m.bytes.assign(34 * sel.size(), 0);
+  const std::uint16_t one = HalfBitsOf(1.0F);
+  for (std::size_t r = 0; r < sel.size(); ++r) {
+    std::memcpy(m.bytes.data() + 34 * r, &one, 2);
+    m.bytes[34 * r + 2 + sel[r]] = 1;
+  }
+  m.w.type = GgmlType::kQ8_0;
+  m.w.cols = 32;
+  m.w.rows = sel.size();
+  m.w.experts = 1;
+  m.w.data = m.bytes.data();
+  m.w.name = "checker.weight";
+  return m;
+}
+
+/// One 32-element row as the given layout stores it.
+QuantRows Fabricate(int layout, const std::vector<std::int8_t>& q, float d,
+                    float s) {
+  Capture c;
+  c.layout = layout;
+  c.rows = 1;
+  c.k = 32;
+  const auto put_half = [](std::uint8_t* p, float v) {
+    const std::uint16_t bits = HalfBitsOf(v);
+    std::memcpy(p, &bits, 2);
+  };
+  if (layout == QFN_MMQ_ACT_Q8_1) {
+    c.k_padded = 32;
+    c.bytes.assign(36, 0);
+    put_half(c.bytes.data(), d);
+    put_half(c.bytes.data() + 2, s);
+    std::memcpy(c.bytes.data() + 4, q.data(), 32);
+  } else {
+    c.k_padded = 128;
+    c.bytes.assign(144, 0);
+    if (layout == QFN_MMQ_ACT_MMQ_D4) {
+      std::memcpy(c.bytes.data(), &d, 4);
+    } else {
+      put_half(c.bytes.data(), d);
+      put_half(c.bytes.data() + 2, s);
+    }
+    std::memcpy(c.bytes.data() + 16, q.data(), 32);
+  }
+  return DecodeCapture(c);
+}
+
+/// Checks one fabricated activation row: `x` quantized to `q` with stored
+/// `d` and `s`, and `gpu`, the GPU's outputs of the one-hot matrix `sel`.
+StageStats CheckFabricated(const std::vector<float>& x,
+                           const std::vector<std::int8_t>& q, float d, float s,
+                           const std::vector<int>& sel,
+                           const std::vector<float>& gpu) {
+  const OneHot m = MakeOneHot(sel);
+  const QuantRows qr = Fabricate(QFN_MMQ_ACT_Q8_1, q, d, s);
+  // One activation row; output m reads column sel[m].
+  return CheckCapturedProjection(m.w, {0}, x, 1, gpu, qr);
+}
+
+void ExpectRejected(const std::string& what, const StageStats& s,
+                    bool by_validation) {
+  const bool rejected =
+      by_validation ? s.quant.violations != 0 : s.unexplained != 0;
+  Require(rejected, "checker accepted " + what);
+  std::cout << "  rejects " << what << ": "
+            << (by_validation ? s.quant.first : s.first) << "\n";
+}
+
+StageStats Rejection(const QuantStats& quant) {
+  StageStats s;
+  s.quant = quant;
+  return s;
+}
+
+void TestCheckerRejects() {
+  // Block with amax 127, so amax / 127 = 1 exactly and x * 127 / amax = x.
+  std::vector<float> x(32, 0.0F);
+  x[0] = 127.0F;
+  std::vector<std::int8_t> q(32, 0);
+  q[0] = 127;
+  // codexms #970: the exactly representable scale 1.0 stored as the next
+  // fp16 value, with no near-tie input anywhere; the output follows it.
+  {
+    const float wrong = 1.0009765625F;
+    ExpectRejected(
+        "an off-boundary fp16 scale (1.0 stored as 1.0009765625)",
+        CheckFabricated(x, q, wrong, wrong * 127.0F, {0}, {127.0F * wrong}),
+        true);
+    // Correct capture, but the product used the wrong scale.
+    ExpectRejected("an output computed with an off-boundary scale",
+                   CheckFabricated(x, q, 1.0F, 127.0F, {0}, {127.0F * wrong}),
+                   false);
+  }
+  // codexms #970: equal inputs 0.5 and 0.5 in one block (each exactly on a
+  // .5 boundary) with codes 0 and 1; each code alone is legitimate.
+  {
+    auto xe = x;
+    xe[1] = xe[2] = 0.5F;
+    auto qe = q;
+    qe[2] = 1;
+    ExpectRejected("equal inputs with different codes (0.5, 0.5 -> 0, 1)",
+                   CheckFabricated(xe, qe, 1.0F, 128.0F, {1, 2}, {0.0F, 1.0F}),
+                   true);
+    // Equal codes either way are fine.
+    for (const std::int8_t c : {0, 1}) {
+      auto qc = q;
+      qc[1] = qc[2] = c;
+      const auto ok = CheckFabricated(xe, qc, 1.0F, 127.0F + 2 * c, {1, 2},
+                                      {float(c), float(c)});
+      Require(ok.quant.violations == 0 && ok.unexplained == 0,
+              "checker rejected equal codes for equal inputs: " +
+                  ok.quant.first + ok.first);
+    }
+  }
+  // A single wrong code far from any boundary: 40.2 -> 41.
+  {
+    auto xw = x;
+    xw[3] = 40.2F;
+    auto qw = q;
+    qw[3] = 41;
+    ExpectRejected("a wrong code far from a boundary (40.2 -> 41)",
+                   CheckFabricated(xw, qw, 1.0F, 168.0F, {3}, {41.0F}), true);
+  }
+  // Each code alone is a legitimate boundary rounding, but 10.5 + 1 ulp
+  // rounding down needs a multiplier below 1 and 20.5 - 1 ulp rounding up
+  // one above 1: no single reciprocal gives both.
+  {
+    auto xj = x;
+    xj[5] = std::nextafter(10.5F, 11.0F);
+    xj[6] = std::nextafter(20.5F, 20.0F);
+    auto qj = q;
+    qj[5] = 10;
+    qj[6] = 21;
+    ExpectRejected(
+        "a jointly unrealizable block (10.5+ulp -> 10, "
+        "20.5-ulp -> 21)",
+        CheckFabricated(xj, qj, 1.0F, 158.0F, {5, 6}, {10.0F, 21.0F}), true);
+  }
+  // Genuine near-boundary case: x * 127 / amax = 10.5 + 9.5e-7, within the
+  // Q8_1 code bound (7u * 10.5 = 4.4e-6) of the boundary, so an approximate
+  // reciprocal may round it down. Accepted, and counted.
+  {
+    auto xn = x;
+    xn[4] = std::nextafter(10.5F, 11.0F);
+    for (const std::int8_t c : {10, 11}) {
+      auto qn = q;
+      qn[4] = c;
+      const auto ok =
+          CheckFabricated(xn, qn, 1.0F, 127.0F + c, {4, 0}, {float(c), 127.0F});
+      Require(ok.quant.violations == 0 && ok.unexplained == 0 &&
+                  ok.quant.boundary_codes == (c == 10 ? 1U : 0U),
+              "checker rejected a genuine near-boundary code: " +
+                  ok.quant.first + ok.first);
+    }
+    std::cout << "  accepts a genuine near-boundary code (10.5+ulp -> 10 or "
+                 "11)\n";
+  }
+  // MMQ layouts: D4 stores the float scale (bound 6u), DS4 fp16 scale and
+  // fp16 sum (bound 7u on the unrounded sum).
+  {
+    QuantStats st = ValidateQuantRows(
+        Fabricate(QFN_MMQ_ACT_MMQ_D4, q, 1.0F + 0x1p-20F, 0.0F), x, 1);
+    ExpectRejected("an MMQ D4 float scale 16u from amax/127", Rejection(st),
+                   true);
+    st = ValidateQuantRows(
+        Fabricate(QFN_MMQ_ACT_MMQ_D4, q, 1.0F + 0x1p-23F, 0.0F), x, 1);
+    Require(st.violations == 0,
+            "checker rejected a D4 scale 2u off: " + st.first);
+    st = ValidateQuantRows(Fabricate(QFN_MMQ_ACT_MMQ_DS4, q, 1.0F, 127.0625F),
+                           x, 1);
+    ExpectRejected("an MMQ DS4 block sum one fp16 step off (127.0625)",
+                   Rejection(st), true);
+    st = ValidateQuantRows(Fabricate(QFN_MMQ_ACT_MMQ_DS4, q, 1.0F, 127.0F), x,
+                           1);
+    Require(st.violations == 0,
+            "checker rejected a correct DS4 block: " + st.first);
+  }
+}
+
+// ---- Scratch allocation failure ------------------------------------------
+
+std::set<void*> g_live;       // allocations made through the mock
+std::size_t g_bad_frees = 0;  // frees of pointers not live (double frees)
+std::size_t g_alloc_calls = 0;
+bool g_fail_alloc = false;
+
+hipError_t MockAlloc(void** ptr, std::size_t bytes) {
+  ++g_alloc_calls;
+  if (g_fail_alloc) {
+    *ptr = nullptr;
+    return hipErrorOutOfMemory;
+  }
+  const hipError_t e = hipMalloc(ptr, bytes);
+  if (e == hipSuccess) {
+    g_live.insert(*ptr);
+  }
+  return e;
+}
+
+hipError_t MockFree(void* ptr) {
+  if (g_live.erase(ptr) == 0) {
+    ++g_bad_frees;
+    return hipErrorInvalidValue;
+  }
+  return hipFree(ptr);
+}
+
+/// Scratch growth with a failing allocator: the call fails cleanly, every
+/// buffer and capacity is left as it was (a later call that fits reuses
+/// them, bit-identically), nothing is freed twice, and the destructor frees
+/// exactly what was allocated.
+void TestReserveFailure() {
+  for (const bool moe : {false, true}) {
+    TinyLayer layer(GgmlType::kQ6_K, moe, 77);
+    std::string error;
+    auto device = gpu::LayerFfn::Upload(layer.config(), layer.layer(), &error);
+    Require(device.has_value(), "upload: " + error);
+    const std::size_t H = layer.config().hidden_size;
+    const auto x1 = RandomRows(1, H, layer.rng());
+    const auto x37 = RandomRows(37, H, layer.rng());
+    float* dx1 = ToDevice(x1);
+    float* dx37 = ToDevice(x37);
+    float* dout = nullptr;
+    CheckHip(hipMalloc(&dout, x37.size() * sizeof(float)), "alloc");
+    g_live.clear();
+    g_bad_frees = 0;
+    g_fail_alloc = false;
+    {
+      GpuContext ctx;
+      ctx.ops().SetAllocatorForTesting(MockAlloc, MockFree);
+      const auto run = [&](const float* dx, std::uint32_t tokens,
+                           gpu::Path path) {
+        error.clear();
+        const bool ok = moe ? ctx.ops().Moe(device->routed(), dx, dout,
+                                            static_cast<std::uint32_t>(H),
+                                            tokens, path, &error)
+                            : ctx.ops().Dense(device->dense(), dx, dout, tokens,
+                                              path, &error);
+        CheckHip(hipStreamSynchronize(ctx.stream()), "sync");
+        return ok;
+      };
+      Require(run(dx1, 1, gpu::Path::kVector), "first call failed: " + error);
+      const auto first = ToHost(dout, H);
+      const std::size_t held = ctx.ops().scratch_bytes();
+      const std::size_t live = g_live.size();
+      const std::int32_t* ids = ctx.ops().ids();
+      g_fail_alloc = true;
+      Require(!run(dx37, 37, gpu::Path::kBatched),
+              "growth succeeded with a failing allocator");
+      Require(error.find("hipMalloc scratch") != std::string::npos,
+              "unexpected failure message: " + error);
+      Require(ctx.ops().scratch_bytes() == held && g_live.size() == live &&
+                  ctx.ops().ids() == ids && g_bad_frees == 0,
+              "failed growth changed the scratch");
+      const std::size_t calls = g_alloc_calls;
+      Require(run(dx1, 1, gpu::Path::kVector),
+              "call after a failed growth failed: " + error);
+      Require(g_alloc_calls == calls, "a fitting call allocated");
+      Require(std::memcmp(ToHost(dout, H).data(), first.data(),
+                          H * sizeof(float)) == 0,
+              "result after a failed growth differs");
+      g_fail_alloc = false;
+      Require(run(dx37, 37, gpu::Path::kBatched),
+              "growth after recovery failed: " + error);
+    }
+    Require(g_live.empty() && g_bad_frees == 0,
+            "destructor leaked or double-freed scratch");
+    (void)hipFree(dx1);
+    (void)hipFree(dx37);
+    (void)hipFree(dout);
+    std::cout << "  " << (moe ? "moe" : "dense")
+              << ": failed scratch growth leaves buffers and capacity intact, "
+                 "no double free\n";
+  }
 }
 
 using Cases = std::vector<std::pair<std::uint32_t, gpu::Path>>;
@@ -331,6 +628,10 @@ void TestConcurrentStreams() {
 
 int main() {
   try {
+    std::cout << "stage checker on fabricated captures\n";
+    TestCheckerRejects();
+    std::cout << "scratch allocation failure\n";
+    TestReserveFailure();
     std::cout << "routed experts, random tiny layers\n";
     TestRoutedTypes();
     std::cout << "dense layer 0\n";
@@ -339,15 +640,20 @@ int main() {
     TestRouterEdges();
     std::cout << "streams\n";
     TestConcurrentStreams();
-    std::cout << "SUMMARY " << g_totals.cases << " operator cases passed, "
-              << g_totals.flip_rows
-              << " stage rows explained as Q8 tie flips and "
-              << g_totals.scale_rows << " as one fp16 scale boundary\n";
+    std::cout << "SUMMARY " << g_totals.cases << " operator cases passed; "
+              << g_totals.blocks << " captured activation blocks validated, "
+              << g_totals.boundary_codes
+              << " codes legitimately not the nearest (within the derived "
+                 "reciprocal error of a .5 boundary)\n";
     for (const auto& [type, worst] : g_totals.worst_e2e) {
       std::cout << "  " << type << ": worst end-to-end " << worst
-                << " of rms (abs " << g_totals.worst_abs[type]
-                << "), worst unexplained stage " << g_totals.worst_stage[type]
-                << "\n";
+                << " of rms (abs " << g_totals.worst_abs[type] << ")\n";
+      for (const auto& [name, st] : g_totals.stages[type]) {
+        std::cout << "    " << name << ": worst " << st.over_rms << " of rms, "
+                  << st.over_bound << " of bound; " << st.boundary_codes
+                  << " boundary codes in " << st.blocks
+                  << " blocks, scale deviation " << st.max_scale_rel << "\n";
+      }
     }
     return 0;
   } catch (const std::exception& e) {

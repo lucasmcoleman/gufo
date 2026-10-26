@@ -11,6 +11,30 @@ void qfn_mmq_release_stream(hipStream_t stream);
 
 void qfn_mmq_set_routed_max_expert_rows(int rows);
 
+// Test hook for operator checks: after each activation quantization this
+// library performs for a projection (and in qfn_mmq_quantize_q8_1), `fn` is
+// called with the packed buffer the following kernels read, while it is
+// still allocated. `layout` is one of QFN_MMQ_ACT_*; the buffer holds `rows`
+// rows of `k` values padded to `k_padded`. Q8_1 rows are consecutive
+// block_q8_1 (half2 {d, d*sum(q)}, 32 int8). MMQ buffers are block_q8_1_mmq
+// (16 scale bytes, 128 int8) at index (column / 128) * rows + row. When not
+// null, device arrays `row_src[row]` and `row_dst[row]` give the input row a
+// buffer row was quantized from and the output row it feeds. `fn` may
+// synchronize `stream` and copy the buffer. Null disables the hook; not
+// thread-safe, set it only while no other thread calls this library.
+enum {
+  QFN_MMQ_ACT_Q8_1 = 0,
+  QFN_MMQ_ACT_MMQ_D4 = 1,
+  QFN_MMQ_ACT_MMQ_DS4 = 2,
+  QFN_MMQ_ACT_MMQ_D2S6 = 3,
+};
+typedef void (*qfn_mmq_activation_capture_fn)(
+    void* user, int layout, const void* data, size_t bytes, int rows, int k,
+    int k_padded, const int32_t* row_src, const int32_t* row_dst,
+    hipStream_t stream);
+void qfn_mmq_set_activation_capture(qfn_mmq_activation_capture_fn fn,
+                                    void* user);
+
 void qfn_mmq_set_routed_tile_cols(int cols);
 
 int qfn_mmq_routed_tile_cols_for_counts(const unsigned int *counts,

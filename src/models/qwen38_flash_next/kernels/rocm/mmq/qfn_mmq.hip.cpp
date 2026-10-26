@@ -11,6 +11,29 @@ namespace qfn_mmq {
 static int g_routed_max_expert_rows = 0;
 static int g_routed_tile_cols = 0;
 static int prepare_decode_kernels();
+static qfn_mmq_activation_capture_fn g_capture = nullptr;
+static void* g_capture_user = nullptr;
+extern "C" void qfn_mmq_set_activation_capture(
+        qfn_mmq_activation_capture_fn fn, void* user) {
+    g_capture = fn;
+    g_capture_user = user;
+}
+static int mmq_capture_layout(ggml_type type) {
+    switch (mmq_get_q8_1_ds_layout(type)) {
+        case MMQ_Q8_1_DS_LAYOUT_DS4:  return QFN_MMQ_ACT_MMQ_DS4;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6: return QFN_MMQ_ACT_MMQ_D2S6;
+        default:                      return QFN_MMQ_ACT_MMQ_D4;
+    }
+}
+static void capture_activations(int layout, const void* data, size_t bytes,
+                                int64_t rows, int64_t k, int64_t k_padded,
+                                const int32_t* row_src, const int32_t* row_dst,
+                                hipStream_t stream) {
+    if (g_capture != nullptr) {
+        g_capture(g_capture_user, layout, data, bytes, (int)rows, (int)k,
+                  (int)k_padded, row_src, row_dst, stream);
+    }
+}
 extern "C" int qfn_mmq_init(int device) {
     if (device < 0) {
         fprintf(stderr, "qfn_mmq_init: invalid device %d\n", device);
@@ -145,6 +168,8 @@ int qfn_mmq_dense_impl(
         fprintf(stderr, "%s: quantize failed: %s\n", tag, hipGetErrorString(err));
         return -2;
     }
+    capture_activations(mmq_capture_layout(type), src1_q8_1, nbytes_src1_q8_1,
+                        ne11, K, ne10_padded, nullptr, nullptr, stream);
 
     const int64_t blck   = ggml_blck_size(type);
     const int64_t s01    = (int64_t)K / blck;
@@ -288,6 +313,9 @@ int qfn_mmq_moe_impl(
                 tag, hipGetErrorString(err));
         return -3;
     }
+    capture_activations(mmq_capture_layout(type), src1_q8_1.get(),
+                        nbytes_src1_q8_1, ne_get_rows, K, ne10_padded,
+                        ids_src1.get(), ids_dst.get(), stream);
 
     const int64_t s1            = (int64_t)M;
 
@@ -446,6 +474,8 @@ static int moe_vector_projection(int weight_type, const void* W,
               hipGetErrorString(err));
       return -2;
     }
+    capture_activations(QFN_MMQ_ACT_Q8_1, src1_q8_1_ptr, nbytes_q8_1, n_tokens,
+                        K, ne10_padded, slot_of_rank, slot_of_rank, stream);
   } else if (!X_q8) {
     quantize_row_q8_1_hip(X_f32, nullptr, (void*)src1_q8_1_ptr, type, K,
                           (int64_t)K, (int64_t)K, (int64_t)K * n_tokens,
@@ -457,6 +487,8 @@ static int moe_vector_projection(int weight_type, const void* W,
               hipGetErrorString(err));
       return -2;
     }
+    capture_activations(QFN_MMQ_ACT_Q8_1, src1_q8_1_ptr, nbytes_q8_1, n_tokens,
+                        K, ne10_padded, nullptr, nullptr, stream);
   }
   const auto* input = reinterpret_cast<const block_q8_1*>(
       X_q8 ? X_q8 : static_cast<const void*>(src1_q8_1_ptr));
@@ -610,7 +642,12 @@ extern "C" int qfn_mmq_quantize_q8_1(
         X_f32, nullptr, X_q8, GGML_TYPE_Q8_0, K,
         (int64_t)K, (int64_t)K * N, (int64_t)K * N,
         ne10_padded, N, 1, 1, stream);
-    return hipGetLastError() == hipSuccess ? 0 : -2;
+    if (hipGetLastError() != hipSuccess) {
+        return -2;
+    }
+    capture_activations(QFN_MMQ_ACT_Q8_1, X_q8, qfn_mmq_q8_1_bytes(N, K), N, K,
+                        ne10_padded, nullptr, nullptr, stream);
+    return 0;
 }
 
 // The 320-row HC down projection has too few waves to hide its long K

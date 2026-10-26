@@ -156,8 +156,23 @@ public:
   [[nodiscard]] const std::int32_t* ids() const noexcept { return ids_; }
   [[nodiscard]] const float* weights() const noexcept { return weights_; }
 
+  /// Total bytes of scratch currently held (grows monotonically).
+  [[nodiscard]] std::size_t scratch_bytes() const noexcept;
+
+  /// Test seam for the scratch allocator: every scratch allocation and free
+  /// (including the destructor's) goes through these. Null restores
+  /// hipMalloc/hipFree. Swap them only while no work is queued that would
+  /// free scratch through the other pair.
+  using DeviceAlloc = hipError_t (*)(void** ptr, std::size_t bytes);
+  using DeviceFree = hipError_t (*)(void* ptr);
+  void SetAllocatorForTesting(DeviceAlloc alloc, DeviceFree release);
+
 private:
-  bool Reserve(void** ptr, std::size_t* capacity, std::size_t bytes,
+  /// Grows `*ptr` to at least `bytes`. The replacement is allocated before
+  /// the old buffer is freed, so on failure `*ptr` and `*capacity` keep their
+  /// old (still valid) values; on success both are updated together.
+  template<class T>
+  bool Reserve(T** ptr, std::size_t* capacity, std::size_t bytes,
                std::string* error_msg);
   bool ProjectDense(const DeviceMatrix& w, const float* x, float* out,
                     std::uint32_t tokens, bool vector, std::string* error_msg);
@@ -173,6 +188,8 @@ private:
 
   hipStream_t stream_;
   TapFn tap_;
+  DeviceAlloc alloc_;
+  DeviceFree free_;
   bool initialized_{false};
   float* logits_{nullptr};
   std::int32_t* ids_{nullptr};
