@@ -1,8 +1,10 @@
 #include "src/models/glm53_flash/kernels/kda.hpp"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 // Forked from src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
@@ -400,6 +402,97 @@ bool KdaOutput(const float* o, const float* gate, std::uint32_t gate_stride,
   KdaOutputKernel<<<Blocks(rows, groups), kThreads, 0, stream>>>(
       o, gate, gate_stride, norm_w, out, rows, heads, eps);
   return hipGetLastError() == hipSuccess;
+}
+
+namespace {
+
+constexpr std::uint32_t kLowRankCols = 128;
+constexpr std::uint32_t kLowRankRows = 64;    // weight rows per block
+constexpr std::uint32_t kLowRankTokens = 32;  // tokens per block
+constexpr std::uint32_t kLowRankPad = kLowRankCols + 1;
+
+// Thread (r, g) = (tid % 64, tid / 64) owns row r of the tile and tokens
+// g * 8 .. g * 8 + 7. LDS rows are padded to 129 floats: lanes of a wave
+// read consecutive rows at the same k without bank conflicts, and the token
+// operand is a broadcast.
+__global__ void __launch_bounds__(kThreads)
+    LowRankQ8Kernel(const std::uint8_t* __restrict__ w,
+                    const float* __restrict__ x, float* __restrict__ y,
+                    std::uint32_t rows, std::uint32_t n_tokens) {
+  __shared__ float wl[kLowRankRows * kLowRankPad];
+  __shared__ float xl[kLowRankTokens * kLowRankPad];
+  constexpr std::uint32_t kRowBytes = (kLowRankCols / 32) * 34;
+  const std::uint32_t r0 = blockIdx.x * kLowRankRows;
+  const std::uint32_t t0 = blockIdx.y * kLowRankTokens;
+  for (std::uint32_t i = threadIdx.x; i < kLowRankRows * kLowRankCols;
+       i += kThreads) {
+    const std::uint32_t r = i / kLowRankCols;
+    const std::uint32_t k = i % kLowRankCols;
+    float v = 0.0f;
+    if (r0 + r < rows) {
+      const std::uint8_t* blk =
+          w + (std::size_t{r0 + r} * kRowBytes) + ((k / 32) * 34);
+      const float d = __half2float(
+          __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(blk)));
+      v = d * static_cast<float>(static_cast<std::int8_t>(blk[2 + (k % 32)]));
+    }
+    wl[(r * kLowRankPad) + k] = v;
+  }
+  for (std::uint32_t i = threadIdx.x; i < kLowRankTokens * kLowRankCols;
+       i += kThreads) {
+    const std::uint32_t t = i / kLowRankCols;
+    const std::uint32_t k = i % kLowRankCols;
+    xl[(t * kLowRankPad) + k] =
+        t0 + t < n_tokens ? x[(std::size_t{t0 + t} * kLowRankCols) + k] : 0.0f;
+  }
+  __syncthreads();
+  const std::uint32_t r = threadIdx.x % kLowRankRows;
+  const std::uint32_t g = threadIdx.x / kLowRankRows;
+  constexpr std::uint32_t kPerThread =
+      kLowRankTokens / (kThreads / kLowRankRows);
+  float acc[kPerThread];
+#pragma unroll
+  for (std::uint32_t j = 0; j < kPerThread; ++j) {
+    acc[j] = 0.0f;
+  }
+  const float* wr = wl + (r * kLowRankPad);
+  const float* xg = xl + (g * kPerThread * kLowRankPad);
+  for (std::uint32_t k = 0; k < kLowRankCols; ++k) {
+    const float wv = wr[k];
+#pragma unroll
+    for (std::uint32_t j = 0; j < kPerThread; ++j) {
+      acc[j] = fmaf(wv, xg[(j * kLowRankPad) + k], acc[j]);
+    }
+  }
+  if (r0 + r >= rows) {
+    return;
+  }
+#pragma unroll
+  for (std::uint32_t j = 0; j < kPerThread; ++j) {
+    const std::uint32_t t = t0 + (g * kPerThread) + j;
+    if (t < n_tokens) {
+      y[(std::size_t{t} * rows) + r0 + r] = acc[j];
+    }
+  }
+}
+
+}  // namespace
+
+bool KdaLowRankQ8(const void* w, std::uint32_t rows, std::uint32_t cols,
+                  const float* x, float* y, std::uint32_t n_tokens,
+                  hipStream_t stream) {
+  if (n_tokens == 0) {
+    return true;
+  }
+  if (w == nullptr || x == nullptr || y == nullptr || rows == 0 ||
+      cols != kLowRankCols || reinterpret_cast<std::uintptr_t>(w) % 2 != 0) {
+    return false;
+  }
+  const dim3 grid((rows + kLowRankRows - 1) / kLowRankRows,
+                  (n_tokens + kLowRankTokens - 1) / kLowRankTokens);
+  LowRankQ8Kernel<<<grid, kThreads, 0, stream>>>(
+      static_cast<const std::uint8_t*>(w), x, y, rows, n_tokens);
+  return hipPeekAtLastError() == hipSuccess;
 }
 
 }  // namespace gufo::models::glm53_flash::rocm

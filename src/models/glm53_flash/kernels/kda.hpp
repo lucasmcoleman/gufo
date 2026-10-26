@@ -83,6 +83,21 @@ bool KdaOutput(const float* o, const float* gate, std::uint32_t gate_stride,
                const float* norm_w, float eps, float* out,
                std::uint32_t n_tokens, std::uint32_t heads, hipStream_t stream);
 
+/// Prefill low-rank up-projection Y[t][r] = sum_k W[r][k] X[t][k] for a
+/// Q8_0 W of `rows` x 128 (f_b / g_b: D -> H*D), X [n_tokens][128] and Y
+/// [n_tokens][rows], F32. The 128-column rows fall outside the Q8_1 WMMA
+/// prefill GEMM (cols % 256) and gufo's batched quant GEMM is slow on them.
+/// A block dequantizes 64 rows into LDS (d * q, exact) and dots them with 32
+/// staged tokens; every output sums its 128 products in k order, in F32
+/// (exact activations, not Q8-rounded). Not bit-identical to the GEMM it
+/// replaces (summation order). Idea from the token-batched KDA projections of
+/// mikealanni/gufo 3ba034e2 / a9ea8e67 (MIT, Mike Alani); GLM-local kernel.
+/// False (nothing launched) unless cols == 128, w is 2-byte aligned and the
+/// pointers are non-null. Switch: GUFO_GLM53_KDA_LOWRANK=1 (executor.cpp).
+bool KdaLowRankQ8(const void* w, std::uint32_t rows, std::uint32_t cols,
+                  const float* x, float* y, std::uint32_t n_tokens,
+                  hipStream_t stream);
+
 }  // namespace gufo::models::glm53_flash::rocm
 
 #endif  // GUFO_MODELS_GLM53_FLASH_KERNELS_KDA_HPP_

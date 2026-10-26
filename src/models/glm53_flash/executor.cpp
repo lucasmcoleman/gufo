@@ -227,6 +227,32 @@ std::size_t LayoutKdaScratch(const Config& config, std::uint32_t tokens,
   return offset;
 }
 
+/// GUFO_GLM53_KDA_LOWRANK=1: prefill f_b / g_b (Q8_0, D = 128 columns)
+/// through rocm::KdaLowRankQ8 instead of gufo's batched quant GEMM. Off by
+/// default until a GPU A/B; decode-sized passes keep the GEMM.
+bool KdaLowRankEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_GLM53_KDA_LOWRANK");
+    return v != nullptr && *v != '\0' && *v != '0';
+  }();
+  return enabled;
+}
+
+constexpr std::uint32_t kLowRankMinTokens = 16;
+
+/// The f_b / g_b projection: KdaLowRankQ8 when enabled and applicable, else
+/// LaunchProjection.
+bool LowRankProjection(const DeviceMatrix& w, const float* x, float* y,
+                       std::uint32_t n, Stream stream) {
+  if (KdaLowRankEnabled() && n >= kLowRankMinTokens && w.experts == 1 &&
+      w.type == GgmlType::kQ8_0 && w.cols == 128 && w.rows <= UINT32_MAX &&
+      rocm::KdaLowRankQ8(w.data, static_cast<std::uint32_t>(w.rows),
+                         static_cast<std::uint32_t>(w.cols), x, y, n, stream)) {
+    return true;
+  }
+  return LaunchProjection(w, x, y, n, stream);
+}
+
 /// One pass over `n` tokens whose scratch fits.
 bool KdaPass(const OpContext& ctx, const Config& config,
              const KdaLayerDevice& w, const KdaState& state, const float* x,
@@ -254,10 +280,10 @@ bool KdaPass(const OpContext& ctx, const Config& config,
                            state.record ? state.conv_ckpt : nullptr);
   scope.emplace(ctx.profiler, "kda/proj_f", stream);
   ok = ok && LaunchProjection(w.f_a, x, s.low, n, stream);
-  ok = ok && LaunchProjection(w.f_b, s.low, s.f, n, stream);
+  ok = ok && LowRankProjection(w.f_b, s.low, s.f, n, stream);
   scope.emplace(ctx.profiler, "kda/proj_g", stream);
   ok = ok && LaunchProjection(w.g_a, x, s.low, n, stream);
-  ok = ok && LaunchProjection(w.g_b, s.low, s.gate, n, stream);
+  ok = ok && LowRankProjection(w.g_b, s.low, s.gate, n, stream);
   scope.emplace(ctx.profiler, "kda/proj_beta", stream);
   ok = ok && LaunchProjection(w.beta, x, s.beta_in, n, stream);
   // Forget gate (HF:353-369), l2norm + beta (HF:451-459, 733), recurrence
