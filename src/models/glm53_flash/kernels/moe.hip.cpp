@@ -567,6 +567,30 @@ std::size_t FfnScratchBytes(const Config& c, std::uint32_t tokens) noexcept {
   return b.layout.valid ? b.layout.bytes : 0;
 }
 
+bool FfnCaptureSafe(const Config& c, std::uint32_t /*layer*/,
+                    const FfnLayerDevice& w, std::uint32_t tokens) {
+  if (tokens == 0 || tokens > expert_vec::kMaxTokens) {
+    return false;
+  }
+  // Project's unrouted routes below 24 tokens: FloatProject(Wave) and
+  // gufo's batched quant GEMM, neither of which allocates.
+  const auto direct = [](const DeviceMatrix& m) {
+    return m.type == GgmlType::kF32 || m.type == GgmlType::kBF16 ||
+           m.type == GgmlType::kQ6_K || m.type == GgmlType::kQ8_0;
+  };
+  if (w.dense) {
+    return direct(w.gate) && direct(w.up) && direct(w.down);
+  }
+  const expert_vec::Mode mode = expert_vec::EnvMode();
+  const bool shared =
+      c.shared_expert_ff == 0 ||
+      (direct(w.shexp_gate) && direct(w.shexp_up) && direct(w.shexp_down));
+  return shared && mode.gate_up && mode.down &&
+         w.gate_exps.type == w.up_exps.type &&
+         expert_vec::Supported(w.gate_exps.type, w.gate_exps.cols) &&
+         expert_vec::Supported(w.down_exps.type, w.down_exps.cols);
+}
+
 bool FfnForward(const OpContext& ctx, const Config& c, std::uint32_t layer,
                 const FfnLayerDevice& w, const float* x, std::uint32_t tokens,
                 float* y) {

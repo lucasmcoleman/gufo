@@ -10,5 +10,14 @@ namespace gufo::models::glm53_flash {
 // Negative or nonfinite clamps are rejected; zero disables clamping.
 [[nodiscard]] std::size_t FfnScratchBytes(const Config& config,
                                           std::uint32_t max_tokens) noexcept;
+// True if FfnForward on these weights and `tokens` only enqueues kernels on
+// ctx.stream over caller scratch: no allocation, pool use or host sync, so a
+// HIP graph may capture it (LayerOps::ffn_capture_safe). Dense SwiGLU and
+// the shared expert always qualify at tokens <= 8; routed experts only on
+// the expert_vec kernels (GUFO_GLM53_EXPERT_VEC=1), since the DS4 vendored
+// path draws from its LIFO pool, whose arena may move when it grows.
+[[nodiscard]] bool FfnCaptureSafe(const Config& config, std::uint32_t layer,
+                                  const FfnLayerDevice& w,
+                                  std::uint32_t tokens);
 }  // namespace gufo::models::glm53_flash
 #endif

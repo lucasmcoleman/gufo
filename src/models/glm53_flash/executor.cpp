@@ -3,16 +3,21 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
+#include <map>
 #include <optional>
+#include <tuple>
 #include <utility>
 
+#include "src/core/hip/detail/hip_graph_decode_executor.hpp"
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/glm53_flash/kernels/hc.hpp"
 #include "src/models/glm53_flash/kernels/kda.hpp"
+#include "src/models/glm53_flash/kernels/moe.hpp"
 #include "src/models/glm53_flash/kernels/prefill_gemm.hpp"
 #include "src/models/glm53_flash/profile.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -661,9 +666,55 @@ LayerOps LaneBOps() {
   return LayerOps{.mla_cache_bytes = &MlaCacheBytes,
                   .op_scratch_bytes = &OpScratchBytes,
                   .mla = &MlaForward,
-                  .ffn = &FfnForward};
+                  .ffn = &FfnForward,
+                  .ffn_capture_safe = &FfnCaptureSafe};
 }
 #endif
+
+// ---- Decode graphs (GUFO_GLM53_DECODE_GRAPH) ----
+//
+// Idea ported from mikealanni/gufo e5490fee (MIT, Mike Alani): replay the
+// one-token decode step from a HIP graph instead of ~1500 eager launches.
+// His capture covers the whole step and reads the position from device
+// memory. Here only position-independent half-layers are captured, in
+// maximal runs: every KDA mixer half and every FFN half whose operator says
+// it is capture-safe (FfnCaptureSafe: routed experts on the expert_vec
+// kernels, GUFO_GLM53_EXPERT_VEC=1), each with its hyper-connection pre/post
+// and norm. MLA attention halves (position-dependent grids and indexer
+// state) stay eager between the runs, so no device-side position is needed.
+// The embedding and head stay eager too.
+//
+// A graph is keyed by (first half-layer, tokens, KDA verify recording):
+// the recording flag selects checkpoint pointers baked into KDA kernels.
+// Every pointer a run touches (activations, scratch, KDA state, weights)
+// lives for the Executor, so graphs survive Reset. The first sighting of a
+// key runs eagerly (lazy runtime initialisation, Ds4Enabled's one-time
+// setup); the second records on a private nonblocking stream, then replays
+// on stream_. A failed recording leaves the key eager for good.
+struct Executor::DecodeGraphs {
+  struct Entry {
+    hip::detail::HipGraphDecodeExecutor graph;
+    bool warmed{false};
+    bool eager{false};
+  };
+  hipStream_t capture{nullptr};
+  std::map<std::tuple<std::uint32_t, std::uint32_t, bool>, Entry> entries;
+  ~DecodeGraphs() {
+    entries.clear();
+    if (capture != nullptr) {
+      (void)hipStreamDestroy(capture);
+    }
+  }
+};
+
+namespace {
+
+bool DecodeGraphEnv() {
+  const char* v = std::getenv("GUFO_GLM53_DECODE_GRAPH");
+  return v != nullptr && *v != '\0' && *v != '0';
+}
+
+}  // namespace
 
 // ---- Executor ----
 
@@ -680,6 +731,7 @@ Executor::~Executor() {
     if (profiler_ != nullptr) {
       PrintProfile(std::cerr);
     }
+    graphs_.reset();
     (void)hipStreamDestroy(stream_);
   }
 }
@@ -963,6 +1015,14 @@ bool Executor::Init(std::string* error) {
   }
   if (!ok) {
     return Fail(error, "activation / scratch allocation failed");
+  }
+  if (DecodeGraphEnv()) {
+    graphs_ = std::make_unique<DecodeGraphs>();
+    if (hipStreamCreateWithFlags(&graphs_->capture, hipStreamNonBlocking) !=
+        hipSuccess) {
+      graphs_->capture = nullptr;
+      graphs_.reset();
+    }
   }
   return true;
 }
@@ -1299,19 +1359,8 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
   }
   embed_scope.reset();
 
-  for (std::uint32_t il = options_.first_layer; il < options_.last_layer;
-       ++il) {
-    if (!HalfLayer(il, /*ffn=*/false, n, position_, tap)) {
-      return Fail(error, "layer " + std::to_string(il) + " " +
-                             (c.IsKdaLayer(il) ? "KDA" : "MLA") +
-                             " half-layer failed at position " +
-                             std::to_string(position_));
-    }
-    if (!HalfLayer(il, /*ffn=*/true, n, position_, tap)) {
-      return Fail(error, "layer " + std::to_string(il) +
-                             " FFN half-layer failed at position " +
-                             std::to_string(position_));
-    }
+  if (!Layers(n, tap, error)) {
+    return false;
   }
 
   const auto download = [&](std::vector<float>& dst, const float* src,
@@ -1370,6 +1419,112 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
     guard.done = true;
   }
   return ok || Fail(error, "head failed");
+}
+
+bool Executor::HalfLayers(std::uint32_t begin, std::uint32_t end,
+                          std::uint32_t n, const TapFn* tap,
+                          std::string* error) {
+  const Config& c = config_;
+  for (std::uint32_t h = begin; h < end; ++h) {
+    const std::uint32_t il = h / 2;
+    const bool ffn = (h % 2) != 0;
+    if (!HalfLayer(il, ffn, n, position_, tap)) {
+      return Fail(error, "layer " + std::to_string(il) + " " +
+                             (ffn                ? "FFN"
+                              : c.IsKdaLayer(il) ? "KDA"
+                                                 : "MLA") +
+                             " half-layer failed at position " +
+                             std::to_string(position_));
+    }
+  }
+  return true;
+}
+
+bool Executor::Graphable(std::uint32_t h, std::uint32_t n) const {
+  const std::uint32_t il = h / 2;
+  if ((h % 2) == 0) {
+    return config_.IsKdaLayer(il);
+  }
+  return ops_.ffn_capture_safe &&
+         ops_.ffn_capture_safe(config_, il, layers_[il].ffn, n);
+}
+
+bool Executor::Layers(std::uint32_t n, const TapFn* tap, std::string* error) {
+  const std::uint32_t begin = 2 * options_.first_layer;
+  const std::uint32_t end = 2 * options_.last_layer;
+  const bool graphs =
+      graphs_ != nullptr && profiler_ == nullptr && (tap == nullptr || !*tap) &&
+      n <= std::max<std::uint32_t>(1, options_.max_verify_tokens);
+  if (!graphs) {
+    return HalfLayers(begin, end, n, tap, error);
+  }
+  bool recording = false;
+  for (const KdaState& k : kda_) {
+    recording = recording || k.record;
+  }
+  std::uint32_t h = begin;
+  while (h < end) {
+    if (!Graphable(h, n)) {
+      if (!HalfLayers(h, h + 1, n, nullptr, error)) {
+        return false;
+      }
+      ++h;
+      continue;
+    }
+    std::uint32_t run_end = h + 1;
+    while (run_end < end && Graphable(run_end, n)) {
+      ++run_end;
+    }
+    DecodeGraphs::Entry& e = graphs_->entries[{h, n, recording}];
+    if (e.eager || !e.warmed) {
+      e.warmed = true;
+      if (!HalfLayers(h, run_end, n, nullptr, error)) {
+        return false;
+      }
+      h = run_end;
+      continue;
+    }
+    const hip::detail::HipGraphCaptureKey key{
+        .execution_identity = (std::uint64_t{n} << 1U) | (recording ? 1U : 0U),
+        .workload_identity = (std::uint64_t{h} << 32U) | run_end};
+    if (!e.graph.IsCapturedFor(key)) {
+      struct CaptureFailure {};
+      const Stream launch = stream_;
+      stream_ = graphs_->capture;
+      bool captured = false;
+      try {
+        captured = e.graph.TryCapture(stream_, key, [&] {
+          if (!HalfLayers(h, run_end, n, nullptr, nullptr)) {
+            throw CaptureFailure{};
+          }
+        });
+      } catch (const CaptureFailure&) {
+        captured = false;
+      }
+      stream_ = launch;
+      if (!captured) {
+        // Recording executed nothing; run this token eagerly and keep the
+        // key eager from now on.
+        e.eager = true;
+        (void)hipGetLastError();
+        if (!HalfLayers(h, run_end, n, nullptr, error)) {
+          return false;
+        }
+        h = run_end;
+        continue;
+      }
+    }
+    // A failed launch may have submitted part of the work: never retry it
+    // eagerly (the caller's failed_ state forces a Reset).
+    if (!e.graph.Launch(stream_, key)) {
+      e.graph.Reset();
+      e.eager = true;
+      return Fail(error, "decode graph launch failed at half-layer " +
+                             std::to_string(h));
+    }
+    h = run_end;
+  }
+  return true;
 }
 
 bool Executor::HalfLayer(std::uint32_t il, bool ffn, std::uint32_t n,

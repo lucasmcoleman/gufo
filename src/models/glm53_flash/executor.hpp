@@ -201,6 +201,13 @@ struct LayerOps {
                      const FfnLayerDevice&, const float*, std::uint32_t,
                      float*)>
       ffn;
+  /// Optional: true if `ffn` on (layer, weights, tokens) only enqueues
+  /// kernels on ctx.stream over executor-owned memory (no allocation, host
+  /// synchronization or host copies), so GUFO_GLM53_DECODE_GRAPH may capture
+  /// it. Empty means never: FFN half-layers then always run eagerly.
+  std::function<bool(const Config&, std::uint32_t, const FfnLayerDevice&,
+                     std::uint32_t)>
+      ffn_capture_safe;
 };
 
 // ---- PRODUCTION BINDING (Lane B) ----
@@ -395,6 +402,14 @@ private:
             const TapFn* tap, std::string* error);
   bool HalfLayer(std::uint32_t il, bool ffn, std::uint32_t n,
                  std::uint32_t pos0, const TapFn* tap);
+  /// The pass's layer loop: eager, or with GUFO_GLM53_DECODE_GRAPH runs of
+  /// position-independent half-layers replayed as HIP graphs.
+  bool Layers(std::uint32_t n, const TapFn* tap, std::string* error);
+  /// Eager half-layers [begin, end) (index 2 * layer + ffn).
+  bool HalfLayers(std::uint32_t begin, std::uint32_t end, std::uint32_t n,
+                  const TapFn* tap, std::string* error);
+  /// True if half-layer h may be captured for an n-token pass.
+  bool Graphable(std::uint32_t h, std::uint32_t n) const;
   void Emit(const TapFn* tap, std::string_view name, std::uint32_t layer,
             const float* data, std::uint64_t ne0, std::uint64_t ne1,
             std::uint64_t ne2 = 1);
@@ -437,6 +452,9 @@ private:
   std::uint32_t verify_base_{0};
   std::uint32_t verify_n_{0};
   std::unique_ptr<OpProfiler> profiler_;  ///< null unless profiling
+  /// GUFO_GLM53_DECODE_GRAPH state (executor.cpp); null when off.
+  struct DecodeGraphs;
+  std::unique_ptr<DecodeGraphs> graphs_;
 };
 
 }  // namespace gufo::models::glm53_flash

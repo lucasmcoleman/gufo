@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -446,6 +447,93 @@ void CheckRefusals(const Model& m) {
   CheckRel("forward after failure + Reset: logits", out.logits, want.logits);
 }
 
+// (g) GUFO_GLM53_DECODE_GRAPH: replayed position-independent half-layer
+// runs (here the KDA mixer halves; the stand-in FFN declares no capture
+// safety and the stand-in MLA syncs, so both stay eager) give bitwise the
+// eager executor's logits, over decode steps, an MTP-style verify of two
+// tokens with Rollback, and a second cycle after Reset (graphs survive
+// Reset; replay must not double-advance or reuse stale state). Run with
+// GUFO_DISPATCH_TELEMETRY=1 to see the graph "hit" events.
+void CheckDecodeGraph(const Model& m) {
+  glm::stand_in::HostOps graph_ops(m.config);
+  glm::stand_in::HostOps eager_ops(m.config);
+  std::string error;
+  glm::ExecutorOptions o = Options(16);
+  o.max_verify_tokens = 2;
+  ::setenv("GUFO_GLM53_DECODE_GRAPH", "1", 1);
+  auto graph = glm::Executor::Create(m.weights, o, graph_ops.Bind(), &error);
+  ::unsetenv("GUFO_GLM53_DECODE_GRAPH");
+  auto eager = glm::Executor::Create(m.weights, o, eager_ops.Bind(), &error);
+  Check("graph comparison executors " + error, graph && eager);
+  if (!graph || !eager)
+    return;
+  const std::span<const std::int32_t> ids(m.ids);
+  const auto token = [&](std::size_t i) {
+    return std::vector<std::int32_t>{ids[(kPrefill + i) % ids.size()]};
+  };
+  const auto same = [](const std::vector<float>& a,
+                       const std::vector<float>& b) {
+    return !a.empty() && a.size() == b.size() &&
+           std::all_of(a.begin(), a.end(),
+                       [](float v) { return std::isfinite(v); }) &&
+           std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+  };
+  std::vector<float> first_cycle;
+  for (int cycle = 0; cycle < 2; ++cycle) {
+    const std::string tag = " cycle " + std::to_string(cycle);
+    if (cycle != 0) {
+      Check("graph reset", graph->Reset());
+      Check("eager reset", eager->Reset());
+    }
+    glm::ForwardResult got, want;
+    Check(
+        "graph/eager prefill" + tag,
+        graph->ForwardLast(ids.first(kPrefill), true, &got, nullptr, &error) &&
+            eager->ForwardLast(ids.first(kPrefill), true, &want, nullptr,
+                               &error));
+    Check("prefill logits bitwise" + tag, same(got.logits, want.logits));
+    std::vector<float> cycle_logits;
+    // Six single-token steps: the first warms each run, the second records
+    // it, the rest replay.
+    for (std::size_t t = 0; t < 6; ++t) {
+      const auto one = token(t);
+      const bool ok = graph->ForwardLast(one, true, &got, nullptr, &error) &&
+                      eager->ForwardLast(one, true, &want, nullptr, &error);
+      Check("graph/eager decode " + std::to_string(t) + tag + " " + error, ok);
+      Check("decode logits bitwise " + std::to_string(t) + tag,
+            ok && same(got.logits, want.logits));
+      cycle_logits.insert(cycle_logits.end(), got.logits.begin(),
+                          got.logits.end());
+    }
+    // Three verify rounds of two tokens (recording KDA checkpoints: its own
+    // graph key), keeping one, then a plain step after the rollback.
+    for (std::size_t r = 0; r < 3; ++r) {
+      std::vector<std::int32_t> two = token(6 + (2 * r));
+      two.push_back(token(7 + (2 * r))[0]);
+      const bool ok = graph->ForwardVerify(two, true, &got, &error) &&
+                      eager->ForwardVerify(two, true, &want, &error);
+      Check("graph/eager verify " + std::to_string(r) + tag + " " + error, ok);
+      Check("verify logits bitwise " + std::to_string(r) + tag,
+            ok && same(got.logits, want.logits));
+      Check("rollback " + std::to_string(r) + tag,
+            graph->Rollback(1) && eager->Rollback(1));
+      const auto one = token(20 + r);
+      const bool step = graph->ForwardLast(one, true, &got, nullptr, &error) &&
+                        eager->ForwardLast(one, true, &want, nullptr, &error);
+      Check("after rollback " + std::to_string(r) + tag,
+            step && same(got.logits, want.logits));
+      cycle_logits.insert(cycle_logits.end(), got.logits.begin(),
+                          got.logits.end());
+    }
+    if (cycle == 0) {
+      first_cycle = cycle_logits;
+    } else {
+      Check("graph reset reproduces the first cycle",
+            same(cycle_logits, first_cycle));
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -463,6 +551,7 @@ int main() {
     CheckPassesAndRanges(m);
     CheckLastLogits(m);
     CheckRefusals(m);
+    CheckDecodeGraph(m);
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << "\n";
     return 1;
