@@ -2251,6 +2251,11 @@ private:
 
 constexpr std::string_view kLagunaStateAbi = "laguna-s-2.1-gfx1151-session-v1";
 
+/// Widest decode batch Laguna advertises. The vector kernels take 32 rows, but
+/// each batched session still holds its own KV, so the scheduler's session
+/// count, not this, bounds it in practice.
+constexpr std::size_t kLagunaMaxBatchWidth = 8;
+
 std::vector<TextRunnerToken> LagunaRunnerTokens(
     std::span<const std::int32_t> tokens) {
   std::vector<TextRunnerToken> converted;
@@ -2393,8 +2398,50 @@ public:
     };
   }
 
+  /// Concurrent decode steps share one forward pass: the projections, the
+  /// router and the experts run once over the sessions' rows and attention
+  /// reads each session's own caches (Session::EvaluateBatch). The widths
+  /// follow the vector kernels' row limit, capped like the other families.
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
-    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    std::vector<TextExecutionPlan> plans{
+        {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    for (std::size_t width = 2; width <= kLagunaMaxBatchWidth; ++width) {
+      plans.push_back(
+          {.kind = TextExecutionPlanKind::kBatched, .physical_width = width});
+    }
+    return plans;
+  }
+
+  void AdvanceBatch(
+      std::span<const TextRunnerAdvance> advances) const override {
+    if (advances.size() < 2) {
+      return TextModelRunner::AdvanceBatch(advances);
+    }
+    std::vector<models::laguna::Session::BatchItem> items(advances.size());
+    for (std::size_t i = 0; i < advances.size(); ++i) {
+      const auto& advance = advances[i];
+      items[i].session = &RequireLagunaState(advance.state.get()).session();
+      if (advance.token > static_cast<TextRunnerToken>(
+                              std::numeric_limits<std::int32_t>::max())) {
+        // Out of engine range: the engine rejects it up front as it does any
+        // token outside the vocabulary.
+        items[i].token = -1;
+      } else {
+        items[i].token = static_cast<std::int32_t>(advance.token);
+      }
+    }
+    models::laguna::Session::EvaluateBatch(items);
+    for (std::size_t i = 0; i < advances.size(); ++i) {
+      if (items[i].completed) {
+        continue;
+      }
+      auto failure = std::make_exception_ptr(
+          std::runtime_error("Laguna decode failed: " + items[i].error));
+      if (!advances[i].failure) {
+        std::rethrow_exception(failure);
+      }
+      *advances[i].failure = failure;
+    }
   }
 
   [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>

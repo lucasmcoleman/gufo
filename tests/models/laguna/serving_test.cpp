@@ -16,6 +16,9 @@
 //    the cold run and every session returns to idle.
 //  * several requests admitted together on three sessions equal their
 //    sequential results.
+//  * concurrent requests share batched decode steps and equal their solo
+//    results, with a peer cancelled mid-decode and a device error inside a
+//    shared step.
 //  * the context limit ends a request exactly at capacity.
 //  * a device error in a prefill pass, a decode pass, or a request restored
 //    from a snapshot fails that request only; the next requests are correct.
@@ -520,6 +523,110 @@ void MultiSession(const EngineFixture&, srv::InferenceBackend& backend) {
   std::cout << "multi-session ok\n";
 }
 
+// ---- batched decode ------------------------------------------------------
+
+/// Concurrent requests share batched decode steps (kBatched plans) and still
+/// equal their solo results token for token, greedy and seeded, with a peer
+/// cancelled mid-decode and a device error inside a shared step.
+void BatchedDecode(const EngineFixture& f, srv::InferenceBackend& backend) {
+  constexpr std::size_t kMax = 48;
+  constexpr int kRequests = 3;
+  std::vector<srv::ChatRequest> requests;
+  std::vector<smp::SamplingConfig> configs;
+  std::vector<Result> expected;
+  for (int i = 0; i < kRequests; ++i) {
+    auto r = ChatOf("Batched request " + std::to_string(i) + " about " +
+                    std::string(3 + 11 * i, 'z'));
+    r.cache_prompt = false;
+    r.client_id = "batched-" + std::to_string(i);
+    smp::SamplingConfig config = kGreedy;
+    if (i % 2 == 1) {
+      config.temperature = 0.8F;
+      config.top_k = 20;
+      config.seed = 100 + i;
+    }
+    const Result solo = backend.chat(r, kMax, config);
+    Require(solo.physical_execution_width == 1 && solo.tokens.size() > 8,
+            "a lone request runs the serial plan");
+    expected.push_back(solo);
+    requests.push_back(std::move(r));
+    configs.push_back(config);
+  }
+  std::size_t widest = 1;
+  for (int round = 0; round < 3; ++round) {
+    std::vector<Request> pending;
+    for (int i = 0; i < kRequests; ++i) {
+      pending.push_back(
+          backend.start_chat(requests[i], kMax, configs[i], {}, true));
+    }
+    for (int i = 0; i < kRequests; ++i) {
+      const Result result = pending[i]->Wait();
+      Require(result.tokens == expected[i].tokens,
+              "request " + std::to_string(i) +
+                  " decoded in shared steps equals its solo result");
+      widest = std::max(widest, result.physical_execution_width);
+    }
+  }
+  Require(widest >= 2, "concurrent decoding used a batched plan");
+  AllIdle(backend, "after batched requests");
+
+  // A peer cancelled mid-decode leaves the others exact.
+  {
+    std::vector<Request> pending;
+    for (int i = 0; i < kRequests; ++i) {
+      pending.push_back(
+          backend.start_chat(requests[i], kMax, configs[i], {}, true));
+    }
+    std::size_t seen = 0;
+    const Result cancelled = pending[1]->Wait([&](std::string_view) {
+      if (++seen == 5) {
+        pending[1]->Cancel();
+      }
+      return true;
+    });
+    Require(cancelled.cancelled || cancelled.tokens == expected[1].tokens,
+            "the cancelled peer ends");
+    for (const int i : {0, 2}) {
+      Require(pending[i]->Wait().tokens == expected[i].tokens,
+              "a peer of a request cancelled mid-decode is exact");
+    }
+    AllIdle(backend, "after a peer was cancelled mid-decode");
+  }
+
+  // A device error inside a pass: a request fails, nothing continues on the
+  // poisoned state, and every later request is exact. Skip the prefill
+  // passes so the error lands in decoding, shared or not.
+  {
+    std::uint32_t prefill_passes = 0;
+    for (const auto& r : expected) {
+      prefill_passes += static_cast<std::uint32_t>((r.prompt_tokens + 15) / 16);
+    }
+    f.model->InjectForwardFailureForTesting(prefill_passes + 3, "o");
+    std::vector<Request> pending;
+    for (int i = 0; i < kRequests; ++i) {
+      pending.push_back(
+          backend.start_chat(requests[i], kMax, configs[i], {}, true));
+    }
+    int failed = 0;
+    for (auto& request : pending) {
+      try {
+        (void)request->Wait();
+      } catch (const std::exception&) {
+        ++failed;
+      }
+    }
+    Require(failed >= 1, "the injected device error fails a request");
+    AllIdle(backend, "after a device error in a batched step");
+    for (int i = 0; i < kRequests; ++i) {
+      Require(backend.chat(requests[i], kMax, configs[i]).tokens ==
+                  expected[i].tokens,
+              "request " + std::to_string(i) +
+                  " after a device error in a shared step is exact");
+    }
+  }
+  std::cout << "batched decode ok (widest plan " << widest << ")\n";
+}
+
 // ---- context limit -------------------------------------------------------
 
 void ContextLimit(const EngineFixture& f) {
@@ -655,6 +762,7 @@ int main() {
     Snapshots(fixture, backend);
     Cancellation(fixture, backend);
     MultiSession(fixture, backend);
+    BatchedDecode(fixture, backend);
     Failures(fixture, backend);
     ToolPrompts(fixture, backend);
     ContextLimit(fixture);

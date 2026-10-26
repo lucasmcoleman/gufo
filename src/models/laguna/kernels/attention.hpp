@@ -51,6 +51,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -215,6 +216,16 @@ private:
   bool valid_{true};
 };
 
+/// One decode row of a batch, as the kernels read it: the K/V buffers of the
+/// row's own sequence (this layer), the position the row is written at and
+/// attends from, and the buffers' capacity in positions.
+struct DecodeRow {
+  void* keys{nullptr};
+  void* values{nullptr};
+  std::uint32_t pos{0};
+  std::uint32_t capacity{0};
+};
+
 /// Device allocation seam (tests inject failures here); defaults to
 /// hipMalloc / hipFree.
 struct DeviceAllocator {
@@ -251,6 +262,24 @@ public:
                              std::uint32_t start_pos, Path path = Path::kAuto,
                              std::string* error_msg = nullptr);
 
+  /// Decode row of `cache` at its committed() position (for ForwardBatch).
+  [[nodiscard]] static DecodeRow DescribeDecodeRow(const KvCache& cache);
+
+  /// One decode row for each of several sequences: out[t][hidden] = the
+  /// attention block of n[t][hidden] at position caches[t]->committed(),
+  /// appending the row's K/V to caches[t]. Each row is computed exactly as
+  /// Forward() computes the same row alone on Path::kVector (the projections
+  /// share one pass, the kernels differ only in where a row's cache, position
+  /// and capacity come from), so a row does not depend on its peers.
+  /// `device_rows` is a device table of DescribeDecodeRow(*caches[t]) taken
+  /// before the call. At most 32 caches, all distinct. A bad argument touches
+  /// nothing; a failure after the K/V append was enqueued invalidates every
+  /// cache of the call.
+  [[nodiscard]] bool ForwardBatch(const AttnWeights& w,
+                                  std::span<KvCache* const> caches,
+                                  const DecodeRow* device_rows, const float* n,
+                                  float* out, std::string* error_msg = nullptr);
+
   /// Debug tap for stage-by-stage checks: the operator synchronizes the stream
   /// after each stage and calls `tap` with the stage name, a device pointer and
   /// a float count. Stages: q_proj, k_proj, v_proj, gate_proj (n times the
@@ -273,6 +302,10 @@ private:
     void* ptr{nullptr};
     std::size_t capacity{0};
   };
+  bool Run(const AttnWeights& w, std::span<KvCache* const> caches,
+           const DecodeRow* rows, const float* n, float* out,
+           std::uint32_t tokens, std::uint32_t start_pos, Path path,
+           std::string* error_msg);
   bool Reserve(Scratch* buffer, std::size_t bytes, std::string* error_msg);
   void Free(Scratch* buffer) noexcept;
   bool Project(const DeviceMatrix& w, const float* x, float* out,

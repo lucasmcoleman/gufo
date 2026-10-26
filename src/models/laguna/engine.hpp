@@ -166,6 +166,26 @@ public:
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
 
+  /// One session's next token in EvaluateBatch, and what became of it.
+  struct BatchItem {
+    Session* session{nullptr};
+    std::int32_t token{0};
+    bool completed{false};  ///< Output: the token was appended, Logits() set.
+    std::string error;      ///< Output when !completed.
+  };
+  /// Appends one token to each session in shared forward passes (the
+  /// projections, routing and experts run once over all rows, each row
+  /// attends over its own session's caches); every session ends up exactly
+  /// as Evaluate(token) leaves it, bit for bit (rows do not depend on their
+  /// peers: see rocm::Executor::DecodeBatch). Sessions must be distinct and
+  /// belong to one Model. A session that cannot take its token (invalid and
+  /// not recoverable, token outside the vocabulary, context exhausted) is
+  /// rejected on its own and nothing of it or its peers is touched. A device
+  /// failure inside a shared pass invalidates and resets every session of
+  /// that pass, as a failed Evaluate does its own session; sessions outside
+  /// the batch are never touched.
+  static void EvaluateBatch(std::span<BatchItem> items);
+
   /// Logits [vocab] after the last token; empty at position 0 and after a
   /// failure.
   [[nodiscard]] const std::vector<float>& Logits() const noexcept {
@@ -224,6 +244,7 @@ private:
   std::uint32_t failures_{0};
   std::uint32_t rebuilds_{0};
   bool injected_{false};
+  std::string inject_stage_;
 };
 
 }  // namespace gufo::models::laguna

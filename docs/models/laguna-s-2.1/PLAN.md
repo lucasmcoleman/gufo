@@ -120,6 +120,22 @@ Decisions and limits:
 - **Snapshots.** RAM snapshots of the full-layer KV up to the position and each
   ring's retained history (`committed`, `retained_begin`, `valid`), plus the
   frontier logits. There is no serialized format, so `--cache-disk` is refused.
+- **Batched decode.** The runner advertises serial plus batched widths 2 to 8
+  (`kLagunaMaxBatchWidth`; the vector kernels take 32 rows). `AdvanceBatch` calls
+  `Session::EvaluateBatch`, which runs `rocm::Executor::DecodeBatch`: the first
+  session of a group lends its stream and scratch, embeds one token per session,
+  and one pass runs the norms, the Q/K/V/gate/O projections, the router and the
+  experts over all rows on the vector path (the path a lone decode token takes).
+  `AttnOps::ForwardBatch` gives each row its own session's K/V buffers, position
+  and ring capacity through a per-step device table (`DecodeRow`); the append and
+  attention kernels do the same arithmetic as before, so a row equals the same
+  token decoded alone bit for bit (`laguna.batch` checks logits, K/V bytes and
+  bookkeeping against solo twins around the window and through ring wrap, up to
+  32 rows). A session that cannot take its token (bad token id, full context,
+  unrecoverable) is refused alone before anything is enqueued. A device error in
+  a shared pass may have appended K/V in any participant, so every session of
+  that pass is invalidated and reset, as a failed solo pass does its own;
+  sessions outside the pass are untouched. Prefill stays per session.
 - **Failure.** A device error after work was enqueued marks the session invalid
   and rebuilds its executor at once; cancellation and ordinary invalidation
   keep the KV memory and start over at position 0.

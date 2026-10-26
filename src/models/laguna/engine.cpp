@@ -316,6 +316,89 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
   return Prefill(std::span<const std::int32_t>(&token, 1), error_msg);
 }
 
+void Session::EvaluateBatch(std::span<BatchItem> items) {
+  std::vector<BatchItem*> accepted;
+  accepted.reserve(items.size());
+  for (BatchItem& item : items) {
+    item.completed = false;
+    item.error.clear();
+    Session* session = item.session;
+    if (session == nullptr) {
+      item.error = "laguna: no session";
+      continue;
+    }
+    if (std::any_of(accepted.begin(), accepted.end(), [&](const BatchItem* o) {
+          return o->session == session;
+        })) {
+      item.error = "laguna: session appears twice in a batch";
+      continue;
+    }
+    // Everything a pass could reject is checked before any work is enqueued,
+    // as Prefill does, so a rejection leaves the session untouched.
+    if (!session->Recover(&item.error)) {
+      continue;
+    }
+    if (item.token < 0 || static_cast<std::uint32_t>(item.token) >=
+                              session->model_->VocabSize()) {
+      item.error = "laguna: token id outside the vocabulary";
+      continue;
+    }
+    if (std::uint64_t{session->Position()} + 1 > session->Context()) {
+      item.error = "laguna: context of " + std::to_string(session->Context()) +
+                   " tokens exhausted";
+      continue;
+    }
+    accepted.push_back(&item);
+  }
+  if (accepted.size() == 1) {
+    BatchItem& item = *accepted.front();
+    item.completed = item.session->Evaluate(item.token, &item.error);
+    return;
+  }
+  if (accepted.empty()) {
+    return;
+  }
+  Session* lead = accepted.front()->session;
+  const Model& model = *lead->model_;
+  // One pass, one injected fault: a pending model-wide fault, else the first
+  // session that carries its own. It fails the pass for every participant,
+  // as a device error in a shared pass would.
+  std::string stage;
+  bool have_stage = model.TakeInjectedFailure(&stage);
+  for (const BatchItem* item : accepted) {
+    if (!have_stage && item->session->injected_) {
+      stage = item->session->inject_stage_;
+      have_stage = true;
+    }
+  }
+  if (have_stage) {
+    lead->executor_->attention_ops().SetFailAfterStage(stage);
+  }
+  std::vector<rocm::DecodeItem> work(accepted.size());
+  for (std::size_t i = 0; i < accepted.size(); ++i) {
+    Session& session = *accepted[i]->session;
+    session.logits_.resize(session.model_->VocabSize());
+    work[i].executor = session.executor_.get();
+    work[i].token = accepted[i]->token;
+    work[i].logits = session.logits_.data();
+  }
+  rocm::Executor::DecodeBatch(work);
+  if (have_stage) {
+    lead->executor_->attention_ops().SetFailAfterStage(
+        lead->injected_ ? lead->inject_stage_ : std::string());
+  }
+  for (std::size_t i = 0; i < accepted.size(); ++i) {
+    BatchItem& item = *accepted[i];
+    if (work[i].completed) {
+      item.completed = true;
+    } else {
+      (void)item.session->Fail(&item.error, work[i].error.empty()
+                                                ? "laguna forward pass failed"
+                                                : work[i].error);
+    }
+  }
+}
+
 void Session::Invalidate() noexcept {
   try {
     logits_.clear();
@@ -381,6 +464,7 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
 
 void Session::InjectFailureForTesting(std::string stage) {
   injected_ = !stage.empty();
+  inject_stage_ = stage;
   executor_->attention_ops().SetFailAfterStage(std::move(stage));
 }
 

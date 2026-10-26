@@ -70,6 +70,12 @@ if (ENGINE_ENABLE_HIP)
   # repeated load/unload. Nothing is skipped.
   add_laguna_test(engine gufo_laguna "hip;gpu;gfx1151")
 
+  # Batched decode (phase 5): several sessions advance in shared forward
+  # passes. Bit-identity with solo decode across the window and ring wrap,
+  # membership changes, up-front rejections, injected failures, tapped and
+  # untapped reruns, two streams. Nothing is skipped.
+  add_laguna_test(batch gufo_laguna "hip;gpu;gfx1151")
+
   # The serve path (InferenceBackend, scheduler, snapshot pool, runner) on a
   # tiny random model: registration, chat/completion against the engine,
   # snapshots, cancellation, several sessions, the context limit and injected

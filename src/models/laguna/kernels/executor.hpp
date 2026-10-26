@@ -53,6 +53,8 @@ struct ExecutorOptions {
 
 enum class LogitsRows { kNone, kLast, kAll };
 
+class Executor;
+
 /// Host copy of one session's KV state: every layer's retained history (full
 /// layers up to the position, sliding rings with their retained_begin) and
 /// the position. Restoring it into an executor of the same geometry (context
@@ -68,6 +70,18 @@ struct ExecutorSnapshot {
     }
     return total;
   }
+};
+
+/// One session's next token in a batched decode step (Executor::DecodeBatch).
+struct DecodeItem {
+  Executor* executor{nullptr};
+  std::int32_t token{0};
+  /// Receives the [vocab] logits of the token, as Forward(kLast) would.
+  float* logits{nullptr};
+  /// Outputs. `completed` means the token was appended and `logits` filled;
+  /// otherwise `error` says why (see DecodeBatch for what was touched).
+  bool completed{false};
+  std::string error;
 };
 
 class Executor {
@@ -109,6 +123,25 @@ public:
   [[nodiscard]] bool Forward(std::span<const std::int32_t> tokens,
                              LogitsRows rows, float* logits,
                              std::string* error_msg = nullptr);
+
+  /// Appends one token to each of several executors of the same model in
+  /// shared forward passes: the projections, norms, routing and experts run
+  /// once over all rows, and each row attends over its own executor's caches
+  /// at its own position. Every row is computed as Forward() computes the
+  /// same single token alone (Path::kAuto or kVector), so an item's result
+  /// does not depend on its peers; executors with another path, model or
+  /// chunk geometry run alone. Items are processed in groups of at most
+  /// min(32, the first executor's max_chunk); the first executor of a group
+  /// lends its stream and scratch, and the others' streams stay idle.
+  ///
+  /// Failure: an item that cannot run (poisoned or invalid executor, token
+  /// outside the vocabulary, context exhausted, duplicate executor, null
+  /// logits) is rejected on its own before anything is enqueued and nothing
+  /// of it, or of its peers, is touched. A device failure inside a shared pass
+  /// may have appended K/V to any participant's layers, so every executor of
+  /// that group is poisoned, exactly as a failed Forward() poisons its own.
+  /// Executors outside the group are never touched.
+  static void DecodeBatch(std::span<DecodeItem> items);
 
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
   [[nodiscard]] bool poisoned() const noexcept { return poisoned_; }
@@ -156,7 +189,11 @@ private:
   void Free(Buffer* b) noexcept;
   bool BuildCaches(std::string* error_msg);
   bool Run(std::uint32_t tokens, std::uint32_t start, LogitsRows rows,
-           std::string* error_msg);
+           std::string* error_msg, std::span<Executor* const> batch = {});
+  static void RunGroup(std::span<DecodeItem* const> group);
+  [[nodiscard]] bool BatchCompatible(const Executor& lead) const noexcept;
+  [[nodiscard]] std::string RejectDecode(std::int32_t token,
+                                         const float* logits) const;
   bool Fail(std::string* error_msg, const std::string& message);
 
   const DeviceModel* model_;
@@ -166,7 +203,7 @@ private:
   std::unique_ptr<AttnOps> attn_;
   std::unique_ptr<FfnOps> ffn_;
   std::vector<KvCache> kv_;
-  Buffer h_, n_, x_, o_, logits_, zero_ids_;
+  Buffer h_, n_, x_, o_, logits_, zero_ids_, rows_;
   std::vector<float> host_embed_;
   std::uint32_t position_{0};
   bool poisoned_{false};

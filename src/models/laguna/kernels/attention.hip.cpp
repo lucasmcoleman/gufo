@@ -95,11 +95,19 @@ __global__ void QkNormRopeAppendKernel(
     const float* __restrict__ v, const float* __restrict__ q_gamma,
     const float* __restrict__ k_gamma, __half* __restrict__ k_cache,
     __half* __restrict__ v_cache, std::uint32_t heads, std::uint32_t kv_heads,
-    float eps, std::uint32_t start_pos, std::uint32_t capacity, RopeArgs rope) {
+    float eps, std::uint32_t start_pos, std::uint32_t capacity, RopeArgs rope,
+    const DecodeRow* __restrict__ rows) {
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t b = blockIdx.y;
   const std::uint32_t d = threadIdx.x;
-  const std::uint32_t pos = start_pos + t;
+  // With `rows`, row t is a decode row of its own sequence: its position,
+  // ring capacity and cache come from the table, and nothing else changes.
+  const std::uint32_t pos = rows != nullptr ? rows[t].pos : start_pos + t;
+  if (rows != nullptr) {
+    capacity = rows[t].capacity;
+    k_cache = static_cast<__half*>(rows[t].keys);
+    v_cache = static_cast<__half*>(rows[t].values);
+  }
   const std::size_t kv_width = std::size_t{kv_heads} * kHeadDim;
   const std::size_t slot = pos % capacity;
   if (b >= heads + kv_heads) {
@@ -189,11 +197,17 @@ __global__ void AttentionKernel(const float* __restrict__ q,
                                 float* __restrict__ out, std::uint32_t heads,
                                 std::uint32_t kv_heads, std::uint32_t window,
                                 std::uint32_t start_pos, std::uint32_t capacity,
-                                float scale) {
+                                float scale,
+                                const DecodeRow* __restrict__ rows) {
   const std::uint32_t kvh = blockIdx.x;
   const std::uint32_t t = blockIdx.y;
   const std::uint32_t d = threadIdx.x;
-  const std::uint32_t p = start_pos + t;
+  const std::uint32_t p = rows != nullptr ? rows[t].pos : start_pos + t;
+  if (rows != nullptr) {
+    capacity = rows[t].capacity;
+    k_cache = static_cast<const __half*>(rows[t].keys);
+    v_cache = static_cast<const __half*>(rows[t].values);
+  }
   const std::uint32_t first =
       (window == 0 || p + 1 <= window) ? 0 : p + 1 - window;
   const std::size_t kv_width = std::size_t{kv_heads} * kHeadDim;
@@ -328,9 +342,9 @@ bool LaunchAttention(const float* q, const __half* k, const __half* v,
                      float* out, std::uint32_t heads, std::uint32_t kv_heads,
                      std::uint32_t window, std::uint32_t start_pos,
                      std::uint32_t tokens, std::uint32_t capacity, float scale,
-                     hipStream_t stream) {
+                     const DecodeRow* rows, hipStream_t stream) {
   AttentionKernel<kGroup><<<dim3(kv_heads, tokens), kHeadDim, 0, stream>>>(
-      q, k, v, out, heads, kv_heads, window, start_pos, capacity, scale);
+      q, k, v, out, heads, kv_heads, window, start_pos, capacity, scale, rows);
   return true;
 }
 
@@ -339,11 +353,12 @@ bool DispatchAttention(std::uint32_t group, const float* q, const __half* k,
                        std::uint32_t kv_heads, std::uint32_t window,
                        std::uint32_t start_pos, std::uint32_t tokens,
                        std::uint32_t capacity, float scale,
-                       hipStream_t stream) {
-#define LAGUNA_ATTN_CASE(G)                                          \
-  case G:                                                            \
-    return LaunchAttention<G>(q, k, v, out, heads, kv_heads, window, \
-                              start_pos, tokens, capacity, scale, stream);
+                       const DecodeRow* rows, hipStream_t stream) {
+#define LAGUNA_ATTN_CASE(G)                                             \
+  case G:                                                               \
+    return LaunchAttention<G>(q, k, v, out, heads, kv_heads, window,    \
+                              start_pos, tokens, capacity, scale, rows, \
+                              stream);
   switch (group) {
     LAGUNA_ATTN_CASE(1)
     LAGUNA_ATTN_CASE(2)
@@ -815,6 +830,50 @@ bool AttnOps::Project(const DeviceMatrix& w, const float* x, float* out,
 bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
                       float* out, std::uint32_t tokens, std::uint32_t start_pos,
                       Path path, std::string* error_msg) {
+  KvCache* caches[1] = {&cache};
+  return Run(w, caches, nullptr, n, out, tokens, start_pos, path, error_msg);
+}
+
+DecodeRow AttnOps::DescribeDecodeRow(const KvCache& cache) {
+  return {const_cast<void*>(cache.k_), const_cast<void*>(cache.v_),
+          cache.committed_, cache.capacity_};
+}
+
+bool AttnOps::ForwardBatch(const AttnWeights& w,
+                           std::span<KvCache* const> caches,
+                           const DecodeRow* device_rows, const float* n,
+                           float* out, std::string* error_msg) {
+  if (caches.empty() || caches.size() > kVectorMaxRows ||
+      device_rows == nullptr) {
+    Assign(error_msg, "laguna attention: unsupported batch size");
+    return false;
+  }
+  for (std::size_t i = 0; i < caches.size(); ++i) {
+    if (caches[i] == nullptr) {
+      Assign(error_msg, "laguna attention: null cache in batch");
+      return false;
+    }
+    for (std::size_t j = 0; j < i; ++j) {
+      if (caches[j] == caches[i]) {
+        Assign(error_msg, "laguna attention: a cache appears twice in a batch");
+        return false;
+      }
+    }
+  }
+  return Run(w, caches, device_rows, n, out,
+             static_cast<std::uint32_t>(caches.size()), 0, Path::kVector,
+             error_msg);
+}
+
+bool AttnOps::Run(const AttnWeights& w, std::span<KvCache* const> caches,
+                  const DecodeRow* rows, const float* n, float* out,
+                  std::uint32_t tokens, std::uint32_t start_pos, Path path,
+                  std::string* error_msg) {
+  // Single-sequence call: caches has one entry and the `tokens` rows continue
+  // it at start_pos. Batch call (`rows` set): row t is one decode row of
+  // caches[t], at that cache's committed() position.
+  const bool batch = rows != nullptr;
+  KvCache& cache = *caches[0];
   if (!initialized_) {
     Assign(error_msg, "qfn_mmq_init failed");
     return false;
@@ -826,16 +885,21 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
     return false;
   }
   if (w.head_dim != kHeadDim || w.kv_heads == 0 || w.heads % w.kv_heads != 0 ||
-      w.kv_heads != cache.kv_heads_ || cache.head_dim_ != kHeadDim ||
-      w.window != cache.window_ || w.q.rows != w.heads * kHeadDim ||
-      w.k.rows != w.kv_heads * kHeadDim || w.v.rows != w.k.rows ||
-      w.q.cols != w.hidden || w.k.cols != w.hidden || w.v.cols != w.hidden ||
-      w.o.cols != w.heads * kHeadDim || w.o.rows != w.hidden ||
-      w.rope.rotary_dim == 0 || w.rope.rotary_dim % 2 != 0 ||
-      w.rope.rotary_dim > kHeadDim || cache.k_ == nullptr ||
-      cache.v_ == nullptr || w.hidden == 0) {
+      w.q.rows != w.heads * kHeadDim || w.k.rows != w.kv_heads * kHeadDim ||
+      w.v.rows != w.k.rows || w.q.cols != w.hidden || w.k.cols != w.hidden ||
+      w.v.cols != w.hidden || w.o.cols != w.heads * kHeadDim ||
+      w.o.rows != w.hidden || w.rope.rotary_dim == 0 ||
+      w.rope.rotary_dim % 2 != 0 || w.rope.rotary_dim > kHeadDim ||
+      w.hidden == 0) {
     Assign(error_msg, "laguna attention: inconsistent weights or cache");
     return false;
+  }
+  for (const KvCache* c : caches) {
+    if (w.kv_heads != c->kv_heads_ || c->head_dim_ != kHeadDim ||
+        w.window != c->window_ || c->k_ == nullptr || c->v_ == nullptr) {
+      Assign(error_msg, "laguna attention: inconsistent weights or cache");
+      return false;
+    }
   }
   // Preflight everything a later stage would check: once the K/V append is
   // enqueued, a failure can no longer leave the cache untouched.
@@ -850,47 +914,55 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
     Assign(error_msg, "laguna attention: null input, output or tensor");
     return false;
   }
-  if (!cache.valid_) {
-    Assign(error_msg,
-           "laguna attention: cache invalidated by a failed call; Reset() it");
-    return false;
-  }
   const std::uint32_t group = w.heads / w.kv_heads;
   if (group == 0 || group > 12 || group == 5 || group == 7 || group == 10 ||
       group == 11) {
     Assign(error_msg, "laguna attention: unsupported GQA group");
     return false;
   }
-  if (start_pos > cache.committed_ ||
-      std::uint64_t{start_pos} + tokens > UINT32_MAX) {
-    Assign(error_msg, "laguna attention: start_pos beyond the cached rows");
-    return false;
-  }
-  if (cache.window_ == 0) {
-    if (std::uint64_t{start_pos} + tokens > cache.capacity_) {
-      Assign(error_msg, "laguna attention: context exceeds the cache");
+  // Per cache: the position its rows start at and how many rows it takes.
+  const std::uint32_t rows_per_cache = batch ? 1U : tokens;
+  const auto start_of = [&](const KvCache& c) {
+    return batch ? c.committed_ : start_pos;
+  };
+  for (const KvCache* cp : caches) {
+    const KvCache& c = *cp;
+    if (!c.valid_) {
+      Assign(
+          error_msg,
+          "laguna attention: cache invalidated by a failed call; Reset() it");
       return false;
     }
-  } else {
-    // Ring: a chunk must fit beside the window, and a rewind must leave the
-    // window of keys before start_pos intact.
-    if (tokens > cache.capacity_ - cache.window_ ||
-        cache.committed_ - start_pos > cache.capacity_ - cache.window_) {
-      Assign(error_msg, "laguna attention: chunk or rewind exceeds the ring");
+    const std::uint32_t start = start_of(c);
+    if (start > c.committed_ ||
+        std::uint64_t{start} + rows_per_cache > UINT32_MAX) {
+      Assign(error_msg, "laguna attention: start_pos beyond the cached rows");
       return false;
     }
-  }
-  // Keys before start_pos that the rows read: [first_key, start_pos). They
-  // must still be in their slots; a rewind cannot bring back evicted ones.
-  const std::uint32_t first_key =
-      cache.window_ != 0 && start_pos + 1 > cache.window_
-          ? start_pos + 1 - cache.window_
-          : 0;
-  if (start_pos > 0 && first_key < cache.retained_begin_) {
-    Assign(
-        error_msg,
-        "laguna attention: keys the call needs were overwritten in the ring");
-    return false;
+    if (c.window_ == 0) {
+      if (std::uint64_t{start} + rows_per_cache > c.capacity_) {
+        Assign(error_msg, "laguna attention: context exceeds the cache");
+        return false;
+      }
+    } else {
+      // Ring: a chunk must fit beside the window, and a rewind must leave the
+      // window of keys before start_pos intact.
+      if (rows_per_cache > c.capacity_ - c.window_ ||
+          c.committed_ - start > c.capacity_ - c.window_) {
+        Assign(error_msg, "laguna attention: chunk or rewind exceeds the ring");
+        return false;
+      }
+    }
+    // Keys before start_pos that the rows read: [first_key, start_pos). They
+    // must still be in their slots; a rewind cannot bring back evicted ones.
+    const std::uint32_t first_key =
+        c.window_ != 0 && start + 1 > c.window_ ? start + 1 - c.window_ : 0;
+    if (start > 0 && first_key < c.retained_begin_) {
+      Assign(
+          error_msg,
+          "laguna attention: keys the call needs were overwritten in the ring");
+      return false;
+    }
   }
   const std::size_t q_dim = std::size_t{w.heads} * kHeadDim;
   const std::size_t kv_dim = std::size_t{w.kv_heads} * kHeadDim;
@@ -935,18 +1007,21 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
                       w.rope.corr_high,  w.rope.freq_scale,  w.rope.ext_factor,
                       w.rope.mscale};
   // From here on the call's K/V rows may be in the cache: any failure
-  // invalidates it, since its slots no longer match committed().
-  const auto invalidate = [&cache] {
-    cache.valid_ = false;
-    cache.committed_ = 0;
-    cache.retained_begin_ = 0;
+  // invalidates every cache the call took, since their slots no longer match
+  // committed().
+  const auto invalidate = [&caches] {
+    for (KvCache* c : caches) {
+      c->valid_ = false;
+      c->committed_ = 0;
+      c->retained_begin_ = 0;
+    }
     return false;
   };
   QkNormRopeAppendKernel<<<dim3(tokens, w.heads + 2 * w.kv_heads), kHeadDim, 0,
                            stream_>>>(
       q, k, v, w.q_norm, w.k_norm, static_cast<__half*>(cache.k_),
       static_cast<__half*>(cache.v_), w.heads, w.kv_heads, w.eps, start_pos,
-      cache.capacity_, rope);
+      cache.capacity_, rope, rows);
   if (!CheckHip(hipGetLastError(), "qk norm rope launch", error_msg) ||
       !Emit("q_rope", q, tokens * q_dim, error_msg)) {
     return invalidate();
@@ -955,7 +1030,7 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
   if (!DispatchAttention(group, q, static_cast<const __half*>(cache.k_),
                          static_cast<const __half*>(cache.v_), attn, w.heads,
                          w.kv_heads, w.window, start_pos, tokens,
-                         cache.capacity_, scale, stream_) ||
+                         cache.capacity_, scale, rows, stream_) ||
       !CheckHip(hipGetLastError(), "attention launch", error_msg) ||
       !Emit("attn", attn, tokens * q_dim, error_msg)) {
     return invalidate();
@@ -976,13 +1051,17 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
   // Writing [start_pos, end) evicted every position below end - capacity. A
   // call below retained_begin (only a start at 0, which needs no history)
   // keeps only its own rows.
-  const std::uint32_t end = start_pos + tokens;
-  std::uint32_t retained = std::min(cache.retained_begin_, start_pos);
-  if (end > cache.capacity_) {
-    retained = std::max(retained, end - cache.capacity_);
+  for (KvCache* cp : caches) {
+    KvCache& c = *cp;
+    const std::uint32_t start = start_of(c);
+    const std::uint32_t end = start + rows_per_cache;
+    std::uint32_t retained = std::min(c.retained_begin_, start);
+    if (end > c.capacity_) {
+      retained = std::max(retained, end - c.capacity_);
+    }
+    c.retained_begin_ = retained;
+    c.committed_ = end;
   }
-  cache.retained_begin_ = retained;
-  cache.committed_ = end;
   return true;
 }
 

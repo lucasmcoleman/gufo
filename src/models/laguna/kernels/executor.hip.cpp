@@ -84,7 +84,7 @@ Executor::~Executor() {
   kv_.clear();
   attn_.reset();
   ffn_.reset();
-  for (Buffer* b : {&h_, &n_, &x_, &o_, &logits_, &zero_ids_}) {
+  for (Buffer* b : {&h_, &n_, &x_, &o_, &logits_, &zero_ids_, &rows_}) {
     Free(b);
   }
   if (stream_ != nullptr) {
@@ -129,7 +129,8 @@ std::size_t Executor::kv_bytes() const noexcept {
 
 std::size_t Executor::scratch_bytes() const noexcept {
   return h_.bytes + n_.bytes + x_.bytes + o_.bytes + logits_.bytes +
-         zero_ids_.bytes + (ffn_ != nullptr ? ffn_->scratch_bytes() : 0);
+         zero_ids_.bytes + rows_.bytes +
+         (ffn_ != nullptr ? ffn_->scratch_bytes() : 0);
 }
 
 bool Executor::BuildCaches(std::string* error_msg) {
@@ -323,13 +324,19 @@ bool Executor::RestoreSnapshot(const ExecutorSnapshot& snapshot,
 }
 
 bool Executor::Run(std::uint32_t T, std::uint32_t start, LogitsRows rows,
-                   std::string* error_msg) {
+                   std::string* error_msg, std::span<Executor* const> batch) {
   const Config& config = model_->config();
   const std::uint32_t H = config.hidden_size;
   Path path = options_.path;
   if (path == Path::kAuto) {
     path = T <= kVectorMaxTokens ? Path::kVector : Path::kBatched;
   }
+  if (!batch.empty()) {
+    // Decode rows of several sessions always take the vector kernels, the
+    // path a lone decode token takes.
+    path = Path::kVector;
+  }
+  std::vector<KvCache*> layer_caches(batch.size());
   const bool vector = path == Path::kVector;
   float* h = static_cast<float*>(h_.ptr);
   float* n = static_cast<float*>(n_.ptr);
@@ -355,8 +362,22 @@ bool Executor::Run(std::uint32_t T, std::uint32_t start, LogitsRows rows,
   for (std::uint32_t il = 0; il < config.num_layers; ++il) {
     const DeviceLayer& layer = model_->layers()[il];
     norm(h, layer.attn_norm, n, T);
-    if (!check("attention norm") ||
-        !attn_->Forward(layer.attn, kv_[il], n, o, T, start, path, &op_error)) {
+    bool attended = false;
+    if (check("attention norm")) {
+      if (batch.empty()) {
+        attended = attn_->Forward(layer.attn, kv_[il], n, o, T, start, path,
+                                  &op_error);
+      } else {
+        for (std::size_t t = 0; t < batch.size(); ++t) {
+          layer_caches[t] = &batch[t]->kv_[il];
+        }
+        attended = attn_->ForwardBatch(
+            layer.attn, layer_caches,
+            static_cast<const DecodeRow*>(rows_.ptr) + std::size_t{il} * T, n,
+            o, &op_error);
+      }
+    }
+    if (!attended) {
       return Fail(error_msg,
                   !op_error.empty()
                       ? "laguna layer " + std::to_string(il) + ": " + op_error
@@ -481,6 +502,183 @@ bool Executor::Forward(std::span<const std::int32_t> tokens, LogitsRows rows,
   }
   position_ += static_cast<std::uint32_t>(T);
   return true;
+}
+
+bool Executor::BatchCompatible(const Executor& lead) const noexcept {
+  const auto vector_ok = [](const Executor& e) {
+    return e.options_.path == Path::kAuto || e.options_.path == Path::kVector;
+  };
+  return model_ == lead.model_ && vector_ok(*this) && vector_ok(lead);
+}
+
+/// Why this executor cannot take `token` now ("" when it can). Nothing is
+/// touched by asking.
+std::string Executor::RejectDecode(std::int32_t token,
+                                   const float* logits) const {
+  if (poisoned_) {
+    return "laguna executor: a previous call failed; Reset() is required";
+  }
+  if (logits == nullptr) {
+    return "laguna executor: logits output missing";
+  }
+  const TensorRef& embd = model_->weights().token_embd;
+  if (token < 0 || static_cast<std::uint64_t>(token) >= embd.rows) {
+    return "laguna executor: token id outside the vocabulary";
+  }
+  if (std::uint64_t{position_} + 1 > options_.context) {
+    return "laguna executor: context of " + std::to_string(options_.context) +
+           " exhausted";
+  }
+  for (const KvCache& cache : kv_) {
+    if (!cache.valid() || cache.committed() != position_) {
+      return "laguna executor: a KV cache is invalid or out of step; Reset() "
+             "is required";
+    }
+  }
+  return {};
+}
+
+void Executor::DecodeBatch(std::span<DecodeItem> items) {
+  std::vector<DecodeItem*> pending;
+  pending.reserve(items.size());
+  for (DecodeItem& item : items) {
+    item.completed = false;
+    item.error.clear();
+    if (item.executor == nullptr) {
+      item.error = "laguna executor: no executor";
+      continue;
+    }
+    const bool duplicate = std::any_of(
+        pending.begin(), pending.end(),
+        [&](const DecodeItem* o) { return o->executor == item.executor; });
+    if (duplicate) {
+      item.error = "laguna executor: executor appears twice in a decode batch";
+      continue;
+    }
+    item.error = item.executor->RejectDecode(item.token, item.logits);
+    if (item.error.empty()) {
+      pending.push_back(&item);
+    }
+  }
+  // Executors that cannot share a pass with the group's first run in another
+  // group (or alone).
+  while (!pending.empty()) {
+    Executor* lead = pending.front()->executor;
+    const std::size_t limit =
+        std::min<std::size_t>(kVectorMaxRows, lead->options_.max_chunk);
+    std::vector<DecodeItem*> group;
+    std::vector<DecodeItem*> rest;
+    for (DecodeItem* item : pending) {
+      if (group.size() < limit &&
+          (item == pending.front() || item->executor->BatchCompatible(*lead))) {
+        group.push_back(item);
+      } else {
+        rest.push_back(item);
+      }
+    }
+    pending = std::move(rest);
+    if (group.size() == 1) {
+      DecodeItem* item = group.front();
+      const std::int32_t token = item->token;
+      item->completed = item->executor->Forward(
+          std::span<const std::int32_t>(&token, 1), LogitsRows::kLast,
+          item->logits, &item->error);
+    } else {
+      RunGroup(group);
+    }
+  }
+}
+
+void Executor::RunGroup(std::span<DecodeItem* const> group) {
+  Executor& lead = *group.front()->executor;
+  const Config& config = lead.model_->config();
+  const std::size_t H = config.hidden_size;
+  const std::size_t n = group.size();
+  const std::size_t layers = config.num_layers;
+  const auto fail_all = [&](const std::string& message, bool poison) {
+    for (DecodeItem* item : group) {
+      item->completed = false;
+      item->error = message;
+      if (poison) {
+        item->executor->poisoned_ = true;
+      }
+    }
+  };
+  // The only allocation, before anything is enqueued: a failure touches
+  // nothing.
+  if (lead.rows_.bytes < layers * n * sizeof(DecodeRow)) {
+    const std::size_t rows_max =
+        std::min<std::size_t>(kVectorMaxRows, lead.options_.max_chunk);
+    Buffer fresh;
+    std::string alloc_error;
+    if (!lead.Alloc(&fresh, layers * rows_max * sizeof(DecodeRow),
+                    &alloc_error)) {
+      fail_all(alloc_error, false);
+      return;
+    }
+    (void)hipStreamSynchronize(lead.stream_);
+    lead.Free(&lead.rows_);
+    lead.rows_ = fresh;
+  }
+  std::vector<Executor*> members(n);
+  std::vector<DecodeRow> table(layers * n);
+  lead.host_embed_.resize(n * H);
+  const TensorRef& embd = lead.model_->weights().token_embd;
+  for (std::size_t t = 0; t < n; ++t) {
+    Executor& member = *group[t]->executor;
+    members[t] = &member;
+    for (std::size_t il = 0; il < layers; ++il) {
+      table[il * n + t] = AttnOps::DescribeDecodeRow(member.kv_[il]);
+    }
+    reference::DequantizeRow(
+        embd.type,
+        static_cast<const std::uint8_t*>(embd.data) +
+            static_cast<std::size_t>(group[t]->token) * embd.RowBytes(),
+        lead.host_embed_.data() + t * H, H);
+  }
+  // From here on a failure can leave some layers' caches advanced.
+  if (const hipError_t s =
+          hipMemcpy(lead.rows_.ptr, table.data(),
+                    table.size() * sizeof(DecodeRow), hipMemcpyHostToDevice);
+      s != hipSuccess) {
+    fail_all(std::string("laguna executor: decode row upload: ") +
+                 hipGetErrorString(s),
+             true);
+    return;
+  }
+  if (const hipError_t s =
+          hipMemcpy(lead.h_.ptr, lead.host_embed_.data(), n * H * sizeof(float),
+                    hipMemcpyHostToDevice);
+      s != hipSuccess) {
+    fail_all(std::string("laguna executor: embedding upload: ") +
+                 hipGetErrorString(s),
+             true);
+    return;
+  }
+  std::string error;
+  if (!lead.Run(static_cast<std::uint32_t>(n), 0, LogitsRows::kAll, &error,
+                members)) {
+    fail_all(error.empty() ? "laguna batched forward pass failed" : error,
+             true);
+    return;
+  }
+  const std::size_t vocab = config.vocab_size;
+  for (std::size_t t = 0; t < n; ++t) {
+    if (const hipError_t s =
+            hipMemcpy(group[t]->logits,
+                      static_cast<const float*>(lead.logits_.ptr) + t * vocab,
+                      vocab * sizeof(float), hipMemcpyDeviceToHost);
+        s != hipSuccess) {
+      fail_all(
+          std::string("laguna executor: logits copy: ") + hipGetErrorString(s),
+          true);
+      return;
+    }
+  }
+  for (DecodeItem* item : group) {
+    item->executor->position_ += 1;
+    item->completed = true;
+  }
 }
 
 }  // namespace gufo::models::laguna::rocm
