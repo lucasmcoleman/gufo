@@ -31,6 +31,7 @@
 #include "src/core/utf8.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/tool_calls.hpp"
+#include "src/models/laguna/tool_calls.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::server {
@@ -95,6 +96,15 @@ constexpr std::array<std::string_view, 7> kToolMarkers{
 };
 using ToolMarkerSet = std::span<const std::string_view>;
 
+// Laguna opens a call with the same bytes as Qwen; this array's identity, not
+// its text, selects the Laguna dialect (IsLagunaMarkers).
+constexpr std::array<std::string_view, 1> kLagunaToolMarkers{
+    models::laguna::ToolSyntax::kCallOpen};
+
+bool IsLagunaMarkers(ToolMarkerSet markers) noexcept {
+  return markers.data() == kLagunaToolMarkers.data();
+}
+
 ToolMarkerSet ToolMarkers(
     std::optional<sampling::JsonConstraint::ToolFormat> format) {
   using Format = sampling::JsonConstraint::ToolFormat;
@@ -111,6 +121,8 @@ ToolMarkerSet ToolMarkers(
   // their native call syntax; keep recognizing every opener there.
   if (!format || *format == Format::kJson)
     return kToolMarkers;
+  if (*format == Format::kLaguna)
+    return kLagunaToolMarkers;
   // Match the canonical opener selected by JsonConstraint::WithTools. Other
   // dialects are ordinary prose under that grammar, not additional calls.
   return *format == Format::kDeepSeek ? ToolMarkerSet(deepseek)
@@ -120,6 +132,10 @@ ToolMarkerSet ToolMarkers(
 // A native function header, rather than a bare marker mentioned in prose,
 // permits the implicit reasoning boundary used by llama.cpp's native parsers.
 ToolMarkerSet ReasoningToolMarkers(ToolMarkerSet markers) {
+  // Laguna reasoning ends only at </think>, as its grammar admits
+  // (JsonConstraint::WithTools gives it no reasoning-side call prefix).
+  if (IsLagunaMarkers(markers))
+    return {};
   static constexpr std::array<std::string_view, 1> qwen{
       tokenization::QwenToolSyntax::kNativeCallOpen};
   static constexpr std::array<std::string_view, 2> deepseek{
@@ -170,7 +186,8 @@ ToolCloserSet ToolClosers(
   // As in llama.cpp, DeepSeek content is everything outside its native call
   // block, which ends the output: there is no echo to strip, and client
   // envelope syntax the model writes stays visible text.
-  if (*format == Format::kDeepSeek)
+  // Laguna's grammar ends the output after its calls in the same way.
+  if (*format == Format::kDeepSeek || *format == Format::kLaguna)
     return {};
   // Mirror ToolMarkers: stripping follows the dialect the request admitted,
   // and another dialect's closing tags are ordinary prose like its openers —
@@ -1025,7 +1042,7 @@ std::string_view AfterReasoningSeparator(std::string_view value,
   // Qwen's llama.cpp PEG uses `reasoning << content`: `<<` consumes space().
   // Keep other dialects' existing line-break rule. Only the boundary after an
   // explicit </think> is framing; answer and argument interiors are untouched.
-  const bool qwen = markers.size() == 1 &&
+  const bool qwen = markers.size() == 1 && !IsLagunaMarkers(markers) &&
                     markers.front() == tokenization::QwenToolSyntax::kCallOpen;
   const auto first = value.find_first_not_of(qwen ? " \t\r\n\f\v" : "\r\n");
   return first == std::string_view::npos ? std::string_view{}
@@ -1526,11 +1543,40 @@ bool InterpretQwenParameter(
   return true;
 }
 
+// A Laguna call in the shape of a native Qwen scan: both dialects carry
+// untyped parameters that the advertised schema interprets, so the Qwen
+// interpretation, recovery and streaming below apply unchanged.
+tokenization::QwenToolCallScan ScanLagunaToolCall(std::string_view text) {
+  const auto scan = models::laguna::ScanToolCall(text);
+  tokenization::QwenToolCallScan result{
+      .matched = scan.matched, .progress = scan.progress, .end = scan.end};
+  if (!scan.call)
+    return result;
+  const auto convert = [](const models::laguna::ScannedToolArgument& argument) {
+    return tokenization::QwenToolCallParameter{.name = argument.name,
+                                               .value = argument.value,
+                                               .framed = true,
+                                               .progress = argument.progress};
+  };
+  tokenization::QwenToolCallSyntax call;
+  call.name = scan.call->name;
+  for (const auto& argument : scan.call->arguments)
+    call.parameters.push_back(convert(argument));
+  if (scan.call->unfinished)
+    call.unfinished = convert(*scan.call->unfinished);
+  call.native = true;
+  // Only a terminated name can stream: "read" may still become "readme".
+  call.canonical_header = scan.call->name_complete;
+  call.complete = scan.call->complete;
+  result.call = std::move(call);
+  return result;
+}
+
 void ParseQwenCalls(
     std::string_view text, std::span<const tokenization::ChatTool> tools,
     std::vector<ParsedToolCall>* calls,
     std::vector<std::pair<std::size_t, std::size_t>>* spans = nullptr,
-    bool require_schema = false, bool partial = false) {
+    bool require_schema = false, bool partial = false, bool laguna = false) {
   QuoteTracker call_quotes;
   call_quotes.Reset(text);
   std::size_t cursor = 0;
@@ -1542,7 +1588,9 @@ void ParseQwenCalls(
       continue;
     }
     const auto marker_begin = cursor;
-    const auto scan = tokenization::ScanQwenToolCall(text.substr(marker_begin));
+    const auto scan =
+        laguna ? ScanLagunaToolCall(text.substr(marker_begin))
+               : tokenization::ScanQwenToolCall(text.substr(marker_begin));
     if (!scan.matched || !scan.call) {
       cursor = marker_begin + scan.progress;
       if (cursor == marker_begin)
@@ -1860,7 +1908,8 @@ ParsedGeneration ParseGeneration(
     // an additional API invocation.
     if (text_from_tools.starts_with(tokenization::QwenToolSyntax::kCallOpen))
       ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, nullptr,
-                     unfinished_reasoning_quote, partial);
+                     unfinished_reasoning_quote, partial,
+                     IsLagunaMarkers(markers));
     else
       ParseDsmlCalls(
           text_from_tools, markers, tools, &parsed.tool_calls, &spans,
@@ -1997,7 +2046,8 @@ ParsedGeneration ParseStructuredGeneration(
     ParsedGeneration call;
     std::vector<std::pair<std::size_t, std::size_t>> spans;
     ParseQwenCalls(content, tools, &call.tool_calls,
-                   tool_only ? &spans : nullptr, false, partial);
+                   tool_only ? &spans : nullptr, false, partial,
+                   IsLagunaMarkers(markers));
     if (tool_only) {
       std::size_t cursor = 0;
       for (const auto& [begin, end] : spans) {

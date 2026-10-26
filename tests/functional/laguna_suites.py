@@ -26,10 +26,8 @@ Suite groups (run.py names):
          edges, progress, stream start, metrics, reasoning separator/budget
   cache  RAM-snapshot cache behaviour: edits, growth, depth, rotation,
          concurrency, shared prefixes, prefill scheduling
-  tools  tool-call suites. Laguna's output dialect is the repository's JSON
-         fallback (the template renders calls natively in history only), so
-         suites that assert a model's native dialect can differ; run it
-         deliberately and read the failures.
+  tools  tool-call suites, in Laguna's native <arg_key>/<arg_value> dialect
+         (the bytes its template renders for calls in history).
 
 Not selected: `cache` (it needs --cache-disk, which Laguna refuses: it has no
 serialized snapshot format), image suites (no vision), and the cache suites

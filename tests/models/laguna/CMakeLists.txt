@@ -17,6 +17,9 @@ add_laguna_test(contract gufo_laguna "cpu")
 # Chat template: the compiled renderer against Poolside's Jinja output. No model
 # needed. The token check reads the real GGUF and is skipped without it.
 add_laguna_test(chat_template gufo_laguna "cpu")
+# The tool-call scanner links into the HTTP layer, not gufo_laguna.
+target_sources(laguna_chat_template_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/models/laguna/tool_calls.cpp)
 target_compile_definitions(laguna_chat_template_test PRIVATE
   GUFO_LAGUNA_CHAT_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_goldens.json")
 

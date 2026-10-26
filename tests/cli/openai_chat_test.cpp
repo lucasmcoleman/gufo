@@ -6339,6 +6339,114 @@ void TestIncrementalToolArguments() {
       }
 }
 
+// Laguna's native calls parse, stream their string arguments incrementally,
+// and keep tag-like, escaped and non-ASCII argument bytes verbatim.
+void TestLagunaNativeToolCalls() {
+  const std::string text =
+      "say \"hi\" \\ caf\xC3\xA9 <tool_call> </parameter> </think> "
+      "|\xE2\x97\x8A|";
+  const std::string raw =
+      "<tool_call>record<arg_key>text</arg_key><arg_value>" + text +
+      "</arg_value><arg_key>count</arg_key><arg_value>42</arg_value>"
+      "<arg_key>values</arg_key><arg_value>[true, null, {\"key\": \"value\"}]"
+      "</arg_value></tool_call>";
+  for (const bool thinking : {false, true})
+    for (const bool stream : {false, true}) {
+      auto body = gufo::json::parse(R"({
+        "model":"test-model","messages":[{"role":"user","content":"go"}],
+        "tool_choice":"required","parallel_tool_calls":false,
+        "tools":[{"type":"function","function":{"name":"record",
+          "parameters":{"type":"object","properties":{
+            "text":{"type":"string"},"count":{"type":"integer"},
+            "values":{"type":"array"}},
+          "required":["text","count","values"]}}}]})");
+      body["stream"] = stream;
+      body["chat_template_kwargs"]["enable_thinking"] = thinking;
+      FakeBackend backend;
+      backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kLaguna;
+      for (char byte : (thinking ? "Plan.</think>" : "") + raw)
+        backend.pieces.emplace_back(1, byte);
+      const auto response =
+          gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      std::string content;
+      std::string reasoning;
+      std::vector<std::string> names;
+      std::string arguments;
+      std::size_t fragments = 0;
+      if (stream) {
+        response.streaming_body([&](std::string_view chunk) {
+          if (chunk == "data: [DONE]\n\n")
+            return true;
+          const auto event = gufo::json::parse(chunk.substr(6));
+          for (const auto& choice : event.find("choices")->items())
+            if (const auto* delta = choice.find("delta")) {
+              content += delta->member_str("content");
+              reasoning += delta->member_str("reasoning_content");
+              if (const auto* calls = delta->find("tool_calls"))
+                for (const auto& call : calls->items())
+                  if (const auto* function = call.find("function")) {
+                    if (!function->member_str("name").empty())
+                      names.push_back(function->member_str("name"));
+                    const auto piece = function->member_str("arguments");
+                    fragments += !piece.empty();
+                    arguments += piece;
+                  }
+            }
+          return true;
+        });
+      } else {
+        const auto parsed = gufo::json::parse(response.body);
+        const auto& message =
+            *parsed.find("choices")->items()[0].find("message");
+        if (message.find("content")->is_string())
+          content = message.member_str("content");
+        reasoning = message.member_str("reasoning_content");
+        for (const auto& call : message.find("tool_calls")->items()) {
+          names.push_back(call.find("function")->member_str("name"));
+          arguments = call.find("function")->member_str("arguments");
+        }
+      }
+      Expect(names == std::vector<std::string>{"record"},
+             "Laguna native call is returned once");
+      const auto parsed_arguments = gufo::json::parse(arguments);
+      Expect(parsed_arguments.member_str("text") == text,
+             "Laguna string argument keeps its bytes");
+      Expect(parsed_arguments.find("count")->is_number() &&
+                 parsed_arguments.find("count")->as_double() == 42,
+             "Laguna integer argument is typed");
+      Expect(parsed_arguments.find("values")->is_array() &&
+                 parsed_arguments.find("values")->items().size() == 3,
+             "Laguna array argument is typed");
+      Expect(content.empty(), "Laguna call markup is not content");
+      Expect((reasoning == "Plan.") == thinking, "Laguna reasoning is kept");
+      Expect(!stream || fragments > 3,
+             "Laguna string arguments stream incrementally");
+    }
+  // Another dialect's envelope in prose stays prose; only <tool_call> opens.
+  auto body = gufo::json::parse(R"({
+    "model":"test-model","messages":[{"role":"user","content":"go"}],
+    "tool_choice":"auto",
+    "tools":[{"type":"function","function":{"name":"read",
+      "parameters":{"type":"object","properties":{"path":{"type":"string"}},
+      "required":["path"]}}}]})");
+  FakeBackend backend;
+  backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kLaguna;
+  backend.pieces = {"<tool_calls></tool_calls>\n",
+                    "<tool_call>read<arg_key>path</arg_key><arg_value>"
+                    "fixture.xml</arg_value></tool_call>"};
+  const auto response =
+      gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+  const auto parsed = gufo::json::parse(response.body);
+  const auto& message = *parsed.find("choices")->items()[0].find("message");
+  const auto& calls = message.find("tool_calls")->items();
+  Expect(
+      calls.size() == 1 && calls[0].find("function")->member_str("arguments") ==
+                               R"({"path":"fixture.xml"})",
+      "Laguna call follows quoted foreign envelope");
+  Expect(message.member_str("content").find("<tool_call>") == std::string::npos,
+         "Laguna call markup leaves content");
+}
+
 void TestParallelCallSeparatorIsNotContent() {
   // Qwen writes a newline between parallel calls and may end with one. That
   // layout is not a reply: the turn has null content, as with one call (#673).
@@ -6438,6 +6546,7 @@ int main() {
   TestResponsesOutput();
   TestNativeToolTransports();
   TestParallelCallSeparatorIsNotContent();
+  TestLagunaNativeToolCalls();
   TestJsonToolStringOwnership();
   TestNativeToolDialectSelection();
   TestNativeToolTextOutsideEnvelopes();

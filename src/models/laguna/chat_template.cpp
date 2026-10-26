@@ -172,17 +172,18 @@ std::string RenderChat(std::span<const ChatMessage> messages,
       }
       out += message.content;
       for (const ChatMessage::ToolCall& call : message.tool_calls) {
-        out += "<tool_call>";
+        out += ToolSyntax::kCallOpen;
         out += call.name;
         for (const ChatMessage::ToolArgument& argument : call.arguments) {
-          out += "<arg_key>";
+          out += ToolSyntax::kKeyOpen;
           out += argument.name;
-          out += "</arg_key><arg_value>";
+          out += ToolSyntax::kKeyClose;
+          out += ToolSyntax::kValueOpen;
           out += argument.is_string ? argument.value
                                     : ArgumentJson(argument.value);
-          out += "</arg_value>";
+          out += ToolSyntax::kValueClose;
         }
-        out += "</tool_call>";
+        out += ToolSyntax::kCallClose;
       }
       out += "</assistant>\n";
     } else if (message.role == "tool") {

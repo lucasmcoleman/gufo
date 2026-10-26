@@ -30,6 +30,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/reasoning.hpp"
+#include "src/models/laguna/tool_calls.hpp"
 
 namespace gufo::models::laguna {
 

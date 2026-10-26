@@ -126,6 +126,49 @@ void EdgeCases() {
                 "</tool_call></assistant>\n"),
             "tool call arguments");
   }
+  // The scanner reads back the bytes the renderer writes for calls, so a
+  // generated call replayed as history reproduces the generated text.
+  {
+    const std::string generated =
+        "<tool_call>record<arg_key>text</arg_key><arg_value>a \"q\" \\ "
+        "<tool_call> </think> caf\xC3\xA9</arg_value><arg_key>n</arg_key>"
+        "<arg_value>42</arg_value></tool_call>";
+    const auto scan = ml::ScanToolCall(generated);
+    Require(scan.matched && scan.call && scan.call->complete &&
+                scan.call->name_complete && scan.end == generated.size(),
+            "scanner reads a complete call");
+    M assistant;
+    assistant.role = "assistant";
+    ml::ChatMessage::ToolCall call;
+    call.name = scan.call->name;
+    for (const auto& argument : scan.call->arguments)
+      call.arguments.push_back(
+          {argument.name, argument.value, argument.name == "text"});
+    assistant.tool_calls.push_back(call);
+    ml::ChatTemplateOptions options;
+    options.add_generation_prompt = false;
+    options.enable_thinking = false;
+    const std::vector<M> messages{user("go"), assistant};
+    Require(
+        ml::RenderChat(messages, {}, options)
+            .ends_with("<assistant></think>" + generated + "</assistant>\n"),
+        "scanned call round-trips through history rendering");
+    // Streaming: an unfinished value holds back a partial closer, and a
+    // name is final only once a tag follows it.
+    const auto partial = ml::ScanToolCall(
+        "<tool_call>record<arg_key>text</arg_key><arg_value>abc</arg_");
+    Require(partial.call && partial.call->name_complete &&
+                partial.call->unfinished &&
+                partial.call->unfinished->value == "abc" &&
+                !partial.call->complete,
+            "unfinished value streams without its partial closer");
+    const auto growing = ml::ScanToolCall("<tool_call>rec");
+    Require(growing.call && !growing.call->name_complete,
+            "an unterminated name is not final");
+    const auto empty = ml::ScanToolCall("<tool_call>noop</tool_call>");
+    Require(empty.call && empty.call->complete && empty.call->arguments.empty(),
+            "a call without arguments is complete");
+  }
   // Only the first message can be the header; roles the template does not
   // know are skipped.
   {

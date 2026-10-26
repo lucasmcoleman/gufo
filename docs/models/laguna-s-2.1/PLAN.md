@@ -105,10 +105,16 @@ Decisions and limits:
   available locally). The prompt carries BOS itself (`〈|EOS|〉`, id 2), so none
   is added; raw completions get BOS, as llama.cpp does for this GGUF.
 - **Stop tokens** are EOS 2 and EOT 24 (`</assistant>`).
-- **Tool calls.** History renders natively. Output uses the repository's JSON
-  fallback dialect (`<tool_call>{"name":..,"arguments":..}</tool_call>`, grammar
-  constrained), not Laguna's native `<arg_key>` form: the native dialect would
-  need its own parser and grammar in `openai_chat.cpp` and `json_constraint.cpp`.
+- **Tool calls.** Output uses Laguna's native dialect, the bytes the template
+  renders for historical calls (`<tool_call>name<arg_key>k</arg_key><arg_value>v
+  </arg_value></tool_call>`, no separators): `JsonConstraint::ToolFormat::kLaguna`
+  constrains it like Qwen's native form (raw string values, JSON otherwise,
+  calls end the output, parallel calls back to back, no reasoning-side call
+  boundary), and `src/models/laguna/tool_calls.{hpp,cpp}` scans it for
+  `openai_chat.cpp`, which interprets and streams the arguments with the Qwen
+  path. A generated call replayed as history renders to the generated text, so
+  tool turns keep the generated frontier in the cache. The earlier JSON
+  fallback injected a system instruction and could not round-trip.
 - **Control text in content.** Like llama.cpp and the Hugging Face tokenizer, a
   client message containing `</assistant>` or `<think>` tokenizes to that token.
 - **Snapshots.** RAM snapshots of the full-layer KV up to the position and each

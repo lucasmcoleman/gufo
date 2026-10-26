@@ -27,6 +27,44 @@ constexpr std::size_t kMaxStates = 8192;
 constexpr std::size_t kMaxStack = 16384;
 constexpr std::size_t kMaxWork = 2000000;
 
+// Native dialects whose parameters carry no type flag: a value admitting
+// strings is raw text, other values are JSON (Qwen3-Coder, Laguna/GLM).
+bool UntypedNativeTags(JsonConstraint::ToolFormat format) {
+  return format == JsonConstraint::ToolFormat::kQwen ||
+         format == JsonConstraint::ToolFormat::kLaguna;
+}
+
+// Laguna-S-2.1 writes `<tool_call>NAME<arg_key>K</arg_key><arg_value>V
+// </arg_value></tool_call>` with no separators, as its chat template renders
+// historical calls (src/models/laguna/chat_template.cpp).
+constexpr std::string_view kLagunaKeyOpen = "<arg_key>";
+constexpr std::string_view kLagunaKeyValue = "</arg_key><arg_value>";
+constexpr std::string_view kLagunaValueClose = "</arg_value>";
+
+// Delimiter that ends a raw native parameter value.
+std::string NativeValueClose(JsonConstraint::ToolFormat format) {
+  using Format = JsonConstraint::ToolFormat;
+  return format == Format::kQwen     ? "\n</parameter>\n"
+         : format == Format::kLaguna ? std::string(kLagunaValueClose)
+                                     : "</｜DSML｜parameter>";
+}
+
+// Bytes after a native parameter value.
+std::string NativeParameterEnd(JsonConstraint::ToolFormat format) {
+  return format == JsonConstraint::ToolFormat::kDeepSeek
+             ? NativeValueClose(format) + "\n"
+             : NativeValueClose(format);
+}
+
+// Opening tag of an untyped native parameter (Qwen or Laguna).
+std::string UntypedParameterOpen(JsonConstraint::ToolFormat format,
+                                 std::string_view name) {
+  if (format == JsonConstraint::ToolFormat::kLaguna)
+    return std::string(kLagunaKeyOpen) + std::string(name) +
+           std::string(kLagunaKeyValue);
+  return "<parameter=" + std::string(name) + ">\n";
+}
+
 [[noreturn]] void Invalid(std::string_view message) {
   throw std::invalid_argument("JSON Schema: " + std::string(message));
 }
@@ -311,7 +349,7 @@ public:
     // Qwen has no type flag for wildcard parameters. Unknown names are text
     // in its parser: emitting native tags would turn 1/true/null/[]/{} into
     // strings. Preserve JSON types instead of guessing from their spelling.
-    if (open && format == Format::kQwen)
+    if (open && UntypedNativeTags(format))
       return {};
     if (const auto* extra = root->find("additionalProperties");
         extra && !extra->is_bool() &&
@@ -332,14 +370,13 @@ public:
       if (name.empty() || name.find_first_of("<>\"=\r\n") != std::string::npos)
         return {};
       // The loose route handles literal names outside this simple subset.
-      if (format == Format::kQwen &&
+      if (UntypedNativeTags(format) &&
           (std::string_view(" \t\f\v").find(name.front()) !=
                std::string_view::npos ||
            std::string_view(" \t\f\v").find(name.back()) !=
                std::string_view::npos))
         return {};
-      const std::string close =
-          format == Format::kQwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
+      const std::string close = NativeValueClose(format);
       const auto* schema = NativeSchema(original);
       const auto* type = schema ? schema->find("type") : nullptr;
       if (!type || !type->is_string() || schema->contains("anyOf")) {
@@ -357,7 +394,7 @@ public:
           return {};
         const bool text = types[kStringType];
         std::uint32_t typed = 0;
-        if (!text || format != Format::kQwen) {
+        if (!text || !UntypedNativeTags(format)) {
           bool supported = true;
           try {
             auto probe = JsonConstraintCompiler(schema_, strict_, true);
@@ -371,9 +408,9 @@ public:
         const auto raw = Optional(
             Lexeme(JsonSchemaLexeme::RawString(json::Value::object(), close)));
         std::uint32_t value;
-        if (format == Format::kQwen) {
-          value =
-              Seq({Literal("<parameter=" + name + ">\n"), text ? raw : typed});
+        if (UntypedNativeTags(format)) {
+          value = Seq({Literal(UntypedParameterOpen(format, name)),
+                       text ? raw : typed});
         } else {
           const auto open =
               "<｜DSML｜parameter name=\"" + name + "\" string=\"";
@@ -384,10 +421,8 @@ public:
             choices.push_back(Seq({Literal(open + "false\">"), typed}));
           value = Alt(choices);
         }
-        members.emplace_back(
-            name,
-            Seq({value,
-                 Literal(format == Format::kQwen ? close : close + "\n")}));
+        members.emplace_back(name,
+                             Seq({value, Literal(NativeParameterEnd(format))}));
         continue;
       }
       const bool string = type->str() == "string";
@@ -436,14 +471,13 @@ public:
       } else {
         value = Visit(original, 1);
       }
-      const auto open = format == Format::kQwen
-                            ? "<parameter=" + name + ">\n"
+      const auto open = UntypedNativeTags(format)
+                            ? UntypedParameterOpen(format, name)
                             : "<｜DSML｜parameter name=\"" + name +
                                   "\" string=\"" + (string ? "true" : "false") +
                                   "\">";
-      members.emplace_back(
-          name, Seq({Literal(open), value,
-                     Literal(format == Format::kQwen ? close : close + "\n")}));
+      members.emplace_back(name, Seq({Literal(open), value,
+                                      Literal(NativeParameterEnd(format))}));
     }
     const auto body = Arguments(members, required);
     grammar_->root_ =
@@ -462,9 +496,8 @@ public:
       JsonConstraint::ToolFormat format) {
     using Format = JsonConstraint::ToolFormat;
     ignore_unknown_keys_ = true;
-    const bool qwen = format == Format::kQwen;
-    const std::string close =
-        qwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
+    const bool qwen = UntypedNativeTags(format);
+    const std::string close = NativeValueClose(format);
     // A root reference is followed as ToolParameters does; other roots that
     // are not objects declare no parameters, as in llama.cpp.
     const auto* root = &schema_;
@@ -497,7 +530,9 @@ public:
       // names, including surrounding spaces, are written literally as llama.cpp
       // does; the parser matches declared names exactly.
       if (name.empty() ||
-          name.find_first_of(qwen ? ">\r\n" : "\"\r\n") != std::string::npos) {
+          name.find_first_of(format == Format::kLaguna ? "<\r\n"
+                             : qwen                    ? ">\r\n"
+                                    : "\"\r\n") != std::string::npos) {
         required.erase(name);
         continue;
       }
@@ -558,8 +593,8 @@ public:
       }
       std::uint32_t value;
       if (qwen) {
-        value =
-            Seq({Literal("<parameter=" + name + ">\n"), text ? raw : typed});
+        value = Seq(
+            {Literal(UntypedParameterOpen(format, name)), text ? raw : typed});
       } else {
         const auto open = "<｜DSML｜parameter name=\"" + name + "\" string=\"";
         Sequence choices;
@@ -570,7 +605,7 @@ public:
         value = Alt(choices);
       }
       members.emplace_back(name,
-                           Seq({value, Literal(qwen ? close : close + "\n")}));
+                           Seq({value, Literal(NativeParameterEnd(format))}));
     }
     grammar_->root_ = Arguments(members, required);
     return Finish();
@@ -644,12 +679,17 @@ private:
       name_schema["pattern"] =
           excluded + name_schema.find("pattern")->str().substr(1);
     }
-    const auto name =
-        Lexeme(JsonSchemaLexeme::RawString(name_schema, qwen ? ">" : "\""));
-    const std::string close =
-        qwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
+    const bool laguna = format == Format::kLaguna;
+    const auto name = Lexeme(JsonSchemaLexeme::RawString(
+        name_schema, laguna ? std::string(kLagunaKeyValue)
+                     : qwen ? ">"
+                            : "\""));
+    const std::string close = NativeValueClose(format);
     const auto raw = Optional(
         Lexeme(JsonSchemaLexeme::RawString(json::Value::object(), close)));
+    if (laguna)
+      return Seq({Literal(std::string(kLagunaKeyOpen)), name,
+                  Literal(std::string(kLagunaKeyValue)), raw, Literal(close)});
     const auto value = qwen ? Seq({Literal(">\n"), raw})
                             : Alt({Seq({Literal("\" string=\"true\">"), raw}),
                                    Seq({Literal("\" string=\"false\">"),
@@ -1826,7 +1866,7 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
   const bool open_untyped =
       grammar && untyped && !preserve_root &&
       !ClosedProperties(schema, best_effort) && (best_effort || open) &&
-      !(format == ToolFormat::kQwen && HasPropertySchemas(schema));
+      !(UntypedNativeTags(format) && HasPropertySchemas(schema));
   if (open_untyped) {
     grammar = OpenToolParameters(format);
   } else if (grammar && format != ToolFormat::kJson) {
@@ -1875,7 +1915,14 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::OpenToolParameters(
     return JsonConstraintCompiler(schema, false)
         .OpenToolParameters(ToolFormat::kDeepSeek);
   }();
-  return format == ToolFormat::kQwen ? qwen : deepseek;
+  static const auto laguna = [] {
+    const auto schema = json::Value::object();
+    return JsonConstraintCompiler(schema, false)
+        .OpenToolParameters(ToolFormat::kLaguna);
+  }();
+  return format == ToolFormat::kQwen     ? qwen
+         : format == ToolFormat::kLaguna ? laguna
+                                         : deepseek;
 }
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::WithReasoning(
@@ -1999,9 +2046,11 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   const bool deepseek = format == ToolFormat::kDeepSeek;
   const std::string_view marker =
       deepseek ? "<｜DSML｜tool_calls>" : "<tool_call>";
+  const bool laguna = format == ToolFormat::kLaguna;
   const auto end = literal(format == ToolFormat::kJson ? "}</tool_call>"
                            : deepseek                  ? "</｜DSML｜invoke>"
-                                      : "</function>\n</tool_call>");
+                           : laguna                    ? "</tool_call>"
+                                    : "</function>\n</tool_call>");
   const auto calls = static_cast<std::uint32_t>(grammar->rules_.size());
   grammar->rules_.push_back({});
   // In tool-only mode ordinary text remains unconstrained until a canonical
@@ -2041,9 +2090,10 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   // As in llama.cpp's DeepSeek V4 and Qwen3-Coder parsers, calls end the
   // output: parallel calls share one DeepSeek block, Qwen calls may follow
   // each other, and no text may follow them. Text after a call is where
-  // echoed framing used to leak into content (#383, #438).
+  // echoed framing used to leak into content (#383, #438). Laguna's template
+  // writes consecutive calls with nothing between them, then </assistant>.
   const bool qwen = format == ToolFormat::kQwen;
-  const bool ends_output = deepseek || qwen || !plain_answer;
+  const bool ends_output = deepseek || qwen || laguna || !plain_answer;
   auto after = ends_output ? static_cast<std::uint32_t>(grammar->rules_.size())
                : parallel  ? prose
                            : text(UINT32_MAX);
@@ -2092,7 +2142,10 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   std::map<const JsonConstraint*, std::uint32_t> imported;
   if (answer)
     imported.emplace(answer.get(), answer->root_);
-  if (format != ToolFormat::kJson) {
+  // Laguna reasoning ends only at </think>: its template always closes the
+  // reasoning block before content and calls.
+  const bool reasoning_calls = format != ToolFormat::kJson && !laguna;
+  if (reasoning_calls) {
     grammar->reasoning_tool_prefix_ =
         deepseek ? "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\""
                  : "<tool_call>\n<function=";
@@ -2104,11 +2157,12 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
         format == ToolFormat::kJson
             ? "{\"name\":" + json::Value(name).dump() + ",\"arguments\":"
         : deepseek ? "\n<｜DSML｜invoke name=\"" + name + "\">\n"
+        : laguna   ? name
                    : "\n<function=" + name + ">\n");
     if (const auto found = imported.find(arguments.get());
         found != imported.end()) {
       grammar->rules_[calls].push_back({begin, found->second, end, after});
-      if (format != ToolFormat::kJson) {
+      if (reasoning_calls) {
         const auto named = literal(name + (deepseek ? "\">\n" : ">\n"));
         grammar->rules_[grammar->reasoning_tool_root_].push_back(
             {named, found->second, end, after});
@@ -2148,7 +2202,7 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
     const auto root = static_cast<std::uint32_t>(arguments->root_ + rules);
     imported.emplace(arguments.get(), root);
     grammar->rules_[calls].push_back({begin, root, end, after});
-    if (format != ToolFormat::kJson) {
+    if (reasoning_calls) {
       const auto named = literal(name + (deepseek ? "\">\n" : ">\n"));
       grammar->rules_[grammar->reasoning_tool_root_].push_back(
           {named, root, end, after});

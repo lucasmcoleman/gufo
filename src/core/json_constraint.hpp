@@ -22,7 +22,10 @@ namespace gufo::sampling {
 // verification.
 class JsonConstraint {
 public:
-  enum class ToolFormat { kJson, kQwen, kDeepSeek };
+  /// kLaguna is Laguna-S-2.1's native `<tool_call>NAME<arg_key>K</arg_key>
+  /// <arg_value>V</arg_value></tool_call>` form: raw string values and JSON
+  /// otherwise, like Qwen, with no reasoning-side call boundary.
+  enum class ToolFormat { kJson, kQwen, kDeepSeek, kLaguna };
   struct Stack {
     std::vector<std::uint32_t> symbols;
     std::string lexeme;

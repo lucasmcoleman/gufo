@@ -29,6 +29,93 @@ bool Accepts(const JsonConstraint& grammar, std::string_view text) {
   return grammar.Complete(state);
 }
 
+// Laguna-S-2.1 writes calls exactly as its template renders history:
+// <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>.
+void TestLagunaNativeTools() {
+  constexpr auto kLaguna = JsonConstraint::ToolFormat::kLaguna;
+  const auto read = JsonConstraint::ToolParameters(parse(R"({
+    "type":"object","properties":{"path":{"type":"string"},
+    "count":{"type":"integer"}},"required":["path"]})"),
+                                                   false, kLaguna);
+  const std::string call =
+      "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</arg_value>"
+      "</tool_call>";
+  const std::string typed =
+      "<tool_call>read<arg_key>count</arg_key><arg_value>3</arg_value>"
+      "<arg_key>path</arg_key><arg_value>a \"b\" <tool_call> </think>"
+      "</arg_value></tool_call>";
+  const auto automatic = JsonConstraint::WithTools(nullptr, {{"read", read}},
+                                                   false, false, kLaguna);
+  assert(Accepts(*automatic, "Plain prose."));
+  assert(Accepts(*automatic, call));
+  assert(Accepts(*automatic, typed));
+  // Another dialect's envelope in prose stays prose before the real call.
+  assert(Accepts(*automatic, "<tool_calls></tool_calls>\n" + call));
+  assert(!Accepts(*automatic, call + "Done."));
+  assert(!Accepts(*automatic, call + call));
+  assert(!Accepts(*automatic,
+                  "<tool_call>read<arg_key>count</arg_key><arg_value>x"
+                  "</arg_value><arg_key>path</arg_key><arg_value>a"
+                  "</arg_value></tool_call>"));
+  assert(!Accepts(*automatic,
+                  "<tool_call>read<arg_key>count</arg_key><arg_value>3"
+                  "</arg_value></tool_call>"));
+  assert(!Accepts(
+      *automatic,
+      R"(<tool_call>{"name":"read","arguments":{"path":"a"}}</tool_call>)"));
+  assert(!Accepts(*automatic,
+                  "<tool_call>\nread<arg_key>path</arg_key>"
+                  "<arg_value>a</arg_value></tool_call>"));
+  const auto parallel = JsonConstraint::WithTools(nullptr, {{"read", read}},
+                                                  false, true, kLaguna);
+  assert(Accepts(*parallel, call + call));
+  assert(!Accepts(*parallel, call + "\n" + call));
+  const auto required = JsonConstraint::WithTools(nullptr, {{"read", read}},
+                                                  true, false, kLaguna);
+  assert(Accepts(*required, call));
+  assert(!Accepts(*required, "Plain prose."));
+  // No reasoning-side call boundary: a call starts only after </think>.
+  const auto reasoning = JsonConstraint::WithReasoning(required);
+  assert(Accepts(*reasoning, "Think <tool_call>read.</think>" + call));
+  assert(!Accepts(*reasoning, "Think " + call));
+  // A finite root declares no parameters, as llama.cpp; the call stays native.
+  const auto finite = JsonConstraint::ToolParameters(
+      parse(R"({"type":"object","const":{"value":"alpha"},
+                "unevaluatedProperties":true})"),
+      false, kLaguna);
+  const auto record = JsonConstraint::WithTools(nullptr, {{"record", finite}},
+                                                true, false, kLaguna);
+  assert(Accepts(*record, "<tool_call>record</tool_call>"));
+  assert(!Accepts(*record,
+                  "<tool_call>record<arg_key>value</arg_key>"
+                  "<arg_value>alpha</arg_value></tool_call>"));
+  // String constants are literal raw text, including tag-like bytes.
+  const auto constant = JsonConstraint::ToolParameters(parse(R"({
+    "type":"object","properties":{"text":{"type":"string","const":"a</think>b"},
+    "values":{"type":"array","const":[true,null]}},
+    "required":["text","values"],"additionalProperties":false})"),
+                                                       false, kLaguna);
+  const auto exact = JsonConstraint::WithTools(nullptr, {{"record", constant}},
+                                               true, false, kLaguna);
+  assert(Accepts(*exact,
+                 "<tool_call>record<arg_key>text</arg_key><arg_value>a</think>b"
+                 "</arg_value><arg_key>values</arg_key><arg_value>[true, null]"
+                 "</arg_value></tool_call>"));
+  assert(!Accepts(*exact,
+                  "<tool_call>record<arg_key>text</arg_key><arg_value>a|b"
+                  "</arg_value><arg_key>values</arg_key><arg_value>[true,null]"
+                  "</arg_value></tool_call>"));
+  // An untyped open tool keeps native framing with any argument names.
+  const auto open = JsonConstraint::ToolParameters(
+      parse(R"({"type":"object","additionalProperties":true})"), false, kLaguna);
+  const auto untyped = JsonConstraint::WithTools(nullptr, {{"note", open}},
+                                                 true, false, kLaguna);
+  assert(Accepts(*untyped, "<tool_call>note</tool_call>"));
+  assert(Accepts(*untyped,
+                 "<tool_call>note<arg_key>any</arg_key><arg_value>x"
+                 "</arg_value></tool_call>"));
+}
+
 void TestWideNativeArgumentOrder() {
   using Format = JsonConstraint::ToolFormat;
   for (const auto format : {Format::kQwen, Format::kDeepSeek}) {
@@ -2293,6 +2380,7 @@ int main(int argc, char** argv) {
   TestAutomaticTools();
   TestWideNativeArgumentOrder();
   TestNativeTools();
+  TestLagunaNativeTools();
   TestOpenNativeTools();
   TestNonStrictAgentTools();
   TestUntypedNonStrictTools();

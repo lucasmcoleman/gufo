@@ -2338,9 +2338,9 @@ const LagunaTextRunnerState& RequireLagunaState(const TextRunnerState& state) {
 /// Laguna-S-2.1 behind the shared scheduler and snapshot pool. Prompts are
 /// prefilled in chunks on the session's executor and every forward pass
 /// leaves the frontier logits, so sampling, previews and restored snapshots
-/// never need an extra pass. The tool-call dialect on output is the JSON
-/// fallback (see ToolFormat in text_model_runner.hpp); the template renders
-/// calls natively in history.
+/// never need an extra pass. Tool calls use the model's native dialect on
+/// output, grammar-constrained (JsonConstraint::ToolFormat::kLaguna), the same
+/// bytes the template renders for calls in history.
 class LagunaTextRunner final : public HipTextModelRunner {
 public:
   LagunaTextRunner(std::shared_ptr<models::laguna::Model> model,
@@ -2408,6 +2408,10 @@ public:
   }
   [[nodiscard]] std::uint32_t VocabularySize() const override {
     return model_->VocabSize();
+  }
+  [[nodiscard]] sampling::JsonConstraint::ToolFormat ToolFormat()
+      const override {
+    return sampling::JsonConstraint::ToolFormat::kLaguna;
   }
 
   /// Raw completion text gets BOS, as llama.cpp does for this GGUF
