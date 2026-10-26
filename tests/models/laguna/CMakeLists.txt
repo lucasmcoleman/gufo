@@ -14,6 +14,12 @@ endfunction()
 
 add_laguna_test(contract gufo_laguna "cpu")
 
+# Chat template: the compiled renderer against Poolside's Jinja output. No model
+# needed. The token check reads the real GGUF and is skipped without it.
+add_laguna_test(chat_template gufo_laguna "cpu")
+target_compile_definitions(laguna_chat_template_test PRIVATE
+  GUFO_LAGUNA_CHAT_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_goldens.json")
+
 # Oracle tests run on tiny synthetic models: no model file, nothing skipped.
 foreach(name IN ITEMS reference_model reference_attention reference_moe reference_quant)
   add_laguna_test(${name} gufo_laguna "cpu")
@@ -28,6 +34,10 @@ foreach(name IN ITEMS config weights tokenizer_golden)
   add_laguna_test(${name} gufo_laguna "cpu;external-model")
   set_tests_properties(laguna.${name} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
+add_laguna_test(chat_template_tokens gufo_laguna "cpu;external-model")
+set_tests_properties(laguna.chat_template_tokens PROPERTIES SKIP_RETURN_CODE 77)
+target_compile_definitions(laguna_chat_template_tokens_test PRIVATE
+  GUFO_LAGUNA_CHAT_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_goldens.json")
 target_compile_definitions(laguna_tokenizer_golden_test PRIVATE
   GUFO_LAGUNA_TOKENIZER_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/tokenizer_goldens.json")
 
@@ -52,9 +62,61 @@ if (ENGINE_ENABLE_HIP)
   # allocation-failure paths. Nothing is skipped.
   add_laguna_test(executor gufo_laguna "hip;gpu;gfx1151")
 
+  # Serving engine (phase 5) on tiny random models: determinism, snapshots at
+  # the window and ring boundaries, failure-and-reset, concurrent sessions and
+  # repeated load/unload. Nothing is skipped.
+  add_laguna_test(engine gufo_laguna "hip;gpu;gfx1151")
+
+  # The serve path (InferenceBackend, scheduler, snapshot pool, runner) on a
+  # tiny random model: registration, chat/completion against the engine,
+  # snapshots, cancellation, several sessions, the context limit and injected
+  # device errors. Nothing is skipped.
+  add_executable(laguna_serving_test serving_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+  target_link_libraries(laguna_serving_test PRIVATE gufo_logging gufo_core
+    gufo_deepseek_v4_flash gufo_qwen38_flash_next gufo_laguna gufo_cache_hip
+    hip::host)
+  add_test(NAME laguna.serving COMMAND laguna_serving_test)
+  set_tests_properties(laguna.serving PROPERTIES LABELS "laguna;hip;gpu;gfx1151;server")
+  add_dependencies(laguna_tests laguna_serving_test)
+
+  # `gufo bench` rows (pp, tg, depth) and prefill validation on a tiny model.
+  add_executable(laguna_bench_test bench_test.cpp)
+  target_link_libraries(laguna_bench_test PRIVATE gufo_llm_cli gufo_laguna)
+  add_test(NAME laguna.bench COMMAND laguna_bench_test)
+  set_tests_properties(laguna.bench PROPERTIES LABELS "laguna;hip;gpu;gfx1151")
+  add_dependencies(laguna_tests laguna_bench_test)
+
   # CLI: teacher-forced all-position logit dump (the #969 contract). Not a
   # test: it needs the 74 GB model resident on the GPU.
   add_executable(laguna_logits logits_cli.cpp)
   target_link_libraries(laguna_logits PRIVATE gufo_laguna)
   add_dependencies(laguna_tests laguna_logits)
+endif()
+
+# Functional suites (tests/functional/run.py) for Laguna. `functional_suites`
+# checks the wiring and needs no model. `functional` runs them against a server
+# on the real model: it skips (status 77) without the GGUF and without
+# GUFO_LAGUNA_FUNCTIONAL=1, so a plain `ctest -R '^laguna\.'` never loads
+# 68.6 GiB; see tests/functional/laguna_suites.py for the command to run it.
+if (Python3_EXECUTABLE)
+  add_test(NAME laguna.functional_suites
+    COMMAND ${Python3_EXECUTABLE}
+      ${PROJECT_SOURCE_DIR}/tests/functional/test_laguna_suites.py)
+  set_tests_properties(laguna.functional_suites PROPERTIES LABELS "laguna;cpu;functional")
+  if (TARGET gufo)
+    add_test(NAME laguna.functional
+      COMMAND ${Python3_EXECUTABLE}
+        ${PROJECT_SOURCE_DIR}/tests/functional/laguna_suites.py --ctest
+        --binary $<TARGET_FILE:gufo>
+        --output ${CMAKE_BINARY_DIR}/laguna-functional)
+    set_tests_properties(laguna.functional PROPERTIES
+      LABELS "laguna;gpu;hip;functional;external-model;slow"
+      SKIP_RETURN_CODE 77 TIMEOUT 14400)
+  endif()
 endif()

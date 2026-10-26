@@ -357,7 +357,7 @@ add_library(gufo_llm_cli STATIC
   src/cli/prompt/prompt.cpp)
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_qwen38_flash_next)
 if(ENGINE_ENABLE_HIP)
-  target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash)
+  target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash gufo_laguna)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
@@ -418,7 +418,8 @@ target_compile_definitions(gufo PRIVATE
   GUFO_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
 
 if (ENGINE_ENABLE_HIP)
-  target_link_libraries(gufo PRIVATE gufo_cache_hip gufo_deepseek_v4_flash)
+  target_link_libraries(gufo PRIVATE gufo_cache_hip gufo_deepseek_v4_flash
+    gufo_laguna)
 endif()
 target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr gufo_embedding_gemma2)
 

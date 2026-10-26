@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -11,6 +12,10 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
+
+namespace gufo::models::laguna {
+class Model;
+}
 
 namespace gufo::cli {
 
@@ -44,6 +49,15 @@ struct BenchOptions {
     const BenchOptions& options, std::uint32_t native,
     std::optional<models::qwen38_flash_next::RopeScaling>* scaling,
     std::string* error);
+
+#if defined(ENGINE_ENABLE_HIP)
+/// Runs the Laguna pp/tg/depth measurements (and --validate-prefill) on a
+/// model that is already loaded, within its own context; `size_gib` labels
+/// the table. RunBench reaches the same code for a Laguna GGUF.
+int RunLagunaBenchmarkOnModel(
+    const BenchOptions& options,
+    const std::shared_ptr<models::laguna::Model>& model, double size_gib);
+#endif
 
 void PrintBenchHelp(std::string_view program_name);
 std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,

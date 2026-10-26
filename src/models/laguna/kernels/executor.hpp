@@ -53,6 +53,23 @@ struct ExecutorOptions {
 
 enum class LogitsRows { kNone, kLast, kAll };
 
+/// Host copy of one session's KV state: every layer's retained history (full
+/// layers up to the position, sliding rings with their retained_begin) and
+/// the position. Restoring it into an executor of the same geometry (context
+/// and chunk) makes every later Forward behave as it would have in the
+/// original session.
+struct ExecutorSnapshot {
+  std::uint32_t position{0};
+  std::vector<KvImage> layers;
+  [[nodiscard]] std::size_t bytes() const noexcept {
+    std::size_t total = 0;
+    for (const KvImage& layer : layers) {
+      total += layer.bytes();
+    }
+    return total;
+  }
+};
+
 class Executor {
 public:
   ~Executor();
@@ -69,6 +86,21 @@ public:
   /// Empties the KV caches (position 0) and clears a poisoned state. Fails,
   /// leaving the executor poisoned, when the caches cannot be rebuilt.
   [[nodiscard]] bool Reset(std::string* error_msg = nullptr);
+
+  /// Empties the KV caches (position 0) without releasing their memory when
+  /// the executor is healthy; a poisoned executor takes the full Reset().
+  [[nodiscard]] bool Clear(std::string* error_msg = nullptr);
+
+  /// Copies the KV state to the host. Fails on a poisoned executor.
+  [[nodiscard]] bool SaveSnapshot(ExecutorSnapshot* snapshot,
+                                  std::string* error_msg = nullptr);
+  /// Host bytes SaveSnapshot would copy now (the retained K/V rows).
+  [[nodiscard]] std::size_t snapshot_bytes() const noexcept;
+  /// Replaces the KV state with `snapshot`. Fails (leaving the executor
+  /// poisoned when a layer was already overwritten) on a geometry mismatch.
+  /// Refuses a poisoned executor: Reset() it first.
+  [[nodiscard]] bool RestoreSnapshot(const ExecutorSnapshot& snapshot,
+                                     std::string* error_msg = nullptr);
 
   /// Runs `tokens` (at most max_chunk) at positions position()..+T-1. With
   /// kAll `logits` receives [T][vocab] floats, with kLast one [vocab] row (of
@@ -87,6 +119,11 @@ public:
     return options_.max_chunk;
   }
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
+  /// One layer's KV cache, for inspection (tests compare the retained-history
+  /// bookkeeping of a restored session with the original).
+  [[nodiscard]] const KvCache& kv_cache(std::uint32_t layer) const {
+    return kv_.at(layer);
+  }
   [[nodiscard]] std::size_t kv_bytes() const noexcept;
   /// Executor buffers plus the FFN operator scratch held now (no KV, no
   /// weights; the attention scratch has no accessor, see measured_warmup).

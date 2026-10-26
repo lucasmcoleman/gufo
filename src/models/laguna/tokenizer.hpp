@@ -49,6 +49,10 @@ public:
 
   [[nodiscard]] std::string Decode(std::span<const TokenId> tokens) const;
 
+  /// One token's text (byte-level pieces, so a multi-byte character can span
+  /// several tokens). Empty for an id outside the vocabulary.
+  [[nodiscard]] std::string DecodeToken(TokenId token) const;
+
   /// The Laguna pre-tokenizer split alone: views into `text` that concatenate
   /// back to it. Invalid UTF-8 bytes each count as one symbol (llama.cpp
   /// throws instead).
@@ -61,6 +65,14 @@ public:
   [[nodiscard]] TokenId bos_token_id() const noexcept { return bos_; }
   [[nodiscard]] TokenId eos_token_id() const noexcept { return eos_; }
   [[nodiscard]] TokenId pad_token_id() const noexcept { return pad_; }
+  /// `tokenizer.ggml.eot_token_id` (`</assistant>`, 24), or kInvalidTokenId.
+  [[nodiscard]] TokenId eot_token_id() const noexcept { return eot_; }
+  /// Generation stops at EOS (2) or EOT (24), as generation_config.json's
+  /// eos_token_id [2, 24] lists them.
+  [[nodiscard]] bool IsStopToken(TokenId token) const noexcept {
+    return token != tokenization::kInvalidTokenId &&
+           (token == eos_ || token == eot_);
+  }
   /// What the GGUF asks for (`tokenizer.ggml.add_bos_token`); informational,
   /// Encode never consults it.
   [[nodiscard]] bool gguf_adds_bos() const noexcept { return gguf_adds_bos_; }
@@ -80,6 +92,7 @@ private:
   TokenId bos_{tokenization::kInvalidTokenId};
   TokenId eos_{tokenization::kInvalidTokenId};
   TokenId pad_{tokenization::kInvalidTokenId};
+  TokenId eot_{tokenization::kInvalidTokenId};
   bool gguf_adds_bos_{false};
 };
 

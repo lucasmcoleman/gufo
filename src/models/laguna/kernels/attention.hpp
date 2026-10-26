@@ -118,6 +118,21 @@ private:
   std::size_t bytes_{0};
 };
 
+/// Host copy of the history one KvCache physically retains: the K/V rows of
+/// positions [retained_begin, committed) in position order, plus the
+/// bookkeeping that says which positions those are. Restoring it into a cache
+/// of the same geometry reproduces the cache exactly as far as any later call
+/// can observe it (slots outside the range are never read).
+struct KvImage {
+  std::uint32_t committed{0};
+  std::uint32_t retained_begin{0};
+  std::vector<std::uint8_t> keys;    ///< (committed - retained_begin) rows, F16
+  std::vector<std::uint8_t> values;  ///< same layout
+  [[nodiscard]] std::size_t bytes() const noexcept {
+    return keys.size() + values.size();
+  }
+};
+
 /// F16 K/V cache of one layer of one sequence. Move-only.
 class KvCache {
 public:
@@ -162,6 +177,21 @@ public:
     retained_begin_ = 0;
     valid_ = true;
   }
+  /// Bytes of one position's K (or V) row.
+  [[nodiscard]] std::size_t row_bytes() const noexcept {
+    return std::size_t{kv_heads_} * head_dim_ * 2;
+  }
+  /// Copies the retained history to the host. `stream` must be the stream the
+  /// cache's calls ran on; it is synchronized first. Fails (and fills
+  /// nothing) on an invalid cache or a HIP error.
+  [[nodiscard]] bool Export(hipStream_t stream, KvImage* image,
+                            std::string* error_msg = nullptr) const;
+  /// Replaces the cache's content with `image` (any previous content,
+  /// including an invalid or failed one, is discarded) and sets committed(),
+  /// retained_begin() and valid() accordingly. Fails without touching the
+  /// cache when the image does not fit the geometry.
+  [[nodiscard]] bool Import(hipStream_t stream, const KvImage& image,
+                            std::string* error_msg = nullptr);
   /// Slot of position `p`.
   [[nodiscard]] std::uint32_t Slot(std::uint32_t p) const noexcept {
     return p % capacity_;

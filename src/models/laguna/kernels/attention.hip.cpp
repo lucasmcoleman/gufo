@@ -575,6 +575,115 @@ std::size_t KvCache::device_bytes() const noexcept {
   return std::size_t{2} * capacity_ * kv_heads_ * head_dim_ * sizeof(__half);
 }
 
+namespace {
+
+/// Calls `copy(slot_begin, count, position_offset)` for each run of
+/// consecutive slots that holds positions [begin, end), in position order.
+template<typename Fn>
+bool ForEachSlotRun(std::uint32_t begin, std::uint32_t end,
+                    std::uint32_t capacity, Fn&& copy) {
+  std::uint32_t position = begin;
+  while (position < end) {
+    const std::uint32_t slot = position % capacity;
+    const std::uint32_t count = std::min(end - position, capacity - slot);
+    if (!copy(slot, count, position - begin)) {
+      return false;
+    }
+    position += count;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool KvCache::Export(hipStream_t stream, KvImage* image,
+                     std::string* error_msg) const {
+  if (!valid_ || k_ == nullptr || v_ == nullptr) {
+    Assign(error_msg, "laguna kv cache: export of an invalid cache");
+    return false;
+  }
+  const std::size_t row = row_bytes();
+  const std::uint32_t count = committed_ - retained_begin_;
+  KvImage out;
+  out.committed = committed_;
+  out.retained_begin = retained_begin_;
+  out.keys.resize(std::size_t{count} * row);
+  out.values.resize(std::size_t{count} * row);
+  if (!CheckHip(hipStreamSynchronize(stream), "export sync", error_msg)) {
+    return false;
+  }
+  const bool ok = ForEachSlotRun(
+      retained_begin_, committed_, capacity_,
+      [&](std::uint32_t slot, std::uint32_t run, std::uint32_t offset) {
+        const std::size_t from = std::size_t{slot} * row;
+        const std::size_t to = std::size_t{offset} * row;
+        const std::size_t bytes = std::size_t{run} * row;
+        return CheckHip(
+                   hipMemcpyAsync(out.keys.data() + to,
+                                  static_cast<const std::uint8_t*>(k_) + from,
+                                  bytes, hipMemcpyDeviceToHost, stream),
+                   "export keys", error_msg) &&
+               CheckHip(
+                   hipMemcpyAsync(out.values.data() + to,
+                                  static_cast<const std::uint8_t*>(v_) + from,
+                                  bytes, hipMemcpyDeviceToHost, stream),
+                   "export values", error_msg);
+      });
+  if (!ok ||
+      !CheckHip(hipStreamSynchronize(stream), "export sync", error_msg)) {
+    return false;
+  }
+  *image = std::move(out);
+  return true;
+}
+
+bool KvCache::Import(hipStream_t stream, const KvImage& image,
+                     std::string* error_msg) {
+  const std::size_t row = row_bytes();
+  const bool ring = window_ != 0;
+  const std::uint64_t count =
+      static_cast<std::uint64_t>(image.committed) - image.retained_begin;
+  if (k_ == nullptr || v_ == nullptr ||
+      image.retained_begin > image.committed ||
+      image.keys.size() != count * row || image.values.size() != count * row ||
+      (ring ? count > capacity_
+            : (image.retained_begin != 0 || image.committed > capacity_))) {
+    Assign(error_msg, "laguna kv cache: snapshot does not fit this cache");
+    return false;
+  }
+  // Earlier work (possibly a failed call) may still be queued on the stream.
+  if (!CheckHip(hipStreamSynchronize(stream), "import sync", error_msg)) {
+    return false;
+  }
+  const bool ok = ForEachSlotRun(
+      image.retained_begin, image.committed, capacity_,
+      [&](std::uint32_t slot, std::uint32_t run, std::uint32_t offset) {
+        const std::size_t to = std::size_t{slot} * row;
+        const std::size_t from = std::size_t{offset} * row;
+        const std::size_t bytes = std::size_t{run} * row;
+        return CheckHip(hipMemcpyAsync(static_cast<std::uint8_t*>(k_) + to,
+                                       image.keys.data() + from, bytes,
+                                       hipMemcpyHostToDevice, stream),
+                        "import keys", error_msg) &&
+               CheckHip(hipMemcpyAsync(static_cast<std::uint8_t*>(v_) + to,
+                                       image.values.data() + from, bytes,
+                                       hipMemcpyHostToDevice, stream),
+                        "import values", error_msg);
+      });
+  if (!ok ||
+      !CheckHip(hipStreamSynchronize(stream), "import sync", error_msg)) {
+    // Part of the content may be overwritten: the cache is unusable.
+    committed_ = 0;
+    retained_begin_ = 0;
+    valid_ = false;
+    return false;
+  }
+  committed_ = image.committed;
+  retained_begin_ = image.retained_begin;
+  valid_ = true;
+  return true;
+}
+
 std::optional<KvCache> KvCache::Create(std::uint32_t kv_heads,
                                        std::uint32_t head_dim,
                                        std::uint32_t capacity,

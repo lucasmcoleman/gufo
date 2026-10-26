@@ -24,6 +24,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/laguna/engine.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
@@ -1157,9 +1158,248 @@ int RunQwen38FlashNextBenchmark(
   return 0;
 }
 
+bool IsLaguna(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "laguna";
+}
+
+/// The measurements of RunLagunaBenchmark on a loaded model. `context` bounds
+/// the token pattern; `size_gib` is the artifact's size for the table.
+int LagunaBenchmarkBody(const BenchOptions& options,
+                        const std::shared_ptr<models::laguna::Model>& model,
+                        double size_gib, std::size_t required_context) {
+  namespace lg = models::laguna;
+  std::string error;
+  auto session = model->CreateSession(&error);
+  if (session == nullptr) {
+    std::cerr << "Error creating Laguna session: " << error << '\n';
+    return 1;
+  }
+
+  // A fixed token pattern keeps runs reproducible. BOS first, as for a prompt.
+  std::vector<std::int32_t> tokens;
+  {
+    const auto pattern = model->Tokenize(
+        "The quick brown fox jumps over the lazy dog. "
+        "Strix Halo executes this deterministic benchmark sequence. ");
+    if (pattern.empty()) {
+      std::cerr << "Error: benchmark token pattern is empty\n";
+      return 1;
+    }
+    tokens.resize(required_context);
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      tokens[i] = pattern[i % pattern.size()];
+    }
+    tokens[0] = model->tokenizer().bos_token_id();
+  }
+
+  if (options.validate_prefill_tokens != 0) {
+    // One batched prefill against one-token-at-a-time evaluation of the same
+    // prefix. The two take different projection kernels, so they round
+    // differently: the winner must agree and the logits stay finite.
+    const auto prefix =
+        std::span(tokens).first(options.validate_prefill_tokens);
+    auto sequential = model->CreateSession(&error);
+    if (!sequential || !session->Prefill(prefix, &error) ||
+        !sequential->Prefill(prefix.first(1), &error)) {
+      std::cerr << "Laguna prefill validation failed: " << error << '\n';
+      return 1;
+    }
+    for (const std::int32_t token : prefix.subspan(1)) {
+      if (!sequential->Evaluate(token, &error)) {
+        std::cerr << "Laguna sequential reference failed: " << error << '\n';
+        return 1;
+      }
+    }
+    const auto comparison =
+        testing::CompareLogits(sequential->Logits(), session->Logits());
+    std::cout << std::fixed << std::setprecision(8)
+              << "[Prefill Validation] tokens=" << prefix.size()
+              << " finite=" << (comparison.finite ? "yes" : "no")
+              << " top1_match=" << (comparison.top1_match ? "yes" : "no")
+              << " max_abs_diff=" << comparison.max_abs_diff
+              << " rmse=" << comparison.root_mean_square_error
+              << " cosine=" << comparison.cosine_similarity << '\n';
+    if (!comparison.finite || !comparison.top1_match) {
+      return 1;
+    }
+    session->Invalidate();
+  }
+
+  std::cout << "| " << std::left << std::setw(32) << "model"
+            << " | " << std::right << std::setw(10) << "size"
+            << " | " << std::left << std::setw(10) << "backend"
+            << " | " << std::right << std::setw(18) << "test"
+            << " | " << std::right << std::setw(21) << "t/s"
+            << " |\n"
+            << "| " << std::string(32, '-') << " | " << std::string(10, '-')
+            << " | " << std::string(10, '-') << " | " << std::string(18, '-')
+            << " | " << std::string(21, '-') << " |\n";
+  std::ostringstream size_text;
+  size_text << std::fixed << std::setprecision(2) << size_gib << " GiB";
+  const auto print_result = [&](std::string_view test_name,
+                                const BenchStats& stats) {
+    std::ostringstream throughput;
+    throughput << std::fixed << std::setprecision(2) << stats.mean << " ± "
+               << stats.stddev;
+    std::cout << "| " << std::left << std::setw(32) << model->ModelName()
+              << " | " << std::right << std::setw(10) << size_text.str()
+              << " | " << std::left << std::setw(10) << "ROCm (HIP)"
+              << " | " << std::right << std::setw(18) << test_name << " | "
+              << std::right << std::setw(21) << throughput.str() << " |\n"
+              << std::flush;
+  };
+  const auto seconds_since = [](std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                         start)
+        .count();
+  };
+
+  for (const std::size_t depth : options.n_depths) {
+    // The state at `depth` is built once and restored for every repetition.
+    const std::size_t base = depth > 0 ? depth : 16;
+    std::unique_ptr<lg::SessionSnapshot> at_depth;
+    const auto restart = [&]() -> bool {
+      if (depth == 0) {
+        session->Invalidate();
+        return true;
+      }
+      return session->RestoreSnapshot(*at_depth, &error);
+    };
+    if (depth > 0) {
+      session->Invalidate();
+      if (!session->Prefill(std::span(tokens).first(depth), &error) ||
+          (at_depth = session->SaveSnapshot(&error)) == nullptr) {
+        std::cerr << "Error preparing depth: " << error << '\n';
+        return 1;
+      }
+    }
+    for (const std::size_t prompt_length : options.n_prompts) {
+      if (depth + prompt_length >= required_context) {
+        std::cerr << "Error: prompt benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      // Repetition 0 is an untimed warm-up of the same shapes.
+      for (std::size_t repetition = 0; repetition <= options.repetitions;
+           ++repetition) {
+        if (!restart()) {
+          std::cerr << "Error restoring depth: " << error << '\n';
+          return 1;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (!session->Prefill(std::span(tokens).subspan(depth, prompt_length),
+                              &error)) {
+          std::cerr << "Error running prefill: " << error << '\n';
+          return 1;
+        }
+        const double seconds = seconds_since(start);
+        if (repetition > 0) {
+          runs.push_back(static_cast<double>(prompt_length) / seconds);
+        }
+      }
+      print_result(MakeTestName("pp", prompt_length, depth),
+                   ComputeStats(runs));
+    }
+
+    for (const std::size_t generation_length : options.n_gens) {
+      if (base + generation_length >= required_context) {
+        std::cerr << "Error: generation benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        if (depth > 0
+                ? !restart()
+                : (session->Invalidate(),
+                   !session->Prefill(std::span(tokens).first(base), &error))) {
+          std::cerr << "Error preparing generation: " << error << '\n';
+          return 1;
+        }
+        const std::vector<sampling::TokenId> history(tokens.begin(),
+                                                     tokens.begin() + base);
+        sampling::SamplerState sampler(options.sampling, history);
+        std::size_t generated = 0;
+        const auto start = std::chrono::steady_clock::now();
+        while (generated < generation_length) {
+          const auto token =
+              static_cast<std::int32_t>(sampler.Sample(session->Logits()));
+          sampler.Accept(static_cast<sampling::TokenId>(token));
+          ++generated;
+          if (!session->Evaluate(token, &error)) {
+            std::cerr << "Error running Laguna decode: " << error << '\n';
+            return 1;
+          }
+        }
+        runs.push_back(static_cast<double>(generation_length) /
+                       seconds_since(start));
+      }
+      print_result(MakeTestName("tg", generation_length, depth),
+                   ComputeStats(runs));
+    }
+  }
+  std::cout << '\n';
+  return 0;
+}
+
+/// Laguna-S-2.1 through the serving engine: one session, so the numbers are
+/// the single-request prefill and decode rates `gufo serve` delivers (sampler
+/// and frontier-logit copy included, as in serving).
+int RunLagunaBenchmark(const BenchOptions& options,
+                       const std::shared_ptr<const core::GgufReader>& reader,
+                       std::chrono::steady_clock::time_point model_load_start) {
+  namespace lg = models::laguna;
+  int device_count = 0;
+  if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
+    std::cerr << "Error: no HIP GPU is available for Laguna-S-2.1\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  if (!options.speculative_backend.empty()) {
+    std::cerr << "Error: Laguna-S-2.1 has no speculative decoding yet\n";
+    return 1;
+  }
+  if (options.concurrency != std::vector<std::size_t>{1}) {
+    std::cerr << "Error: Laguna bench supports C1; use the serving benchmark "
+                 "for concurrent requests\n";
+    return 1;
+  }
+  const std::size_t required_context = FlashNextBenchContext(options);
+  const auto native = reader->GetMetadataUint32("laguna.context_length");
+  if (!native || required_context > *native) {
+    std::cerr << "Error: the workload needs a context of " << required_context
+              << " tokens but the model's is " << native.value_or(0) << '\n';
+    return 1;
+  }
+  std::string error;
+  auto model = lg::Model::Load(
+      reader,
+      lg::ModelOptions{
+          .max_context = static_cast<std::uint32_t>(required_context),
+          .session_count = 1},
+      &error);
+  if (model == nullptr) {
+    std::cerr << "Error creating Laguna model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(model_load_start);
+  return LagunaBenchmarkBody(
+      options, model,
+      static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0),
+      required_context);
+}
 #endif
 
 }  // namespace
+
+#if defined(ENGINE_ENABLE_HIP)
+int RunLagunaBenchmarkOnModel(
+    const BenchOptions& options,
+    const std::shared_ptr<models::laguna::Model>& model, double size_gib) {
+  return LagunaBenchmarkBody(options, model, size_gib, model->MaxContext());
+}
+#endif
 
 std::size_t FlashNextBenchContext(const BenchOptions& options) {
   const auto max_or_zero = [](const std::vector<std::size_t>& values) {
@@ -1317,6 +1557,9 @@ int RunBench(std::span<const char* const> args) {
   }
   if (IsQwen38FlashNext(*reader)) {
     return RunQwen38FlashNextBenchmark(opt, reader, model_load_start);
+  }
+  if (IsLaguna(*reader)) {
+    return RunLagunaBenchmark(opt, reader, model_load_start);
   }
 
   if (opt.concurrency != std::vector<std::size_t>{1}) {

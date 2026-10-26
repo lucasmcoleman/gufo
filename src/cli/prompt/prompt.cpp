@@ -250,6 +250,16 @@ bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";
 }
 
+// Laguna-S-2.1 runs through `gufo serve` and `gufo bench`; the one-shot
+// prompt and chat commands have no Laguna path yet.
+bool RejectLaguna(const core::GgufReader& reader) {
+  if (reader.GetMetadataString("general.architecture") != "laguna")
+    return false;
+  std::cerr << "Laguna-S-2.1 is supported by `gufo serve` and `gufo bench`, "
+               "not by `gufo prompt` or `gufo chat`\n";
+  return true;
+}
+
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   if (value == "minimal") {
     return ReasoningEffort::kMinimal;
@@ -1004,6 +1014,9 @@ int RunPrompt(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (RejectLaguna(*reader)) {
+    return 2;
+  }
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -1227,6 +1240,9 @@ int RunChat(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (RejectLaguna(*reader)) {
+    return 2;
+  }
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)

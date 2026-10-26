@@ -42,6 +42,7 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/laguna/engine.hpp"
 #include "src/models/qwen/continuation_adapter.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -2246,6 +2247,377 @@ private:
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
+// ---- Laguna-S-2.1 ---------------------------------------------------------
+
+constexpr std::string_view kLagunaStateAbi = "laguna-s-2.1-gfx1151-session-v1";
+
+std::vector<TextRunnerToken> LagunaRunnerTokens(
+    std::span<const std::int32_t> tokens) {
+  std::vector<TextRunnerToken> converted;
+  converted.reserve(tokens.size());
+  for (const std::int32_t token : tokens) {
+    if (token < 0) {
+      throw std::invalid_argument("Laguna token ID must not be negative");
+    }
+    converted.push_back(static_cast<TextRunnerToken>(token));
+  }
+  return converted;
+}
+
+std::vector<std::int32_t> LagunaEngineTokens(
+    std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const TextRunnerToken token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("Laguna token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+/// One request-owned session: its own executor, KV caches and scratch.
+class LagunaTextRunnerState final : public TextRunnerState {
+public:
+  explicit LagunaTextRunnerState(
+      const std::shared_ptr<models::laguna::Model>& model) {
+    std::string error;
+    session_ = model->CreateSession(&error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create Laguna session: " + error);
+    }
+  }
+
+  void Invalidate() noexcept override { session_->Invalidate(); }
+
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = session_->KvBytes(),
+            .temporary_scratch_bytes = std::nullopt};
+  }
+
+  [[nodiscard]] models::laguna::Session& session() const { return *session_; }
+
+private:
+  std::unique_ptr<models::laguna::Session> session_;
+};
+
+class LagunaTextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  LagunaTextRunnerSnapshot(
+      std::shared_ptr<models::laguna::Model> model,
+      std::unique_ptr<models::laguna::SessionSnapshot> snapshot)
+      : model(std::move(model)), snapshot(std::move(snapshot)) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return snapshot != nullptr ? snapshot->bytes() : 0;
+  }
+
+  std::shared_ptr<models::laguna::Model> model;
+  std::unique_ptr<models::laguna::SessionSnapshot> snapshot;
+};
+
+LagunaTextRunnerState& RequireLagunaState(TextRunnerState& state) {
+  auto* laguna = dynamic_cast<LagunaTextRunnerState*>(&state);
+  if (laguna == nullptr) {
+    throw std::logic_error("text runner state is not Laguna");
+  }
+  return *laguna;
+}
+
+const LagunaTextRunnerState& RequireLagunaState(const TextRunnerState& state) {
+  const auto* laguna = dynamic_cast<const LagunaTextRunnerState*>(&state);
+  if (laguna == nullptr) {
+    throw std::logic_error("text runner state is not Laguna");
+  }
+  return *laguna;
+}
+
+/// Laguna-S-2.1 behind the shared scheduler and snapshot pool. Prompts are
+/// prefilled in chunks on the session's executor and every forward pass
+/// leaves the frontier logits, so sampling, previews and restored snapshots
+/// never need an extra pass. The tool-call dialect on output is the JSON
+/// fallback (see ToolFormat in text_model_runner.hpp); the template renders
+/// calls natively in history.
+class LagunaTextRunner final : public HipTextModelRunner {
+public:
+  LagunaTextRunner(std::shared_ptr<models::laguna::Model> model,
+                   std::uint32_t max_context)
+      : model_(std::move(model)), max_context_(max_context) {}
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->ModelName(),
+        .state_abi = std::string(kLagunaStateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = true,
+                .fork = true,
+                // The stop token is never advanced, and a normal ending
+                // leaves the last sampled token pending: the checkpoint is
+                // the executed frontier, as for DeepSeek.
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = false,
+                .batched_multi_token_decode = false,
+                .prefix_reuse = true,
+                // Every prefill chunk is a complete forward pass.
+                .partial_prefill_retention = true,
+                .prefill_rollback = false,
+            },
+        // No serialized snapshot format: RAM snapshots only.
+        .persistence = std::nullopt,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    const auto budget = model_->SessionBudget();
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      capacity = free_bytes;
+    }
+    return {
+        .resident_weights_bytes = model_->device().resident_bytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = budget.kv(),
+        .temporary_scratch_bytes = budget.scratch(),
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        model_->VocabSize(), [this](std::uint32_t id) {
+          return sampling::ConstraintVocabulary::Piece{
+              model_->DecodeToken(static_cast<std::int32_t>(id)),
+              model_->IsStopToken(static_cast<std::int32_t>(id))};
+        });
+  }
+  [[nodiscard]] std::uint32_t VocabularySize() const override {
+    return model_->VocabSize();
+  }
+
+  /// Raw completion text gets BOS, as llama.cpp does for this GGUF
+  /// (tokenizer.ggml.add_bos_token). Control-token text is parsed.
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return LagunaRunnerTokens(model_->Tokenize(text, /*add_bos=*/true));
+  }
+  [[nodiscard]] std::vector<TextRunnerToken> TokenizeControl(
+      std::string_view text) const override {
+    return LagunaRunnerTokens(model_->Tokenize(text, /*add_bos=*/false));
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    std::vector<models::laguna::ChatMessage> messages;
+    messages.reserve(request.messages.size());
+    for (const auto& message : request.messages) {
+      models::laguna::ChatMessage converted{
+          .role = std::string(LagunaRoleName(message.role)),
+          .content = message.content + message.framing_suffix,
+          .reasoning_content = message.thought,
+          .tool_calls = {},
+          .tool_call_id = message.tool_call_id,
+      };
+      converted.tool_calls.reserve(message.tool_calls.size());
+      for (const auto& call : message.tool_calls) {
+        models::laguna::ChatMessage::ToolCall converted_call{
+            .name = call.name, .arguments = {}, .id = call.id};
+        converted_call.arguments.reserve(call.arguments.size());
+        for (const auto& argument : call.arguments) {
+          converted_call.arguments.push_back({.name = argument.name,
+                                              .value = argument.value,
+                                              .is_string = argument.is_string});
+        }
+        converted.tool_calls.push_back(std::move(converted_call));
+      }
+      messages.push_back(std::move(converted));
+    }
+    std::vector<models::laguna::ChatTool> tools;
+    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      tools.reserve(request.tools.size());
+      for (const auto& tool : request.tools) {
+        tools.push_back({.name = tool.name,
+                         .description = tool.description,
+                         .parameters_json = tool.parameters_json,
+                         .definition_json = tool.definition_json});
+      }
+    }
+    auto tokens = LagunaRunnerTokens(model_->EncodeChat(
+        messages, tools,
+        models::laguna::ResolveLagunaChatOptions(request.reasoning)));
+    if (tokens.empty()) {
+      return std::nullopt;
+    }
+    return tokens;
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return models::laguna::ResolveLagunaChatOptions(request.reasoning)
+                   .enable_thinking
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return model_->Decode(LagunaEngineTokens(tokens));
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<LagunaTextRunnerState>(model_);
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    if (RequireLagunaState(state).session().Position() != prefix.size()) {
+      throw std::logic_error("Laguna reused prefix does not match checkpoint");
+    }
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& session = RequireLagunaState(state).session();
+    if (offset != session.Position()) {
+      throw std::logic_error(
+          "Laguna prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error("Laguna prefill has no remaining input");
+    }
+    const std::size_t consumed = std::min<std::size_t>(
+        {max_input_tokens, prompt.size() - offset, model_->PrefillChunk()});
+    if (consumed == 0) {
+      throw std::logic_error("Laguna prefill was granted no input");
+    }
+    if (offset + consumed > max_context_) {
+      throw std::invalid_argument("Laguna prompt exceeds the context");
+    }
+    const auto chunk = LagunaEngineTokens(prompt.subspan(offset, consumed));
+    std::string error;
+    if (!session.Prefill(chunk, &error)) {
+      throw std::runtime_error("Laguna prefill failed: " + error);
+    }
+    return {.consumed_tokens = consumed,
+            .decode_ready = offset + consumed == prompt.size()};
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& laguna = RequireLagunaState(state);
+    return Select(laguna, sampler);
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("Laguna token ID exceeds engine range");
+    }
+    std::string error;
+    if (!RequireLagunaState(state).session().Evaluate(
+            static_cast<std::int32_t>(token), &error)) {
+      throw std::runtime_error("Laguna decode failed: " + error);
+    }
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return Select(RequireLagunaState(state), sampler);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireLagunaState(state).session().Position();
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    return RequireLagunaState(state).session().SnapshotBytes();
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    std::string error;
+    auto snapshot = RequireLagunaState(state).session().SaveSnapshot(&error);
+    if (snapshot == nullptr) {
+      throw std::runtime_error("Laguna snapshot failed: " + error);
+    }
+    return std::make_unique<LagunaTextRunnerSnapshot>(model_,
+                                                      std::move(snapshot));
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    const auto* laguna_snapshot =
+        dynamic_cast<const LagunaTextRunnerSnapshot*>(&snapshot);
+    if (laguna_snapshot == nullptr ||
+        laguna_snapshot->model.get() != model_.get() ||
+        laguna_snapshot->snapshot == nullptr) {
+      throw std::invalid_argument(
+          "Laguna snapshot does not belong to this model");
+    }
+    std::string error;
+    if (!RequireLagunaState(state).session().RestoreSnapshot(
+            *laguna_snapshot->snapshot, &error)) {
+      throw std::runtime_error("Laguna snapshot restore failed: " + error);
+    }
+  }
+
+private:
+  static std::string_view LagunaRoleName(tokenization::ChatRole role) {
+    switch (role) {
+      case tokenization::ChatRole::kSystem:
+      case tokenization::ChatRole::kDeveloper:
+        return "system";
+      case tokenization::ChatRole::kAssistant:
+        return "assistant";
+      case tokenization::ChatRole::kTool:
+        return "tool";
+      case tokenization::ChatRole::kUser:
+        return "user";
+    }
+    return "user";
+  }
+
+  [[nodiscard]] TextDecodeSelection Select(
+      LagunaTextRunnerState& state, sampling::SamplerState& sampler) const {
+    auto& session = state.session();
+    if (session.Position() >= max_context_) {
+      return {.stop = true, .piece = {}};
+    }
+    const auto& logits = session.Logits();
+    if (logits.empty()) {
+      throw std::runtime_error("Laguna token selection has no frontier");
+    }
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    return {
+        .stop = state.stop_at_eos() && model_->IsStopToken(token),
+        .token = static_cast<TextRunnerToken>(token),
+        .piece = model_->DecodeToken(token),
+    };
+  }
+
+  std::shared_ptr<models::laguna::Model> model_;
+  std::uint32_t max_context_;
+};
+
 /// Derives the content identity that keys persistent continuations for one
 /// GGUF artifact. Full digests are cached by the open file metadata.
 bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
@@ -3055,6 +3427,43 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
 
+  if (architecture == "laguna") {
+    if (!vision_model_path.empty()) {
+      SetError(error, "Laguna does not support --mmproj");
+      return false;
+    }
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+      SetError(error,
+               "Laguna does not support speculative decoding yet (its DFlash "
+               "drafter is a later phase)");
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config)) {
+      SetError(error,
+               "Laguna has no persistent snapshot format; serve without "
+               "--cache-disk (RAM snapshots are used)");
+      return false;
+    }
+    if (session_count == 0) {
+      SetError(error, "HTTP session count must be at least one");
+      return false;
+    }
+    auto model = models::laguna::Model::Load(
+        reader,
+        models::laguna::ModelOptions{
+            .max_context = max_context,
+            .session_count = static_cast<std::uint32_t>(std::min<std::size_t>(
+                session_count, std::numeric_limits<std::uint32_t>::max())),
+        },
+        &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create Laguna model: " + load_error);
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config), ram_cache_config);
+  }
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
     if (!vision_model_path.empty()) {
       SetError(error, "DeepSeek does not support --mmproj");
@@ -3457,6 +3866,59 @@ bool InferenceBackend::load(
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(std::shared_ptr<models::laguna::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config,
+                            TextRunnerRamCacheOptions ram_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "Laguna model must not be null");
+    return false;
+  }
+  if (max_context == 0)
+    max_context = model->MaxContext();
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+    SetError(error, "Laguna does not support speculative decoding yet");
+    return false;
+  }
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (max_context < 2 || max_context > model->MaxContext()) {
+    SetError(error, "HTTP context exceeds the loaded Laguna model context");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config)) {
+    SetError(error, "Laguna has no persistent snapshot format");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->sampling_defaults.model = sampling::TextModelPreset::kLaguna;
+    new_state->sampling_defaults.supplied = {};
+    auto runner =
+        std::make_shared<LagunaTextRunner>(std::move(model), max_context);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = max_context;
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::nullopt, ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

@@ -341,6 +341,11 @@ std::unique_ptr<Tokenizer> Tokenizer::FromGguf(const core::GgufReader& gguf,
       !id_of("tokenizer.ggml.padding_token_id", &tokenizer->pad_)) {
     return fail("GGUF lacks a valid BOS, EOS or padding token id");
   }
+  // The end-of-turn token is optional metadata; without it only EOS stops.
+  if (const auto eot = gguf.GetMetadataUint32("tokenizer.ggml.eot_token_id");
+      eot.has_value() && *eot < tokens.size()) {
+    tokenizer->eot_ = *eot;
+  }
   tokenizer->gguf_adds_bos_ =
       gguf.GetMetadataBool("tokenizer.ggml.add_bos_token").value_or(false);
   return tokenizer;
@@ -416,6 +421,13 @@ std::vector<TokenId> Tokenizer::Encode(std::string_view text,
 
 std::string Tokenizer::Decode(std::span<const TokenId> tokens) const {
   return bpe_->Decode(tokens);
+}
+
+std::string Tokenizer::DecodeToken(TokenId token) const {
+  if (static_cast<std::size_t>(token) >= bpe_->GetVocabSize()) {
+    return {};
+  }
+  return bpe_->DecodeTokenCopy(token);
 }
 
 }  // namespace gufo::models::laguna

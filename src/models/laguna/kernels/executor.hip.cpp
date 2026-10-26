@@ -245,6 +245,83 @@ bool Executor::Reset(std::string* error_msg) {
   return true;
 }
 
+bool Executor::Clear(std::string* error_msg) {
+  if (poisoned_) {
+    return Reset(error_msg);
+  }
+  if (stream_ != nullptr) {
+    (void)hipStreamSynchronize(stream_);
+  }
+  for (KvCache& cache : kv_) {
+    cache.Reset();
+  }
+  position_ = 0;
+  return true;
+}
+
+std::size_t Executor::snapshot_bytes() const noexcept {
+  std::size_t total = 0;
+  for (const KvCache& cache : kv_) {
+    total += std::size_t{cache.committed() - cache.retained_begin()} *
+             cache.row_bytes() * 2;
+  }
+  return total;
+}
+
+bool Executor::SaveSnapshot(ExecutorSnapshot* snapshot,
+                            std::string* error_msg) {
+  if (poisoned_) {
+    Assign(error_msg,
+           "laguna executor: a previous call failed; Reset() is required");
+    return false;
+  }
+  ExecutorSnapshot out;
+  out.position = position_;
+  out.layers.resize(kv_.size());
+  for (std::size_t il = 0; il < kv_.size(); ++il) {
+    if (kv_[il].committed() != position_) {
+      Assign(error_msg, "laguna executor: layer " + std::to_string(il) +
+                            " is not at the session position");
+      return false;
+    }
+    if (!kv_[il].Export(stream_, &out.layers[il], error_msg)) {
+      return false;
+    }
+  }
+  *snapshot = std::move(out);
+  return true;
+}
+
+bool Executor::RestoreSnapshot(const ExecutorSnapshot& snapshot,
+                               std::string* error_msg) {
+  if (poisoned_) {
+    Assign(error_msg,
+           "laguna executor: a previous call failed; Reset() is required");
+    return false;
+  }
+  if (snapshot.layers.size() != kv_.size() ||
+      snapshot.position > options_.context) {
+    Assign(error_msg, "laguna executor: snapshot does not fit this executor");
+    return false;
+  }
+  for (const KvImage& layer : snapshot.layers) {
+    if (layer.committed != snapshot.position) {
+      Assign(error_msg, "laguna executor: snapshot layers disagree");
+      return false;
+    }
+  }
+  for (std::size_t il = 0; il < kv_.size(); ++il) {
+    if (!kv_[il].Import(stream_, snapshot.layers[il], error_msg)) {
+      // Earlier layers already hold the snapshot and this one is invalid.
+      poisoned_ = true;
+      position_ = 0;
+      return false;
+    }
+  }
+  position_ = snapshot.position;
+  return true;
+}
+
 bool Executor::Run(std::uint32_t T, std::uint32_t start, LogitsRows rows,
                    std::string* error_msg) {
   const Config& config = model_->config();

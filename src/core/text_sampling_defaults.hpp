@@ -8,7 +8,7 @@
 
 namespace gufo::sampling {
 
-enum class TextModelPreset { kUnspecified, kQwen38, kDeepSeekV4Flash };
+enum class TextModelPreset { kUnspecified, kQwen38, kDeepSeekV4Flash, kLaguna };
 
 // Presence is independent of value: an explicit zero must override a preset.
 struct SamplingOverrides {
@@ -31,6 +31,8 @@ struct SamplingOverrides {
 inline TextModelPreset TextPreset(const core::ModelConfig& config) {
   if (config.architecture == "deepseek4")
     return TextModelPreset::kDeepSeekV4Flash;
+  if (config.architecture == "laguna")
+    return TextModelPreset::kLaguna;
   if (config.architecture == "qwen4exp" ||
       (config.num_layers == 64 && config.hidden_size == 5120 &&
        config.vocab_size == 248320))
@@ -49,6 +51,13 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
   result.constraint = configured.constraint;
   result.temperature = 1.0F;
   result.top_p = 0.95F;
+  if (model == TextModelPreset::kLaguna) {
+    // generation_config.json and the GGUF's general.sampling.*: temperature
+    // 1.0, top_k 20, top_p 1.0, min_p 0.
+    result.top_k = 20;
+    result.top_p = 1.0F;
+    result.min_p = 0.0F;
+  }
   if (model == TextModelPreset::kQwen38) {
     result.top_k = 20;
     if (!thinking.value_or(true)) {
