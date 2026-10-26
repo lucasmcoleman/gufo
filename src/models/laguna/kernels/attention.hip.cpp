@@ -699,6 +699,47 @@ bool KvCache::Import(hipStream_t stream, const KvImage& image,
   return true;
 }
 
+std::string KvCache::RejectContinue(std::uint32_t start,
+                                    std::uint32_t rows) const {
+  if (!valid_) {
+    return "laguna attention: cache invalidated by a failed call; Reset() it";
+  }
+  if (start > committed_ || std::uint64_t{start} + rows > UINT32_MAX) {
+    return "laguna attention: start_pos beyond the cached rows";
+  }
+  if (window_ == 0) {
+    if (std::uint64_t{start} + rows > capacity_) {
+      return "laguna attention: context exceeds the cache";
+    }
+  } else if (rows > capacity_ - window_ ||
+             committed_ - start > capacity_ - window_) {
+    // Ring: a chunk must fit beside the window, and a rewind must leave the
+    // window of keys before start intact.
+    return "laguna attention: chunk or rewind exceeds the ring";
+  }
+  // Keys before start that the rows read: [first_key, start). They must still
+  // be in their slots; a rewind cannot bring back evicted ones.
+  const std::uint32_t first_key =
+      window_ != 0 && start + 1 > window_ ? start + 1 - window_ : 0;
+  if (start > 0 && first_key < retained_begin_) {
+    return "laguna attention: keys the call needs were overwritten in the "
+           "ring";
+  }
+  return {};
+}
+
+bool KvCache::RewindTo(std::uint32_t position, std::string* error_msg) {
+  if (std::string why = RejectContinue(position, 0); !why.empty()) {
+    Assign(error_msg, why);
+    return false;
+  }
+  // [retained_begin, position) is untouched by the rows given up; at 0 there
+  // is no history left to keep.
+  retained_begin_ = std::min(retained_begin_, position);
+  committed_ = position;
+  return true;
+}
+
 std::optional<KvCache> KvCache::Create(std::uint32_t kv_heads,
                                        std::uint32_t head_dim,
                                        std::uint32_t capacity,
@@ -926,41 +967,9 @@ bool AttnOps::Run(const AttnWeights& w, std::span<KvCache* const> caches,
     return batch ? c.committed_ : start_pos;
   };
   for (const KvCache* cp : caches) {
-    const KvCache& c = *cp;
-    if (!c.valid_) {
-      Assign(
-          error_msg,
-          "laguna attention: cache invalidated by a failed call; Reset() it");
-      return false;
-    }
-    const std::uint32_t start = start_of(c);
-    if (start > c.committed_ ||
-        std::uint64_t{start} + rows_per_cache > UINT32_MAX) {
-      Assign(error_msg, "laguna attention: start_pos beyond the cached rows");
-      return false;
-    }
-    if (c.window_ == 0) {
-      if (std::uint64_t{start} + rows_per_cache > c.capacity_) {
-        Assign(error_msg, "laguna attention: context exceeds the cache");
-        return false;
-      }
-    } else {
-      // Ring: a chunk must fit beside the window, and a rewind must leave the
-      // window of keys before start_pos intact.
-      if (rows_per_cache > c.capacity_ - c.window_ ||
-          c.committed_ - start > c.capacity_ - c.window_) {
-        Assign(error_msg, "laguna attention: chunk or rewind exceeds the ring");
-        return false;
-      }
-    }
-    // Keys before start_pos that the rows read: [first_key, start_pos). They
-    // must still be in their slots; a rewind cannot bring back evicted ones.
-    const std::uint32_t first_key =
-        c.window_ != 0 && start + 1 > c.window_ ? start + 1 - c.window_ : 0;
-    if (start > 0 && first_key < c.retained_begin_) {
-      Assign(
-          error_msg,
-          "laguna attention: keys the call needs were overwritten in the ring");
+    if (std::string why = cp->RejectContinue(start_of(*cp), rows_per_cache);
+        !why.empty()) {
+      Assign(error_msg, why);
       return false;
     }
   }

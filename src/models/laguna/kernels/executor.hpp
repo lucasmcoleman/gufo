@@ -15,7 +15,11 @@
 // the vector (MMVQ) kernels under Path::kAuto and more rows the batched (MMQ)
 // kernels, which round activations differently (see ffn.hpp), so decode
 // (single rows) and a large prefill differ by that rounding. Pin the path in
-// ExecutorOptions to compare splits bit for bit.
+// ExecutorOptions, or per call (ForwardArgs::path, how a speculative verify of
+// up to 32 rows takes the vector path on an executor that prefills in batched
+// 512-row chunks), to compare splits bit for bit. RewindTo gives up rows after
+// a position (the commit of a verify); ForwardArgs::features captures chosen
+// layer outputs on the device for the DFlash drafter (DFLASH.md phase 6d).
 //
 // All scratch is held per executor (and per stream inside AttnOps/FfnOps);
 // nothing is shared between executors. A failed Forward may have appended some
@@ -29,6 +33,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -52,6 +57,23 @@ struct ExecutorOptions {
 };
 
 enum class LogitsRows { kNone, kLast, kAll };
+
+/// Per-call settings of Forward (DFLASH.md rule 3 and the 6d feature taps).
+struct ForwardArgs {
+  /// Projection path of this call; unset keeps ExecutorOptions::path. A
+  /// speculative verify pins Path::kVector (at most 32 rows) so its rows equal
+  /// the same tokens decoded alone bit for bit, while prefill chunks of the
+  /// same executor keep the batched path.
+  std::optional<Path> path;
+  /// Device buffer of [T][feature_width()] floats that receives, for every row
+  /// of the call, the hidden state after each layer of SetFeatureTaps() in
+  /// that order (F32, the residual stream after the layer's FFN add, the
+  /// point the debug layer tap shows). Written by kernels on the executor's
+  /// stream; nothing synchronizes for it, so the buffer is complete once
+  /// later work on that stream (or Forward's own final synchronize) has run.
+  /// Null: no capture (an untapped call computes exactly the same).
+  float* features{nullptr};
+};
 
 class Executor;
 
@@ -126,6 +148,38 @@ public:
   [[nodiscard]] bool Forward(std::span<const std::int32_t> tokens,
                              LogitsRows rows, float* logits,
                              std::string* error_msg = nullptr);
+  /// Forward with per-call settings. Refused up front (nothing touched) when
+  /// the call's path is kVector and the chunk has more than 32 rows, or when
+  /// `args.features` is set but no feature taps are configured.
+  [[nodiscard]] bool Forward(std::span<const std::int32_t> tokens,
+                             LogitsRows rows, float* logits,
+                             const ForwardArgs& args,
+                             std::string* error_msg = nullptr);
+
+  /// Moves the session back to `position` (<= position()), giving up the
+  /// rows after it: host bookkeeping only, nothing is enqueued (DFLASH rule
+  /// 1; the commit of a verify is a rewind, rule 2). Every layer's cache is
+  /// checked with KvCache::RejectContinue first, the same rule a Forward at
+  /// `position` must pass, and the rewind is refused, touching nothing, when
+  /// any layer refuses (a ring that no longer holds the keys a call at
+  /// `position` reads, a poisoned executor, a position ahead of position()).
+  [[nodiscard]] bool RewindTo(std::uint32_t position,
+                              std::string* error_msg = nullptr);
+
+  /// Layers whose outputs ForwardArgs::features receives, in order (zero-based
+  /// layer outputs, IDraftBackend::TargetHiddenLayerIds' convention; for the
+  /// DFlash drafter DFlashConfig::tap_layer(0..5) = 1, 10, 19, 29, 38, 47).
+  /// Empty clears them. Refused, keeping the previous list, on a layer out of
+  /// range or listed twice. An executor with taps configured is a speculating
+  /// session and is refused by DecodeBatch (DFLASH rule 6): it decodes alone.
+  [[nodiscard]] bool SetFeatureTaps(std::span<const std::uint32_t> layers,
+                                    std::string* error_msg = nullptr);
+  [[nodiscard]] const std::vector<std::uint32_t>& feature_taps()
+      const noexcept {
+    return tap_layers_;
+  }
+  /// Floats per row of a feature capture: taps x hidden.
+  [[nodiscard]] std::size_t feature_width() const noexcept;
 
   /// Appends one token to each of several executors of the same model in
   /// shared forward passes: the projections, norms, routing and experts run
@@ -136,6 +190,9 @@ public:
   /// chunk geometry run alone. Items are processed in groups of at most
   /// min(32, the first executor's max_chunk); the first executor of a group
   /// lends its stream and scratch, and the others' streams stay idle.
+  ///
+  /// An executor with feature taps (a speculating session) is refused like
+  /// an item that cannot run: it decodes alone (DFLASH.md rule 6).
   ///
   /// Failure: an item that cannot run (poisoned or invalid executor, token
   /// outside the vocabulary, context exhausted, duplicate executor, null
@@ -155,6 +212,7 @@ public:
     return options_.max_chunk;
   }
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
+  [[nodiscard]] const DeviceModel& model() const noexcept { return *model_; }
   /// One layer's KV cache, for inspection (tests compare the retained-history
   /// bookkeeping of a restored session with the original).
   [[nodiscard]] const KvCache& kv_cache(std::uint32_t layer) const {
@@ -192,7 +250,11 @@ private:
   void Free(Buffer* b) noexcept;
   bool BuildCaches(std::string* error_msg);
   bool Run(std::uint32_t tokens, std::uint32_t start, LogitsRows rows,
-           std::string* error_msg, std::span<Executor* const> batch = {});
+           Path path, float* features, std::string* error_msg,
+           std::span<Executor* const> batch = {});
+  /// The kernels a call of `tokens` rows takes (kVector or kBatched).
+  [[nodiscard]] Path ResolvePath(std::optional<Path> requested,
+                                 std::uint32_t tokens) const noexcept;
   static void RunGroup(std::span<DecodeItem* const> group);
   [[nodiscard]] bool BatchCompatible(const Executor& lead) const noexcept;
   [[nodiscard]] std::string RejectDecode(std::int32_t token,
@@ -212,6 +274,9 @@ private:
   bool poisoned_{false};
   std::size_t measured_warmup_{0};
   LayerTap layer_tap_;
+  std::vector<std::uint32_t> tap_layers_;
+  /// Per layer: its index in tap_layers_, or -1.
+  std::vector<std::int32_t> tap_slot_;
 };
 
 }  // namespace gufo::models::laguna::rocm

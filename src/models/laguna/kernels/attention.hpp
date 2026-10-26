@@ -178,6 +178,21 @@ public:
     retained_begin_ = 0;
     valid_ = true;
   }
+  /// Why a call of `rows` rows starting at `start` cannot run on this cache
+  /// now ("" when it can): an invalid cache, a start beyond committed(), a
+  /// chunk or rewind the ring cannot hold, or keys before `start` that the
+  /// rows read but the ring has already overwritten (they must lie in
+  /// [retained_begin(), committed())). AttnOps validates every call with it,
+  /// and RewindTo() validates a rewind with it, so both obey one rule.
+  [[nodiscard]] std::string RejectContinue(std::uint32_t start,
+                                           std::uint32_t rows) const;
+  /// Moves the logical end back to `position` (host bookkeeping only; DFLASH
+  /// rule 1): the slots of [position, committed()) are overwritten by the
+  /// next call. Refused, touching nothing, when a call starting at
+  /// `position` would be (RejectContinue(position, 0)), so a rewind can never
+  /// expose a key the ring no longer holds.
+  [[nodiscard]] bool RewindTo(std::uint32_t position,
+                              std::string* error_msg = nullptr);
   /// Bytes of one position's K (or V) row.
   [[nodiscard]] std::size_t row_bytes() const noexcept {
     return std::size_t{kv_heads_} * head_dim_ * 2;

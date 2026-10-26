@@ -75,6 +75,18 @@ __global__ void AddKernel(const float* __restrict__ a,
   }
 }
 
+/// Feature capture: row r of `h` ([T][n]) goes to dst[r * stride + n * slot
+/// ...]. A plain copy, so the capture holds exactly the F32 hidden state.
+__global__ void CaptureTapKernel(const float* __restrict__ h,
+                                 float* __restrict__ dst, std::uint32_t n,
+                                 std::size_t stride, std::uint32_t slot) {
+  const float* in = h + std::size_t{blockIdx.x} * n;
+  float* out = dst + std::size_t{blockIdx.x} * stride + std::size_t{slot} * n;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    out[i] = in[i];
+  }
+}
+
 }  // namespace
 
 Executor::~Executor() {
@@ -219,7 +231,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     std::size_t total = 0;
     const bool have_info = hipMemGetInfo(&before, &total) == hipSuccess;
     if (hipMemset(ex->h_.ptr, 0, ex->h_.bytes) != hipSuccess ||
-        !ex->Run(options.max_chunk, 0, LogitsRows::kAll, error_msg)) {
+        !ex->Run(options.max_chunk, 0, LogitsRows::kAll,
+                 ex->ResolvePath(std::nullopt, options.max_chunk), nullptr,
+                 error_msg)) {
       return nullptr;
     }
     if (have_info && hipMemGetInfo(&after, &total) == hipSuccess &&
@@ -323,14 +337,80 @@ bool Executor::RestoreSnapshot(const ExecutorSnapshot& snapshot,
   return true;
 }
 
+Path Executor::ResolvePath(std::optional<Path> requested,
+                           std::uint32_t tokens) const noexcept {
+  const Path path = requested.value_or(options_.path);
+  if (path != Path::kAuto) {
+    return path;
+  }
+  return tokens <= kVectorMaxTokens ? Path::kVector : Path::kBatched;
+}
+
+std::size_t Executor::feature_width() const noexcept {
+  return tap_layers_.size() * model_->config().hidden_size;
+}
+
+bool Executor::SetFeatureTaps(std::span<const std::uint32_t> layers,
+                              std::string* error_msg) {
+  const std::uint32_t L = model_->config().num_layers;
+  std::vector<std::int32_t> slots(L, -1);
+  for (std::size_t i = 0; i < layers.size(); ++i) {
+    if (layers[i] >= L || slots[layers[i]] >= 0) {
+      Assign(error_msg, "laguna executor: feature tap layer " +
+                            std::to_string(layers[i]) +
+                            " is out of range or listed twice");
+      return false;
+    }
+    slots[layers[i]] = static_cast<std::int32_t>(i);
+  }
+  tap_layers_.assign(layers.begin(), layers.end());
+  tap_slot_ = std::move(slots);
+  return true;
+}
+
+bool Executor::RewindTo(std::uint32_t position, std::string* error_msg) {
+  if (poisoned_) {
+    Assign(error_msg,
+           "laguna executor: a previous call failed; Reset() is required");
+    return false;
+  }
+  if (position > position_) {
+    Assign(error_msg, "laguna executor: cannot rewind to " +
+                          std::to_string(position) + ", ahead of position " +
+                          std::to_string(position_));
+    return false;
+  }
+  // Validate every layer before changing any.
+  for (std::size_t il = 0; il < kv_.size(); ++il) {
+    if (kv_[il].committed() != position_) {
+      Assign(error_msg, "laguna executor: layer " + std::to_string(il) +
+                            " is not at the session position");
+      return false;
+    }
+    if (std::string why = kv_[il].RejectContinue(position, 0); !why.empty()) {
+      Assign(error_msg, "laguna executor: rewind to " +
+                            std::to_string(position) + " refused at layer " +
+                            std::to_string(il) + ": " + why);
+      return false;
+    }
+  }
+  for (std::size_t il = 0; il < kv_.size(); ++il) {
+    if (!kv_[il].RewindTo(position, error_msg)) {
+      // Cannot happen after the check above; never leave layers disagreeing.
+      return Fail(error_msg, "laguna executor: rewind of layer " +
+                                 std::to_string(il) +
+                                 " failed after the check");
+    }
+  }
+  position_ = position;
+  return true;
+}
+
 bool Executor::Run(std::uint32_t T, std::uint32_t start, LogitsRows rows,
-                   std::string* error_msg, std::span<Executor* const> batch) {
+                   Path path, float* features, std::string* error_msg,
+                   std::span<Executor* const> batch) {
   const Config& config = model_->config();
   const std::uint32_t H = config.hidden_size;
-  Path path = options_.path;
-  if (path == Path::kAuto) {
-    path = T <= kVectorMaxTokens ? Path::kVector : Path::kBatched;
-  }
   if (!batch.empty()) {
     // Decode rows of several sessions always take the vector kernels, the
     // path a lone decode token takes.
@@ -400,6 +480,15 @@ bool Executor::Run(std::uint32_t T, std::uint32_t start, LogitsRows rows,
     if (!check("residual")) {
       return false;
     }
+    if (features != nullptr && tap_slot_[il] >= 0) {
+      // Asynchronous like everything else here: no synchronize for capture.
+      CaptureTapKernel<<<T, kNormThreads, 0, stream_>>>(
+          h, features, H, feature_width(),
+          static_cast<std::uint32_t>(tap_slot_[il]));
+      if (!check("feature capture")) {
+        return false;
+      }
+    }
     if (layer_tap_) {
       if (const hipError_t s = hipStreamSynchronize(stream_); s != hipSuccess) {
         return Fail(error_msg, std::string("laguna executor: tap sync: ") +
@@ -440,6 +529,12 @@ bool Executor::Run(std::uint32_t T, std::uint32_t start, LogitsRows rows,
 
 bool Executor::Forward(std::span<const std::int32_t> tokens, LogitsRows rows,
                        float* logits, std::string* error_msg) {
+  return Forward(tokens, rows, logits, ForwardArgs{}, error_msg);
+}
+
+bool Executor::Forward(std::span<const std::int32_t> tokens, LogitsRows rows,
+                       float* logits, const ForwardArgs& args,
+                       std::string* error_msg) {
   if (poisoned_) {
     Assign(error_msg,
            "laguna executor: a previous call failed; Reset() is required");
@@ -461,6 +556,17 @@ bool Executor::Forward(std::span<const std::int32_t> tokens, LogitsRows rows,
   }
   if (rows != LogitsRows::kNone && logits == nullptr) {
     Assign(error_msg, "laguna executor: logits output missing");
+    return false;
+  }
+  const Path path = ResolvePath(args.path, static_cast<std::uint32_t>(T));
+  if (path == Path::kVector && T > kVectorMaxRows) {
+    Assign(error_msg, "laguna executor: the vector path takes at most " +
+                          std::to_string(kVectorMaxRows) + " rows, not " +
+                          std::to_string(T));
+    return false;
+  }
+  if (args.features != nullptr && tap_layers_.empty()) {
+    Assign(error_msg, "laguna executor: feature capture without feature taps");
     return false;
   }
   const TensorRef& embd = model_->weights().token_embd;
@@ -486,7 +592,8 @@ bool Executor::Forward(std::span<const std::int32_t> tokens, LogitsRows rows,
     return Fail(error_msg, std::string("laguna executor: embedding upload: ") +
                                hipGetErrorString(s));
   }
-  if (!Run(static_cast<std::uint32_t>(T), position_, rows, error_msg)) {
+  if (!Run(static_cast<std::uint32_t>(T), position_, rows, path, args.features,
+           error_msg)) {
     poisoned_ = true;
     return false;
   }
@@ -517,6 +624,10 @@ std::string Executor::RejectDecode(std::int32_t token,
                                    const float* logits) const {
   if (poisoned_) {
     return "laguna executor: a previous call failed; Reset() is required";
+  }
+  if (!tap_layers_.empty()) {
+    return "laguna executor: a session with feature taps (speculating) "
+           "decodes alone through Forward, not in a decode batch";
   }
   if (logits == nullptr) {
     return "laguna executor: logits output missing";
@@ -667,8 +778,8 @@ void Executor::RunGroup(std::span<DecodeItem* const> group) {
     return;
   }
   std::string error;
-  if (!lead.Run(static_cast<std::uint32_t>(n), 0, LogitsRows::kAll, &error,
-                members)) {
+  if (!lead.Run(static_cast<std::uint32_t>(n), 0, LogitsRows::kAll,
+                Path::kVector, nullptr, &error, members)) {
     fail_all(error.empty() ? "laguna batched forward pass failed" : error,
              true);
     return;
