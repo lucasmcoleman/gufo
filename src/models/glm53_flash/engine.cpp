@@ -491,8 +491,18 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   model->impl_->reader = reader;
   model->impl_->weights = std::make_unique<ModelWeights>(std::move(*weights));
   ExecutorOptions executor_options;
-  executor_options.max_tokens =
-      std::max<std::uint32_t>(options.prefill_chunk, 1);
+  // GUFO_GLM53_PREFILL_CHUNK overrides ModelOptions::prefill_chunk (1..8192)
+  // for the chunk x MoE-tile sweep (EXPERIMENTS.md, 2026-10-26). A
+  // chunk other than 256 changes logits (EXPERIMENTS.md, 2026-10-20).
+  std::uint32_t prefill_chunk = options.prefill_chunk;
+  if (const char* chunk_env = std::getenv("GUFO_GLM53_PREFILL_CHUNK");
+      chunk_env != nullptr && *chunk_env != '\0') {
+    const long v = std::strtol(chunk_env, nullptr, 10);
+    if (v > 0 && v <= 8192) {
+      prefill_chunk = static_cast<std::uint32_t>(v);
+    }
+  }
+  executor_options.max_tokens = std::max<std::uint32_t>(prefill_chunk, 1);
   executor_options.capacity = max_context;
   executor_options.shards = reader->GetMappedRegions();
   executor_options.nextn = want_mtp;

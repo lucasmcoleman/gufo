@@ -447,6 +447,34 @@ void CheckRefusals(const Model& m) {
   CheckRel("forward after failure + Reset: logits", out.logits, want.logits);
 }
 
+// (h) A pass longer than the 256-row logits buffer (Executor::HeadLogits
+// projects the head in row blocks): per-token logits of one 300-token pass
+// match 16-token passes (batch-dependent GEMM routes: F32 rounding).
+void CheckLongPassLogits(const Model& m) {
+  glm::stand_in::HostOps long_ops(m.config);
+  glm::stand_in::HostOps short_ops(m.config);
+  std::string error;
+  glm::ExecutorOptions lo = Options(300);
+  lo.capacity = 512;
+  glm::ExecutorOptions so = Options(16);
+  so.capacity = 512;
+  auto one = glm::Executor::Create(m.weights, lo, long_ops.Bind(), &error);
+  auto many = glm::Executor::Create(m.weights, so, short_ops.Bind(), &error);
+  Check("long-pass executors " + error, one && many);
+  if (!one || !many)
+    return;
+  std::vector<std::int32_t> ids(300);
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    ids[i] = m.ids[i % m.ids.size()];
+  }
+  glm::ForwardResult a, b;
+  Check("long pass " + error, one->Forward(ids, true, &a, nullptr, &error));
+  Check("short passes " + error, many->Forward(ids, true, &b, nullptr, &error));
+  Check("long pass logits rows",
+        a.logits.size() == ids.size() * m.config.vocab_size);
+  CheckRel("300-token pass vs 16-token passes: logits", a.logits, b.logits);
+}
+
 // (g) GUFO_GLM53_DECODE_GRAPH: replayed position-independent half-layer
 // runs (here the KDA mixer halves; the stand-in FFN declares no capture
 // safety and the stand-in MLA syncs, so both stay eager) give bitwise the
@@ -552,6 +580,7 @@ int main() {
     CheckLastLogits(m);
     CheckRefusals(m);
     CheckDecodeGraph(m);
+    CheckLongPassLogits(m);
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << "\n";
     return 1;

@@ -1023,8 +1023,13 @@ bool Executor::Init(std::string* error) {
             floats(xn_, t * hidden) && floats(a_, t * hidden) &&
             floats(split_, t * mix_dim) && floats(tap_post_, t * c.hc_count) &&
             floats(tap_comb_, t * c.hc_count * c.hc_count);
+  // At most kHeadLogitRows rows are projected at once (HeadLogits), so a
+  // long prefill chunk does not need a [chunk x vocab] buffer (2048 rows
+  // would be 1.2 GiB). Up to 256-token passes nothing changes.
+  logit_rows_ =
+      static_cast<std::uint32_t>(std::min<std::size_t>(t, kHeadLogitRows));
   if (ok && !output_.empty()) {
-    ok = floats(logits_, t * c.vocab_size);
+    ok = floats(logits_, std::size_t{logit_rows_} * c.vocab_size);
   }
   if (ok && !embd_.empty()) {
     ids_ =
@@ -1237,8 +1242,7 @@ bool Executor::ForwardNextn(std::span<const std::int32_t> tokens,
                                       hidden, c.rms_eps, stream_);
     ok = ok && download(out->hidden, xn_, n, hidden);
     if (want_logits && !output_.empty() && all_rows) {
-      ok = ok && LaunchProjection(output_, xn_, logits_, n, stream_) &&
-           download(out->logits, logits_, n, c.vocab_size);
+      ok = ok && HeadLogits(xn_, n, &out->logits);
     } else if (want_logits && !output_.empty() && t0 + n == n_tokens) {
       ok = ok &&
            LaunchProjection(output_, xn_ + ((n - 1) * hidden), logits_, 1,
@@ -1420,8 +1424,7 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
     }
     if (need_logits && !last_row) {
       const OpScope scope(profiler_.get(), "head_logits", stream_);
-      ok = ok && LaunchProjection(output_, xn_, logits_, n, stream_) &&
-           download(out->logits, logits_, c.vocab_size);
+      ok = ok && HeadLogits(xn_, n, &out->logits);
     } else if (need_logits && last_pass) {
       // One row: the final token of the call, projected inside this pass.
       const OpScope scope(profiler_.get(), "head_logits", stream_);
@@ -1445,6 +1448,25 @@ bool Executor::Pass(const std::int32_t* tokens, const float* streams,
     guard.done = true;
   }
   return ok || Fail(error, "head failed");
+}
+
+bool Executor::HeadLogits(const float* rows, std::uint32_t n,
+                          std::vector<float>* dst) {
+  const std::size_t vocab = config_.vocab_size;
+  const std::size_t hidden = config_.hidden_size;
+  for (std::uint32_t r0 = 0; r0 < n; r0 += logit_rows_) {
+    const std::uint32_t m = std::min(logit_rows_, n - r0);
+    const std::size_t at = dst->size();
+    dst->resize(at + (std::size_t{m} * vocab));
+    // Stream order keeps the next block's projection behind this copy.
+    if (!LaunchProjection(output_, rows + (std::size_t{r0} * hidden), logits_,
+                          m, stream_) ||
+        hipMemcpyAsync(dst->data() + at, logits_, m * vocab * sizeof(float),
+                       hipMemcpyDeviceToHost, stream_) != hipSuccess) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool Executor::HalfLayers(std::uint32_t begin, std::uint32_t end,

@@ -410,6 +410,11 @@ private:
                   const TapFn* tap, std::string* error);
   /// True if half-layer h may be captured for an n-token pass.
   bool Graphable(std::uint32_t h, std::uint32_t n) const;
+  /// Output-head logits of `n` normed rows appended to `dst`, projected
+  /// logit_rows_ rows at a time through logits_.
+  bool HeadLogits(const float* rows, std::uint32_t n, std::vector<float>* dst);
+  static constexpr std::size_t kHeadLogitRows = 256;
+  std::uint32_t logit_rows_{0};  ///< logits_ rows: min(max_tokens, 256)
   void Emit(const TapFn* tap, std::string_view name, std::uint32_t layer,
             const float* data, std::uint64_t ne0, std::uint64_t ne1,
             std::uint64_t ne2 = 1);
