@@ -14,6 +14,16 @@ endfunction()
 
 add_laguna_test(contract gufo_laguna "cpu")
 
+# Oracle tests run on tiny synthetic models: no model file, nothing skipped.
+foreach(name IN ITEMS reference_model reference_attention reference_moe reference_quant)
+  add_laguna_test(${name} gufo_laguna "cpu")
+endforeach()
+
+# CLI that runs the oracle on the real GGUF (not a test: needs ~90 GiB free).
+add_executable(laguna_oracle oracle_cli.cpp)
+target_link_libraries(laguna_oracle PRIVATE gufo_laguna)
+add_dependencies(laguna_tests laguna_oracle)
+
 foreach(name IN ITEMS config weights tokenizer_golden)
   add_laguna_test(${name} gufo_laguna "cpu;external-model")
   set_tests_properties(laguna.${name} PROPERTIES SKIP_RETURN_CODE 77)

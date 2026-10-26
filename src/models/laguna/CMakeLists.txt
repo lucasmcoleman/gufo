@@ -1,7 +1,9 @@
-# Laguna-S-2.1 model package. Phase 1 is CPU only: configuration, weight index
-# and tokenizer. The BPE engine comes from the Qwen tokenizer in gufo_core.
+# Laguna-S-2.1 model package. CPU only so far: configuration, weight index,
+# tokenizer and the F32/Q8-aware reference forward (the oracle).
+# The BPE engine comes from the Qwen tokenizer in gufo_core.
 add_library(gufo_laguna STATIC
   config.cpp
+  reference.cpp
   tokenizer.cpp
   weights.cpp)
 
