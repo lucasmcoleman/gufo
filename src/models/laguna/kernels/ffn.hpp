@@ -36,6 +36,10 @@
 #include "src/models/laguna/config.hpp"
 #include "src/models/laguna/weights.hpp"
 
+namespace gufo::hip {
+class WeightUpload;
+}
+
 namespace gufo::models::laguna::rocm {
 
 /// A device-resident tensor in its GGUF encoding. `cols` is the contiguous
@@ -90,10 +94,14 @@ public:
 
   /// Copies the tensors `layer` uses (dense or MoE per `layer.moe`). Returns
   /// nullopt with a message on an unsupported type, a shape that disagrees
-  /// with `config`, or a HIP failure (partial uploads are freed).
+  /// with `config`, or a HIP failure (partial uploads are freed). With a
+  /// `stager`, payloads stream from the GGUF file by TensorRef::shard and
+  /// file_offset and the mapping is never read (the real model); without one
+  /// they are copied from TensorRef::data. The call returns after every
+  /// queued copy has finished, also on failure.
   [[nodiscard]] static std::optional<LayerFfn> Upload(
       const Config& config, const LayerWeights& layer,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr, hip::WeightUpload* stager = nullptr);
 
   [[nodiscard]] bool moe() const noexcept { return moe_; }
   [[nodiscard]] const DenseFfnWeights& dense() const noexcept { return dense_; }

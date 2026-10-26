@@ -46,4 +46,15 @@ if (ENGINE_ENABLE_HIP)
   add_laguna_test(attention_ops gufo_laguna "hip;gpu;gfx1151")
   add_laguna_test(attention_real gufo_laguna "hip;gpu;gfx1151;external-model")
   set_tests_properties(laguna.attention_real PROPERTIES SKIP_RETURN_CODE 77)
+
+  # Full-model GPU executor (phase 4) on random tiny models: the oracle match,
+  # chunk-split and decode bit-identity, reset, untapped reruns and the
+  # allocation-failure paths. Nothing is skipped.
+  add_laguna_test(executor gufo_laguna "hip;gpu;gfx1151")
+
+  # CLI: teacher-forced all-position logit dump (the #969 contract). Not a
+  # test: it needs the 74 GB model resident on the GPU.
+  add_executable(laguna_logits logits_cli.cpp)
+  target_link_libraries(laguna_logits PRIVATE gufo_laguna)
+  add_dependencies(laguna_tests laguna_logits)
 endif()

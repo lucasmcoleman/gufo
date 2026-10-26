@@ -15,6 +15,7 @@
 #include <cmath>
 #include <utility>
 
+#include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
 namespace gufo::models::laguna::rocm {
@@ -267,7 +268,7 @@ namespace {
 /// poisons that output (then sanitized to 0).
 bool UploadTensor(const TensorRef& t, std::vector<void*>* owned,
                   std::size_t* bytes, DeviceMatrix* out,
-                  std::string* error_msg) {
+                  hip::WeightUpload* stager, std::string* error_msg) {
   if (t.empty() || t.data == nullptr) {
     Assign(error_msg, "laguna ffn upload: missing tensor");
     return false;
@@ -282,8 +283,12 @@ bool UploadTensor(const TensorRef& t, std::vector<void*>* owned,
   }
   owned->push_back(device);
   *bytes += size + tail;
-  if (!CheckHip(hipMemcpy(device, t.data, size, hipMemcpyHostToDevice),
-                "hipMemcpy", error_msg) ||
+  const bool copied =
+      stager != nullptr
+          ? stager->Copy(t.shard, t.file_offset, size, device, error_msg)
+          : CheckHip(hipMemcpy(device, t.data, size, hipMemcpyHostToDevice),
+                     "hipMemcpy", error_msg);
+  if (!copied ||
       (tail != 0 &&
        !CheckHip(hipMemset(static_cast<char*>(device) + size, 0, tail),
                  "hipMemset", error_msg))) {
@@ -313,14 +318,15 @@ bool Expect(const TensorRef& t, GgmlType type, std::uint64_t cols,
 
 std::optional<LayerFfn> LayerFfn::Upload(const Config& config,
                                          const LayerWeights& layer,
-                                         std::string* error_msg) {
+                                         std::string* error_msg,
+                                         hip::WeightUpload* stager) {
   LayerFfn result;
   result.moe_ = layer.moe;
   const std::uint64_t hidden = config.hidden_size;
   bool ok = true;
   const auto up = [&](const TensorRef& t, DeviceMatrix* m) {
-    ok = ok &&
-         UploadTensor(t, &result.allocations_, &result.bytes_, m, error_msg);
+    ok = ok && UploadTensor(t, &result.allocations_, &result.bytes_, m, stager,
+                            error_msg);
   };
   DenseFfnWeights* dense = &result.dense_;
   if (!layer.moe) {
@@ -374,6 +380,15 @@ std::optional<LayerFfn> LayerFfn::Upload(const Config& config,
       r.used = config.num_experts_used;
       r.normalize = config.expert_weights_norm;
       r.scale = config.expert_weights_scale;
+    }
+  }
+  // Queued copies write into `result`'s allocations: wait for them before the
+  // result is returned or (on failure) freed.
+  if (stager != nullptr) {
+    std::string finish_error;
+    if (!stager->Finish(&finish_error) && ok) {
+      ok = false;
+      Assign(error_msg, finish_error);
     }
   }
   if (!ok) {
