@@ -24,6 +24,7 @@ hold it before starting. The clock and power mode reset at boot.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `GUFO_NPU_DIR` | unset (NPU off) | Directory with the NPU kernel files (`tools/npu`). Setting it turns the NPU on. |
+| `GUFO_NPU_PROGRAM` | `fixed` | Which NPU program to load from `GUFO_NPU_DIR`: `fixed` is the M = 4096, K = 2560 pair in the directory itself; `runtime_k` loads `runtime_k/` (one XCLBIN for every K, K / 64 written by the instruction stream; its K = 2560 stream moves the same data as the fixed one); `runtime_mk` loads `runtime_mk/`, which has no K = 2560 stream yet, so the NPU stays off until one is generated. Experimental, awaiting the hardware A/B. See [tools/npu/PROVENANCE.md](../../../tools/npu/PROVENANCE.md). |
 
 ### What the NPU computes
 

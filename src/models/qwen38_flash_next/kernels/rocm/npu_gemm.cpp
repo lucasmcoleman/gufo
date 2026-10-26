@@ -66,6 +66,7 @@ struct Call {
   int a_id;
   std::vector<int> b_ids;
   std::vector<int> c_ids;
+  int program{0};  ///< 0: the Create() stream; i: AddProgram's i-th stream
 };
 
 class CopyPool {
@@ -172,6 +173,14 @@ struct NpuGemm::Impl {
   xrt::bo instructions;
   std::size_t instruction_words{0};
   int group_a{0};
+  /// Further instruction streams for the same kernel (other reduction or token
+  /// lengths of a runtime-K or runtime-M/K program). Program 0 is the one
+  /// above; program i is extra_programs[i - 1].
+  struct Program {
+    xrt::bo instructions;
+    std::size_t words{0};
+  };
+  std::vector<Program> extra_programs;
 
   struct Buffer {
     void* host{nullptr};    // GPU-visible pinned memory
@@ -428,8 +437,14 @@ struct NpuGemm::Impl {
           ReapOldest();
         }
         const auto t_launch = std::chrono::steady_clock::now();
+        const auto& program_bo =
+            call.program == 0 ? instructions
+                              : extra_programs[call.program - 1].instructions;
+        const std::size_t program_words =
+            call.program == 0 ? instruction_words
+                              : extra_programs[call.program - 1].words;
         pending.emplace_back(
-            kernel(kOpcode, instructions, instruction_words, NpuBo(call.a_id),
+            kernel(kOpcode, program_bo, program_words, NpuBo(call.a_id),
                    NpuBo(call.b_ids[i]), NpuBo(call.c_ids[i])),
             call.c_ids[i]);
         launch_us += Since(t_launch);
@@ -553,10 +568,59 @@ std::unique_ptr<NpuGemm> NpuGemm::Create(const Config& config,
 }
 
 std::size_t NpuGemm::ABytes() const noexcept {
-  return std::size_t{impl_->config.tokens} * impl_->config.k / 8 * kBytesPer8;
+  return ABytes(impl_->config.k);
 }
 std::size_t NpuGemm::BBytes() const noexcept {
-  return std::size_t{impl_->config.k} * impl_->config.n / 8 * kBytesPer8;
+  return BBytes(impl_->config.k);
+}
+std::size_t NpuGemm::ABytes(std::uint32_t k) const noexcept {
+  return std::size_t{impl_->config.tokens} * k / 8 * kBytesPer8;
+}
+std::size_t NpuGemm::BBytes(std::uint32_t k) const noexcept {
+  return std::size_t{k} * impl_->config.n / 8 * kBytesPer8;
+}
+
+int NpuGemm::AddProgram(const std::string& insts, std::string* error) {
+  Impl& i = *impl_;
+  try {
+    std::ifstream file(insts, std::ios::binary | std::ios::ate);
+    if (!file) {
+      if (error != nullptr) {
+        *error = "NPU instruction file not readable: " + insts;
+      }
+      return -1;
+    }
+    const auto size = static_cast<std::size_t>(file.tellg());
+    if (size == 0 || size % sizeof(int) != 0) {
+      if (error != nullptr) {
+        *error = "NPU instruction file is empty or not word aligned: " + insts;
+      }
+      return -1;
+    }
+    file.seekg(0);
+    std::vector<char> words(size);
+    if (!file.read(words.data(), static_cast<std::streamsize>(size))) {
+      if (error != nullptr) {
+        *error = "NPU instruction file read failed: " + insts;
+      }
+      return -1;
+    }
+    Impl::Program program;
+    program.words = size / sizeof(int);
+    program.instructions =
+        xrt::bo(i.device, size, XCL_BO_FLAGS_CACHEABLE, i.kernel.group_id(1));
+    std::memcpy(program.instructions.map<void*>(), words.data(), size);
+    program.instructions.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    // The worker reads extra_programs under `mutex` while it launches.
+    const std::lock_guard lock(i.mutex);
+    i.extra_programs.push_back(std::move(program));
+    return static_cast<int>(i.extra_programs.size());
+  } catch (const std::exception& e) {
+    if (error != nullptr) {
+      *error = std::string("NPU program setup failed: ") + e.what();
+    }
+    return -1;
+  }
 }
 std::size_t NpuGemm::CBytes() const noexcept {
   return std::size_t{impl_->config.tokens} * impl_->config.n / 8 * kBytesPer8;
@@ -631,10 +695,18 @@ void NpuGemm::FinalizeWeights(int id) {
 }
 
 bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
-                     const int* c_ids, int count) {
+                     const int* c_ids, int count, int program) {
   Trace("submit_host", a_id, count);
-  auto* call = new Call{
-      impl_.get(), a_id, {b_ids, b_ids + count}, {c_ids, c_ids + count}};
+  if (program < 0 ||
+      static_cast<std::size_t>(program) > impl_->extra_programs.size()) {
+    impl_->FailLaunch("NPU submit names an unknown program");
+    return false;
+  }
+  auto* call = new Call{impl_.get(),
+                        a_id,
+                        {b_ids, b_ids + count},
+                        {c_ids, c_ids + count},
+                        program};
   const hipError_t status = hipLaunchHostFunc(
       stream,
       [](void* data) {

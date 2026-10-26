@@ -56,8 +56,19 @@ public:
 
   /// Enqueues `count` runs reading A buffer a_id and B buffers b_ids[i],
   /// writing C buffers c_ids[i]. The runs execute in order on the NPU.
+  /// `program` selects the instruction stream: 0 is the one given to Create,
+  /// i > 0 the i-th stream added by AddProgram. A submit that names an unknown
+  /// program fails and poisons the engine.
   bool Submit(hipStream_t stream, int a_id, const int* b_ids, const int* c_ids,
-              int count);
+              int count, int program = 0);
+  /// Loads another instruction stream for the same XCLBIN (a runtime-K or
+  /// runtime-M/K program serving another reduction or token length) and
+  /// returns its id for Submit, or -1 with `error` set. Operand sizes for
+  /// reduction length k are ABytes(k) and BBytes(k). Call before the first
+  /// Submit that uses it.
+  int AddProgram(const std::string& insts, std::string* error);
+  std::size_t ABytes(std::uint32_t k) const noexcept;
+  std::size_t BBytes(std::uint32_t k) const noexcept;
   /// Blocks the stream until every submitted run has finished and its C buffer
   /// is readable by the GPU.
   bool Wait(hipStream_t stream);

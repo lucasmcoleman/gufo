@@ -30,6 +30,8 @@ Non-Nix builds must retain the notices of the versions they actually distribute.
 | GNU C/C++/OpenMP runtimes | System runtime libraries; no Gufo source import | `LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)` | glibc/GCC packages in flake.lock | [GNU](https://www.gnu.org/software/) |
 | llama.cpp / ggml | Adapted quantization, attention and model-private HIP kernels | `MIT` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a`; attention `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | mikealanni/gufo | Adapted Flash-Next GDN row reuse and SSM stride optimization | `MIT` | `f450218743bcaf77e3e1f8fab78f4cd4e4aafae3` | [gufo fork](https://github.com/mikealanni/gufo/tree/f450218743bcaf77e3e1f8fab78f4cd4e4aafae3) |
+| mikealanni/gufo (NPU) | Flash-Next XDNA2 NPU prefill offload (PR #568), its non-NPU link stub, runtime-K and runtime-M/K NPU programs, K-quant/IQ block-float weight encoder and check tool, two-bank NPU prefill | `MIT` | `2e499c39e4cd2d9250da2f44f529435f04995c84` (fork-enhancements); see [tools/npu/PROVENANCE.md](tools/npu/PROVENANCE.md) | [gufo fork](https://github.com/mikealanni/gufo/tree/2e499c39e4cd2d9250da2f44f529435f04995c84) |
+| mlir-aie | NPU microkernel (`mm_bfp_mixed.cc`) and placed AIE design (`n32_core_placed.py`) under `tools/npu`, and the prebuilt XCLBIN and instruction-stream files generated from them | `Apache-2.0 WITH LLVM-exception` | Copied from mikealanni/gufo `2e499c39`; upstream mlir-aie revision not recorded | [Xilinx/mlir-aie](https://github.com/Xilinx/mlir-aie) |
 | Qwen chat templates | Reference Jinja and adapted renderer behavior | `Apache-2.0` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` (27B), `de4b8e4d43b917e7706784d8bb445c9af86a3540` (Flash-Next) | [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) |
 | DS4 | Adapted loader, tokenizer, sessions and HIP kernels | `MIT` | `84cc882352757baf628a1776badf7cc54d584e28` | [antirez/ds4](https://github.com/antirez/ds4) |
 | DS4 GB10/GX10 fork | Adapted paired MoE launch code, now HIP | `MIT` | `910501e` | [xangel82/DS4](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA) |
@@ -50,6 +52,21 @@ This software is based in part on the work of the Independent JPEG Group.
 
 The mikealanni/gufo fork retains the same Copyright (c) 2026 gufo contributors
 notice and MIT text as Gufo's root `LICENSE`.
+
+The NPU sources under `tools/npu` carry `Copyright (C) 2026, Advanced Micro
+Devices, Inc.` and `SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception`;
+the license text is in [licenses/mlir-aie.txt](licenses/mlir-aie.txt). The
+runtime-K and runtime-M/K copies note Mike Alani's modifications in their
+headers. The following prebuilt NPU programs are distributed as binaries,
+built by Mike Alani with mlir-aie and Peano from those sources; they have not
+been rebuilt in this tree (rebuild notes and every instruction-stream hash are
+in [tools/npu/PROVENANCE.md](tools/npu/PROVENANCE.md)):
+
+| File | Program | SHA-256 | Fork commit |
+| --- | --- | --- | --- |
+| `tools/npu/final_4096x2560x1024_128x64x128.xclbin` | fixed M = 4096, K = 2560 | `d31ceb12b0b62dcbb2e32d1ae73f2125b3fe15871b8570a1c89372f3c3fb410e` | `736a9f4c`, upstream PR #568 |
+| `tools/npu/runtime_k/final_4096xKx1024_128x64x128.xclbin` | runtime K, M = 4096 | `d229c66ab90641bd78a72c7e25711323dbe40053e38b8f73c0d48d2c48140b13` | `23c2d158` |
+| `tools/npu/runtime_mk/final_4096xKx1024_128x64x128.xclbin` | runtime M and K | `f25931ff8851fd78aca963934b60a5d600dabc4b3350aa239f094f0caadabae0` | `ccfb7747` |
 
 FFmpeg is invoked as a separate process, not linked into Gufo. The pinned Nix
 build enables GPL/version3 components; a system FFmpeg build can have different

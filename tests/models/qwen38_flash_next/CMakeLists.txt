@@ -16,6 +16,9 @@ add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
+add_qwen38_flash_next_test(npu_plan gufo_core "cpu")
+target_compile_definitions(qwen38_flash_next_npu_plan_test PRIVATE
+  GUFO_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
 target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
@@ -24,8 +27,8 @@ set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2"
 
 if (ENGINE_ENABLE_HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
-      attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
-      select_ops)
+      attention_ops moe_epilogue_ops moe_ids_ops npu_encode_ops projection_ops
+      routed_wmma_ops select_ops)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
 
@@ -58,6 +61,17 @@ if (ENGINE_ENABLE_HIP)
     dense_gemm_bench.cpp)
   target_link_libraries(qwen38_flash_next_dense_gemm_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
+
+  if (GUFO_ENABLE_NPU)
+    # Drives the NPU: built only on request, run only in an NPU round.
+    add_executable(qwen38_flash_next_npu_quant_check EXCLUDE_FROM_ALL
+      npu_quant_check.hip.cpp)
+    set_source_files_properties(npu_quant_check.hip.cpp PROPERTIES LANGUAGE HIP)
+    target_compile_definitions(qwen38_flash_next_npu_quant_check PRIVATE
+      ENGINE_ENABLE_HIP=1)
+    target_link_libraries(qwen38_flash_next_npu_quant_check PRIVATE
+      gufo_qwen38_flash_next hip::host)
+  endif()
 
   add_executable(qwen38_flash_next_attn_bench EXCLUDE_FROM_ALL attn_bench.cpp)
   target_link_libraries(qwen38_flash_next_attn_bench PRIVATE

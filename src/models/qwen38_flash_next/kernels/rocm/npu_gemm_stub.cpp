@@ -69,8 +69,21 @@ void* NpuGemm::Device(int /*id*/) const {
 void NpuGemm::FinalizeWeights(int /*id*/) {}
 
 bool NpuGemm::Submit(hipStream_t /*stream*/, int /*a_id*/, const int* /*b_ids*/,
-                     const int* /*c_ids*/, int /*count*/) {
+                     const int* /*c_ids*/, int /*count*/, int /*program*/) {
   return false;
+}
+
+int NpuGemm::AddProgram(const std::string& /*insts*/, std::string* error) {
+  if (error != nullptr) {
+    *error = "NPU support was not compiled into this build";
+  }
+  return -1;
+}
+std::size_t NpuGemm::ABytes(std::uint32_t /*k*/) const noexcept {
+  return 0;
+}
+std::size_t NpuGemm::BBytes(std::uint32_t /*k*/) const noexcept {
+  return 0;
 }
 
 void* NpuGemm::Staged(hipStream_t /*stream*/, int /*id*/) {

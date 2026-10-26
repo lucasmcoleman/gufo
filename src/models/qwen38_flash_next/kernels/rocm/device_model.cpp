@@ -11,6 +11,7 @@
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#include "src/models/qwen38_flash_next/npu_plan.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -359,13 +360,29 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   std::unique_ptr<NpuGemm> early_npu;
   if (const char* dir = std::getenv("GUFO_NPU_DIR");
       dir != nullptr && dir[0] != '\0') {
-    NpuGemm::Config cfg;
-    cfg.xclbin = std::string(dir) + "/final_4096x2560x1024_128x64x128.xclbin";
-    cfg.insts = std::string(dir) + "/insts_4096x2560x1024_128x64x128.txt";
-    std::string npu_error;
-    early_npu = NpuGemm::Create(cfg, &npu_error);
-    if (early_npu == nullptr) {
-      std::fprintf(stderr, "NPU off: %s\n", npu_error.c_str());
+    // GUFO_NPU_PROGRAM=runtime_k (or runtime_mk) loads the reusable runtime
+    // program from that subdirectory instead of the fixed 4096 x 2560 one.
+    const char* program_env = std::getenv("GUFO_NPU_PROGRAM");
+    const auto program = ParseNpuProgram(program_env);
+    const auto files =
+        program ? NpuProgramPaths(dir, *program, 4096, 2560) : std::nullopt;
+    if (!files) {
+      std::fprintf(stderr,
+                   "NPU off: GUFO_NPU_PROGRAM=%s is not fixed, runtime_k or "
+                   "runtime_mk\n",
+                   program_env);
+    } else {
+      NpuGemm::Config cfg;
+      cfg.xclbin = files->xclbin;
+      cfg.insts = files->insts;
+      std::string npu_error;
+      early_npu = NpuGemm::Create(cfg, &npu_error);
+      if (early_npu == nullptr) {
+        std::fprintf(stderr, "NPU off: %s\n", npu_error.c_str());
+      } else if (*program != NpuProgram::kFixed) {
+        std::fprintf(stderr, "NPU: program %s with %s\n", cfg.xclbin.c_str(),
+                     cfg.insts.c_str());
+      }
     }
   }
 #endif
