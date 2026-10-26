@@ -529,7 +529,9 @@ KvCache::KvCache(KvCache&& other) noexcept
       head_dim_(other.head_dim_),
       capacity_(other.capacity_),
       window_(other.window_),
-      committed_(other.committed_) {
+      committed_(other.committed_),
+      retained_begin_(other.retained_begin_),
+      valid_(other.valid_) {
   other.k_ = nullptr;
   other.v_ = nullptr;
   other.capacity_ = 0;
@@ -545,6 +547,8 @@ KvCache& KvCache::operator=(KvCache&& other) noexcept {
     capacity_ = other.capacity_;
     window_ = other.window_;
     committed_ = other.committed_;
+    retained_begin_ = other.retained_begin_;
+    valid_ = other.valid_;
     other.k_ = nullptr;
     other.v_ = nullptr;
     other.capacity_ = 0;
@@ -662,13 +666,18 @@ bool AttnOps::Reserve(Scratch* buffer, std::size_t bytes,
 
 bool AttnOps::Emit(const char* name, const float* device, std::size_t count,
                    std::string* error_msg) {
-  if (!tap_) {
-    return true;
+  if (tap_) {
+    if (!CheckHip(hipStreamSynchronize(stream_), "tap synchronize",
+                  error_msg)) {
+      return false;
+    }
+    tap_(name, device, count);
   }
-  if (!CheckHip(hipStreamSynchronize(stream_), "tap synchronize", error_msg)) {
+  if (!fail_after_.empty() && fail_after_ == name) {
+    Assign(error_msg,
+           std::string("laguna attention: injected failure after ") + name);
     return false;
   }
-  tap_(name, device, count);
   return true;
 }
 
@@ -714,8 +723,27 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
       w.q.cols != w.hidden || w.k.cols != w.hidden || w.v.cols != w.hidden ||
       w.o.cols != w.heads * kHeadDim || w.o.rows != w.hidden ||
       w.rope.rotary_dim == 0 || w.rope.rotary_dim % 2 != 0 ||
-      w.rope.rotary_dim > kHeadDim || cache.k_ == nullptr) {
+      w.rope.rotary_dim > kHeadDim || cache.k_ == nullptr ||
+      cache.v_ == nullptr || w.hidden == 0) {
     Assign(error_msg, "laguna attention: inconsistent weights or cache");
+    return false;
+  }
+  // Preflight everything a later stage would check: once the K/V append is
+  // enqueued, a failure can no longer leave the cache untouched.
+  for (const DeviceMatrix* m : {&w.q, &w.k, &w.v, &w.o}) {
+    if (m->type != GgmlType::kQ6_K || m->experts != 1 || m->data == nullptr) {
+      Assign(error_msg, "laguna attention projection needs a Q6_K matrix");
+      return false;
+    }
+  }
+  if (n == nullptr || out == nullptr || w.gate == nullptr ||
+      w.q_norm == nullptr || w.k_norm == nullptr) {
+    Assign(error_msg, "laguna attention: null input, output or tensor");
+    return false;
+  }
+  if (!cache.valid_) {
+    Assign(error_msg,
+           "laguna attention: cache invalidated by a failed call; Reset() it");
     return false;
   }
   const std::uint32_t group = w.heads / w.kv_heads;
@@ -724,7 +752,8 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
     Assign(error_msg, "laguna attention: unsupported GQA group");
     return false;
   }
-  if (start_pos > cache.committed_) {
+  if (start_pos > cache.committed_ ||
+      std::uint64_t{start_pos} + tokens > UINT32_MAX) {
     Assign(error_msg, "laguna attention: start_pos beyond the cached rows");
     return false;
   }
@@ -741,6 +770,18 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
       Assign(error_msg, "laguna attention: chunk or rewind exceeds the ring");
       return false;
     }
+  }
+  // Keys before start_pos that the rows read: [first_key, start_pos). They
+  // must still be in their slots; a rewind cannot bring back evicted ones.
+  const std::uint32_t first_key =
+      cache.window_ != 0 && start_pos + 1 > cache.window_
+          ? start_pos + 1 - cache.window_
+          : 0;
+  if (start_pos > 0 && first_key < cache.retained_begin_) {
+    Assign(
+        error_msg,
+        "laguna attention: keys the call needs were overwritten in the ring");
+    return false;
   }
   const std::size_t q_dim = std::size_t{w.heads} * kHeadDim;
   const std::size_t kv_dim = std::size_t{w.kv_heads} * kHeadDim;
@@ -784,6 +825,14 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
   const RopeArgs rope{w.rope.rotary_dim, w.rope.theta_scale, w.rope.corr_low,
                       w.rope.corr_high,  w.rope.freq_scale,  w.rope.ext_factor,
                       w.rope.mscale};
+  // From here on the call's K/V rows may be in the cache: any failure
+  // invalidates it, since its slots no longer match committed().
+  const auto invalidate = [&cache] {
+    cache.valid_ = false;
+    cache.committed_ = 0;
+    cache.retained_begin_ = 0;
+    return false;
+  };
   QkNormRopeAppendKernel<<<dim3(tokens, w.heads + 2 * w.kv_heads), kHeadDim, 0,
                            stream_>>>(
       q, k, v, w.q_norm, w.k_norm, static_cast<__half*>(cache.k_),
@@ -791,7 +840,7 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
       cache.capacity_, rope);
   if (!CheckHip(hipGetLastError(), "qk norm rope launch", error_msg) ||
       !Emit("q_rope", q, tokens * q_dim, error_msg)) {
-    return false;
+    return invalidate();
   }
   const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
   if (!DispatchAttention(group, q, static_cast<const __half*>(cache.k_),
@@ -800,22 +849,31 @@ bool AttnOps::Forward(const AttnWeights& w, KvCache& cache, const float* n,
                          cache.capacity_, scale, stream_) ||
       !CheckHip(hipGetLastError(), "attention launch", error_msg) ||
       !Emit("attn", attn, tokens * q_dim, error_msg)) {
-    return false;
+    return invalidate();
   }
   GateKernel<<<std::size_t{tokens} * w.heads, kHeadDim, 0, stream_>>>(gate,
                                                                       attn);
   if (!CheckHip(hipGetLastError(), "gate activation launch", error_msg) ||
       !Emit("gate_act", gate, std::size_t{tokens} * w.heads, error_msg) ||
       !Emit("gated", attn, tokens * q_dim, error_msg)) {
-    return false;
+    return invalidate();
   }
   // Project the gated rows. The rows were produced in float, so they are
   // quantized exactly as the oracle quantizes them.
   if (!Project(w.o, attn, out, tokens, vector, error_msg) ||
       !Emit("o", out, std::size_t{tokens} * w.hidden, error_msg)) {
-    return false;
+    return invalidate();
   }
-  cache.committed_ = start_pos + tokens;
+  // Writing [start_pos, end) evicted every position below end - capacity. A
+  // call below retained_begin (only a start at 0, which needs no history)
+  // keeps only its own rows.
+  const std::uint32_t end = start_pos + tokens;
+  std::uint32_t retained = std::min(cache.retained_begin_, start_pos);
+  if (end > cache.capacity_) {
+    retained = std::max(retained, end - cache.capacity_);
+  }
+  cache.retained_begin_ = retained;
+  cache.committed_ = end;
   return true;
 }
 

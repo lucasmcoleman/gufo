@@ -21,6 +21,17 @@
 // p % capacity, and a chunk of at most max_chunk rows is appended before it is
 // attended, which cannot overwrite a key the chunk's first row still sees.
 //
+// The cache tracks the history it physically retains separately from its
+// logical end: committed() is where the next call may continue, and
+// retained_begin() the earliest position whose slot still holds that
+// position's K/V. Writing position p evicts p - capacity, and a rewind (a call
+// below committed()) lowers the end but cannot restore evicted slots, so a
+// call is accepted only when every key its rows read before start_pos lies in
+// [retained_begin(), committed()). Every argument is validated before any work
+// is enqueued; a failure after the call's K/V append was enqueued marks the
+// cache invalid (committed() 0, valid() false) and it rejects every call until
+// Reset().
+//
 // The attention kernel is row independent: row p sums its keys in an order
 // fixed by p alone, so a row's result does not depend on how the sequence was
 // split into chunks. The projections do depend on the Path (see ffn.hpp): the
@@ -134,6 +145,23 @@ public:
   [[nodiscard]] std::uint32_t head_dim() const noexcept { return head_dim_; }
   /// Positions appended so far (the next call's start_pos at most).
   [[nodiscard]] std::uint32_t committed() const noexcept { return committed_; }
+  /// Earliest position whose K/V is still in its slot for the current
+  /// history: [retained_begin(), committed()) is physically present. Always 0
+  /// on a full layer.
+  [[nodiscard]] std::uint32_t retained_begin() const noexcept {
+    return retained_begin_;
+  }
+  /// False after a call failed once it may have written K/V; every Forward is
+  /// then rejected until Reset().
+  [[nodiscard]] bool valid() const noexcept { return valid_; }
+  /// Empties the cache (committed 0, valid). Host state only: the device
+  /// buffers are kept and overwritten by later calls, so in-flight work on
+  /// them may continue.
+  void Reset() noexcept {
+    committed_ = 0;
+    retained_begin_ = 0;
+    valid_ = true;
+  }
   /// Slot of position `p`.
   [[nodiscard]] std::uint32_t Slot(std::uint32_t p) const noexcept {
     return p % capacity_;
@@ -153,6 +181,8 @@ private:
   std::uint32_t capacity_{0};
   std::uint32_t window_{0};
   std::uint32_t committed_{0};
+  std::uint32_t retained_begin_{0};
+  bool valid_{true};
 };
 
 /// Device allocation seam (tests inject failures here); defaults to
@@ -179,10 +209,13 @@ public:
   /// out[t][hidden] = attention block of n[t][hidden] at position
   /// start_pos + t, appending the rows' K/V to `cache`. start_pos may not
   /// exceed cache.committed() (a smaller value rewinds and overwrites; on a
-  /// ring it may rewind by at most capacity - window). Fails without touching
-  /// the cache on a bad argument. Rows per call: at most 32 on Path::kVector;
-  /// at most capacity - window on a ring; start_pos + tokens <= capacity on a
-  /// full layer.
+  /// ring it may rewind by at most capacity - window, and only while the keys
+  /// [start_pos - window + 1, start_pos) are still retained, see
+  /// KvCache::retained_begin()). Fails without touching the cache on a bad
+  /// argument, including an invalid cache; a failure after the K/V append was
+  /// enqueued invalidates the cache (see KvCache::valid()). Rows per call: at
+  /// most 32 on Path::kVector; at most capacity - window on a ring;
+  /// start_pos + tokens <= capacity on a full layer.
   [[nodiscard]] bool Forward(const AttnWeights& w, KvCache& cache,
                              const float* n, float* out, std::uint32_t tokens,
                              std::uint32_t start_pos, Path path = Path::kAuto,
@@ -198,6 +231,11 @@ public:
   using TapFn = std::function<void(std::string_view name, const float* device,
                                    std::size_t count)>;
   void SetTap(TapFn tap) { tap_ = std::move(tap); }
+
+  /// Test hook: Forward fails right after emitting stage `stage` (one of the
+  /// tap stage names; empty disables), whether or not a tap is set. Used to
+  /// exercise failures after the K/V append.
+  void SetFailAfterStage(std::string stage) { fail_after_ = std::move(stage); }
 
 private:
   /// One device scratch buffer; grows by allocate-then-swap.
@@ -215,6 +253,7 @@ private:
   hipStream_t stream_;
   DeviceAllocator allocator_;
   TapFn tap_;
+  std::string fail_after_;
   bool initialized_{false};
   Scratch q_, k_, v_, gate_, attn_, ids_;
 };

@@ -584,6 +584,295 @@ void TestArguments() {
   ++g_cases;
 }
 
+// ---- retained history and failed calls
+// ----------------------------------------------------------
+//
+// The scenarios of review #972 (codexms, ring_state.py at e1e8f90e) on the
+// kOddShape sliding layer: window 37, ring 37 + 16 = 53, so after 100 rows the
+// ring holds positions 47..99.
+
+/// One sequence on one cache, driven call by call.
+struct Sequence {
+  Sequence(Fixture& fx_in, std::uint32_t il_in, std::uint32_t rows,
+           std::uint32_t context)
+      : fx(fx_in), il(il_in), H(fx_in.tiny.config().hidden_size) {
+    n = TinyRows(rows, H, fx.tiny.rng());
+    dn = ToDevice(n);
+    CheckHip(hipMalloc(&dout, rows * H * sizeof(float)), "alloc out");
+    std::string error;
+    auto made = gpu::KvCache::Create(fx.tiny.config(), il, context, 16, &error);
+    Require(made.has_value(), error);
+    cache = std::move(*made);
+  }
+  ~Sequence() {
+    (void)hipStreamSynchronize(fx.ctx.stream());
+    (void)hipFree(dn);
+    (void)hipFree(dout);
+  }
+  Sequence(const Sequence&) = delete;
+  Sequence& operator=(const Sequence&) = delete;
+
+  bool Run(std::uint32_t rows, std::uint32_t start,
+           const gpu::AttnWeights* weights = nullptr) {
+    const gpu::AttnWeights& w = weights ? *weights : fx.dev[il].weights();
+    error.clear();
+    const bool ok =
+        fx.ctx.ops().Forward(w, cache, dn + start * H, dout + start * H, rows,
+                             start, gpu::Path::kBatched, &error);
+    CheckHip(hipStreamSynchronize(fx.ctx.stream()), "sync");
+    return ok;
+  }
+  void Accept(std::uint32_t rows, std::uint32_t start,
+              const std::string& what) {
+    const bool ok = Run(rows, start);
+    Require(ok, what + ": rejected: " + error);
+  }
+  std::vector<float> Rows(std::uint32_t first, std::uint32_t rows) {
+    return ToHost(dout + first * H, rows * H);
+  }
+  /// Raw F16 bits of the first `slots` slots of keys then values.
+  std::vector<std::uint16_t> Kv(std::uint32_t slots) const {
+    const std::size_t row = std::size_t{cache.kv_heads()} * cache.head_dim();
+    std::vector<std::uint16_t> bits(2 * slots * row);
+    CheckHip(hipMemcpy(bits.data(), cache.keys(), slots * row * 2,
+                       hipMemcpyDeviceToHost),
+             "copy keys");
+    CheckHip(hipMemcpy(bits.data() + slots * row, cache.values(),
+                       slots * row * 2, hipMemcpyDeviceToHost),
+             "copy values");
+    return bits;
+  }
+  /// Slots whose K or V bits differ between two Kv() snapshots.
+  std::set<std::uint32_t> ChangedSlots(const std::vector<std::uint16_t>& a,
+                                       const std::vector<std::uint16_t>& b,
+                                       std::uint32_t slots) const {
+    const std::size_t row = std::size_t{cache.kv_heads()} * cache.head_dim();
+    std::set<std::uint32_t> changed;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i] != b[i]) {
+        changed.insert(static_cast<std::uint32_t>((i / row) % slots));
+      }
+    }
+    return changed;
+  }
+  void Prefill100() {
+    for (std::uint32_t pos = 0; pos < 100; pos += 10) {
+      Accept(10, pos, "prefill chunk at " + std::to_string(pos));
+    }
+  }
+
+  Fixture& fx;
+  std::uint32_t il;
+  std::size_t H;
+  std::vector<float> n;
+  float* dn{nullptr};
+  float* dout{nullptr};
+  gpu::KvCache cache;
+  std::string error;
+};
+
+/// A rejected call must leave committed, retained history and K/V bits alone.
+void RequireRejectedUntouched(Sequence& s, std::uint32_t rows,
+                              std::uint32_t start, const std::string& what,
+                              const gpu::AttnWeights* weights = nullptr) {
+  const std::uint32_t committed = s.cache.committed();
+  const std::uint32_t retained = s.cache.retained_begin();
+  const bool valid = s.cache.valid();
+  const auto kv = s.Kv(s.cache.capacity());
+  Require(!s.Run(rows, start, weights), "accepted: " + what);
+  Require(s.cache.committed() == committed &&
+              s.cache.retained_begin() == retained && s.cache.valid() == valid,
+          "rejected call changed the cache state: " + what);
+  Require(s.Kv(s.cache.capacity()) == kv,
+          "rejected call changed K/V bits: " + what);
+}
+
+/// Rewinds on a wrapped ring: accepted only while the whole window before
+/// start_pos is still retained; accepted rewinds reproduce the fresh rows.
+void TestRingRewindRetention() {
+  std::cout << "ring rewind needs retained history (window 37, ring 53)\n";
+  Fixture fx(kOddShape, 7700);
+  Sequence s(fx, 1, 100, 100);
+  Require(s.cache.capacity() == 53, "ring capacity is window + chunk");
+  s.Prefill100();
+  const auto fresh = s.Rows(0, 100);
+  const auto fresh_kv = s.Kv(53);
+  Require(s.cache.committed() == 100 && s.cache.retained_begin() == 47,
+          "after 100 rows the ring holds 47..99");
+  // Review scenario 1: 1@84 then 1@69. The second needs keys 33..69; 33..46
+  // were overwritten by 86..99.
+  s.Accept(1, 84, "1@84 (needs 48..84, retained)");
+  Require(
+      BitIdentical(s.Rows(84, 1), std::vector<float>(fresh.begin() + 84 * s.H,
+                                                     fresh.begin() + 85 * s.H)),
+      "rewound row 84 differs from the fresh row");
+  Require(s.cache.committed() == 85 && s.cache.retained_begin() == 47,
+          "a rewind keeps the retained start (cannot restore slots)");
+  RequireRejectedUntouched(s, 1, 69, "review scenario 1: 1@69 after 1@84");
+  // The exact edge: 1@83 needs 47..83 (accepted), 1@82 needs 46 (gone).
+  s.Accept(1, 83, "1@83 (needs exactly 47..83)");
+  Require(
+      BitIdentical(s.Rows(83, 1), std::vector<float>(fresh.begin() + 83 * s.H,
+                                                     fresh.begin() + 84 * s.H)),
+      "rewound row 83 differs from the fresh row");
+  RequireRejectedUntouched(s, 1, 82, "1@82 needs evicted key 46");
+  RequireRejectedUntouched(s, 10, 70, "10@70 needs evicted keys 34..46");
+  // Continue from the rewound end: rows and the whole ring match the fresh
+  // run bit for bit.
+  s.Accept(16, 84, "16@84 replays 84..99");
+  Require(
+      BitIdentical(s.Rows(84, 16),
+                   std::vector<float>(fresh.begin() + 84 * s.H, fresh.end())),
+      "replayed rows 84..99 differ from the fresh rows");
+  Require(s.Kv(53) == fresh_kv, "replayed ring K/V differs from the fresh run");
+  Require(s.cache.committed() == 100 && s.cache.retained_begin() == 47,
+          "state after the replay");
+  // A restart at 0 is a rewind beyond the ring slack; Reset() starts over.
+  RequireRejectedUntouched(s, 10, 0, "restart at 0 without Reset");
+  s.cache.Reset();
+  Require(s.cache.committed() == 0 && s.cache.retained_begin() == 0,
+          "state after Reset");
+  s.Prefill100();
+  Require(BitIdentical(s.Rows(0, 100), fresh), "re-prefill after Reset");
+  Require(s.Kv(53) == fresh_kv, "re-prefill K/V after Reset");
+  std::cout << "  1@84 then 1@69 rejected; 1@83 accepted, 1@82 rejected; "
+               "replays bit-identical\n";
+  ++g_cases;
+}
+
+/// Failed calls: argument failures (including a bad Wo type, now preflighted)
+/// change nothing; failures after the K/V append invalidate the cache until
+/// Reset(), after which it works normally.
+void TestFailedCallState() {
+  std::cout << "failed calls leave a usable or an invalid cache\n";
+  const std::vector<std::string> stages = {"q_proj",    "k_proj", "v_proj",
+                                           "gate_proj", "q_rope", "attn",
+                                           "gate_act",  "gated",  "o"};
+  const std::set<std::string> after_append = {"q_rope", "attn", "gate_act",
+                                              "gated", "o"};
+  for (std::uint32_t il = 0; il < 2; ++il) {
+    Fixture fx(kOddShape, 7800 + il);
+    // Full layer: context 120 holds every position; sliding: ring 53.
+    Sequence s(fx, il, 116, 120);
+    const std::uint32_t slots = s.cache.capacity();
+    const std::string layer = il == 0 ? "full: " : "swa: ";
+    // The fresh reference of rows 0..115.
+    s.Prefill100();
+    s.Accept(16, 100, layer + "16@100");
+    const auto fresh = s.Rows(0, 116);
+    const auto row_of = [&](std::uint32_t p) {
+      return std::vector<float>(fresh.begin() + p * s.H,
+                                fresh.begin() + (p + 1) * s.H);
+    };
+    const auto fresh_kv_116 = s.Kv(slots);
+    s.cache.Reset();
+    s.Prefill100();
+    const auto kv100 = s.Kv(slots);
+    // 1. Argument failures, all caught before any work is queued.
+    gpu::AttnWeights bad = fx.dev[il].weights();
+    bad.o.type = gufo::core::GgmlType::kQ8_0;
+    RequireRejectedUntouched(s, 16, 100, layer + "Wo of the wrong type", &bad);
+    bad = fx.dev[il].weights();
+    bad.q.type = gufo::core::GgmlType::kQ8_0;
+    RequireRejectedUntouched(s, 16, 100, layer + "Wq of the wrong type", &bad);
+    bad = fx.dev[il].weights();
+    bad.gate = nullptr;
+    RequireRejectedUntouched(s, 16, 100, layer + "null gate", &bad);
+    Require(s.Kv(slots) == kv100, layer + "argument failures changed K/V");
+    // Keys 48..84 are intact, so 1@84 is a valid rewind here.
+    s.Accept(1, 84, layer + "1@84 after preflight failures");
+    Require(BitIdentical(s.Rows(84, 1), row_of(84)),
+            layer + "1@84 after preflight failures differs");
+    // 2. A failure after each stage of 16@100.
+    for (const auto& stage : stages) {
+      s.cache.Reset();
+      s.Prefill100();
+      Require(s.Kv(slots) == kv100, layer + "prefill is not reproducible");
+      fx.ctx.ops().SetFailAfterStage(stage);
+      const bool ok = s.Run(16, 100);
+      fx.ctx.ops().SetFailAfterStage({});
+      Require(!ok, layer + "injected failure after " + stage + " ignored");
+      Require(s.error.find("injected failure") != std::string::npos,
+              layer + "unexpected error text: " + s.error);
+      const auto kv = s.Kv(slots);
+      if (after_append.count(stage) == 0) {
+        Require(s.cache.valid() && s.cache.committed() == 100 && kv == kv100,
+                layer + "failure before the append changed the cache (" +
+                    stage + ")");
+        s.Accept(1, 84, layer + "1@84 after a pre-append failure");
+        Require(BitIdentical(s.Rows(84, 1), row_of(84)),
+                layer + "1@84 after a pre-append failure differs");
+        continue;
+      }
+      // The append ran: only the slots of 100..115 changed (on the ring they
+      // held 47..62, so all of them changed; a full layer rewrites the bits
+      // the reference run left there), and the cache claims no history.
+      std::set<std::uint32_t> want;
+      for (std::uint32_t p = 100; p < 116; ++p) {
+        want.insert(s.cache.Slot(p));
+      }
+      const auto changed = s.ChangedSlots(kv100, kv, slots);
+      Require(std::includes(want.begin(), want.end(), changed.begin(),
+                            changed.end()) &&
+                  (il == 0 || changed == want),
+              layer + "post-append failure changed the wrong slots (" + stage +
+                  ")");
+      Require(
+          !s.cache.valid() && s.cache.committed() == 0 &&
+              s.cache.retained_begin() == 0,
+          layer + "post-append failure left the cache valid (" + stage + ")");
+      // Review scenario 2 (1@84 after a failed 16@100), and every other call,
+      // is rejected until Reset().
+      RequireRejectedUntouched(s, 1, 84,
+                               layer +
+                                   "review scenario 2: 1@84 after a "
+                                   "failed 16@100 (" +
+                                   stage + ")");
+      RequireRejectedUntouched(s, 1, 0, layer + "1@0 on an invalid cache");
+      s.cache.Reset();
+      Require(s.cache.valid() && s.cache.committed() == 0, "Reset state");
+      s.Prefill100();
+      s.Accept(16, 100, layer + "16@100 after Reset");
+      Require(BitIdentical(s.Rows(0, 116), fresh),
+              layer + "rows after Reset differ from the fresh run");
+      Require(s.Kv(slots) == fresh_kv_116,
+              layer + "K/V after Reset differs from the fresh run");
+    }
+    // 3. Full layers keep all history: any rewind is valid and reproduces the
+    // fresh rows.
+    if (il == 0) {
+      s.cache.Reset();
+      s.Prefill100();
+      s.Accept(1, 50, "full: 1@50");
+      s.Accept(1, 10, "full: 1@10");
+      Require(s.cache.retained_begin() == 0, "full layer evicted history");
+      Require(BitIdentical(s.Rows(10, 1), row_of(10)) &&
+                  BitIdentical(s.Rows(50, 1), row_of(50)),
+              "full: rewound rows differ");
+      s.Accept(16, 11, "full: 16@11");
+      for (std::uint32_t pos = 27; pos < 116; pos += 16) {
+        s.Accept(std::min<std::uint32_t>(16, 116 - pos), pos,
+                 "full: replay at " + std::to_string(pos));
+      }
+      Require(BitIdentical(s.Rows(0, 116), fresh), "full: replayed rows");
+      const auto replay_kv = s.Kv(slots);
+      const std::size_t row = std::size_t{s.cache.kv_heads()} * 128;
+      for (int half = 0; half < 2; ++half) {
+        const std::size_t off = half * std::size_t{slots} * row;
+        Require(std::equal(replay_kv.begin() + off,
+                           replay_kv.begin() + off + 116 * row,
+                           fresh_kv_116.begin() + off),
+                "full: replayed K/V differs from the fresh run");
+      }
+      RequireRejectedUntouched(s, 5, 116, "full: rows past the context");
+    }
+  }
+  std::cout << "  preflight failures change nothing; post-append failures "
+               "invalidate until Reset (1@84 rejected); Reset reproduces the "
+               "fresh run\n";
+  ++g_cases;
+}
+
 }  // namespace
 
 int main() {
@@ -596,6 +885,8 @@ int main() {
     TestConcurrent();
     TestAllocationFailure();
     TestArguments();
+    TestRingRewindRetention();
+    TestFailedCallState();
     std::cout << "SUMMARY " << g_cases << " attention operator cases passed\n";
     for (const auto& [name, g] : g_groups) {
       PrintGroup(name, g);
