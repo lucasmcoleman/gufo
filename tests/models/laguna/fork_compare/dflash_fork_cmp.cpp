@@ -124,9 +124,11 @@ int main(int argc, char** argv) {
     return 1;
   }
   llama_context_params cp = llama_context_default_params();
-  cp.n_ctx = 1024;
-  cp.n_batch = 512;
-  cp.n_ubatch = 512;
+  // The encoder needs n_ubatch >= the context rows, so size for long prompts.
+  const uint32_t rows = static_cast<uint32_t>(std::max(512, n_ctx_rows));
+  cp.n_ctx = rows * 2 + 64;
+  cp.n_batch = rows;
+  cp.n_ubatch = rows;
   cp.n_seq_max = 1;
   llama_context* ctx_tgt = llama_init_from_model(tgt, cp);
   if (!ctx_tgt) {
@@ -135,6 +137,20 @@ int main(int argc, char** argv) {
   }
   llama_context_params dp = cp;
   dp.ctx_other = ctx_tgt;
+  // Drafter attention knobs, to attribute a divergence: FORK_FA=on|off|auto and
+  // FORK_KV=f16|f32 (K and V cache type; f32 needs FORK_FA=off).
+  if (const char* fa = std::getenv("FORK_FA")) {
+    const std::string v = fa;
+    dp.flash_attn_type = v == "off"  ? LLAMA_FLASH_ATTN_TYPE_DISABLED
+                         : v == "on" ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+                                     : LLAMA_FLASH_ATTN_TYPE_AUTO;
+  }
+  if (const char* kv = std::getenv("FORK_KV")) {
+    const ggml_type t =
+        std::string(kv) == "f32" ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    dp.type_k = t;
+    dp.type_v = t;
+  }
   if (argc == 5) {
     dp.cb_eval = OnTensor;
     dp.cb_eval_user_data = &tap_diff;
@@ -159,6 +175,19 @@ int main(int argc, char** argv) {
   const float* fused = llama_get_embeddings_nextn(ctx);
   std::vector<float> fused_copy(
       fused, fused + static_cast<size_t>(n_ctx_rows) * n_dec);
+
+  // FORK_INJECT=oracle: inject the oracle's encoder output (enc_norm_out.f32
+  // from the taps directory) instead of the fork's own, to separate the
+  // encoder's 1e-6 difference from the K/V injection and attention.
+  if (const char* inj_src = std::getenv("FORK_INJECT");
+      inj_src != nullptr && std::string(inj_src) == "oracle" && argc == 5) {
+    const std::vector<float> o = ReadF32(tap_diff.dir + "/enc_norm_out.f32");
+    if (o.size() != fused_copy.size()) {
+      std::fprintf(stderr, "enc_norm_out.f32 size mismatch\n");
+      return 1;
+    }
+    fused_copy = o;
+  }
 
   // Inject at positions 0..n_ctx-1.
   llama_batch inj = llama_batch_init(n_ctx_rows, n_dec, 1);
@@ -206,10 +235,15 @@ int main(int argc, char** argv) {
       den += double(ol[v]) * ol[v];
     }
     const double rel = std::sqrt(num / std::max(den, 1e-30));
+    // Margin of the oracle's top-1 over the logit the fork picked, to tell a
+    // near-tie from a real disagreement.
+    const double gap = double(ol[oa]) - ol[fa];
     worst_rel = std::max(worst_rel, rel);
     agree += fa == oa;
-    std::printf("row %2d: fork top1 %6d oracle top1 %6d %s rel-rms %.3e\n", r,
-                fa, oa, fa == oa ? "same" : "DIFF", rel);
+    std::printf(
+        "row %2d: fork top1 %6d oracle top1 %6d %s rel-rms %.3e "
+        "oracle-gap %.3f\n",
+        r, fa, oa, fa == oa ? "same" : "DIFF", rel, gap);
   }
   std::printf("RESULT top-1 agreement %d/%d, worst row rel-rms %.3e\n", agree,
               block - 1, worst_rel);

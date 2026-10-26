@@ -355,7 +355,27 @@ say the drafter can pay.
   quantized projections then amplify to 1 to 5 percent on the draft logits.
   Top-1 of the 15 drafts agrees at 14 of 15 positions (position 14: fork 350,
   oracle 81; not examined further). Not yet explained: the 3e-4
-  attention difference (not the F16 Q conversion; flash-attention
-  accumulation in the fork is the suspect). One prompt only, so this confirms
-  the graph (tap convention, per-tap norm, K/V injection, mask, gate) and
-  not the acceptance rate.
+  attention difference.
+- Cause of the 3e-4 (2026-10-26, CPU only): the fork's CPU flash-attention
+  kernel (`ggml_compute_forward_flash_attn_ext_f16`, ops.cpp) keeps the V
+  accumulator in F16 (`VKQ16`, rounded after every rescale and every key); the
+  oracle accumulated in F32. The fork's GPU kernels accumulate in F32, so the
+  target oracle's F32 attention is the right default for gufo and the
+  F16 accumulator is only a comparison mode (`Options::fa_f16_accumulator`,
+  `GUFO_LAGUNA_DFLASH_FA16ACC=1` in the smoke test). Evidence (8-token prompt,
+  layer-0 `attn_gated`, oracle in CPU activation-quant mode with F16 K/V):
+  fork flash-attn on 3.3e-4; fork `-fa off`, F16 cache 1.4e-4; F32 cache 2.3e-4
+  (the oracle rounds Q/K/V through F16, so F16 storage is closer); with the
+  F16 accumulator mode the same tap drops to 3.9e-5 when the oracle's encoder
+  output is injected into the fork (`FORK_INJECT=oracle`). A second, separate
+  amplifier: the encoder's 1.2e-6 difference becomes 9e-5 on the injected K
+  and 1.2e-4 on V (the Q8_K activation quantization of `kv_inp_normed` flips
+  rounding steps), so with the fork's own encoder the tap is 1.5e-4. The
+  remaining 1 to 5 percent on the draft logits is that quantized-projection
+  amplification, not attention. The first prompt's position 14 miss was a
+  near tie (oracle logit gap 0.021).
+- Top-1 of the 15 drafts against the fork (FA on, F16 accumulator mode):
+  8 tokens 15/15 (was 14/15), 120 tokens (code) 15/15, 300 tokens (prose)
+  15/15, 600 tokens (window 512 in play) 14/15 (row 11, logit gap 0.23 at 2 to
+  3 percent logit noise). Four prompts, one drafter file: this confirms the
+  graph and the numerics, not the acceptance rate.

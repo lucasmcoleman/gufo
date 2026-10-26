@@ -24,6 +24,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <vector>
@@ -112,13 +113,28 @@ int main() {
     // 8-token prompt: BOS plus the first seven tokens of a plain sentence.
     laguna::EncodeOptions encode;
     encode.add_bos = true;
-    auto prompt = tokenizer->Encode(
-        "The capital of France is Paris, and the capital of Germany is Berlin.",
-        encode);
-    Require(prompt.size() >= 8, "prompt tokenizes to at least 8 tokens");
-    prompt.resize(8);
+    // GUFO_LAGUNA_DFLASH_PROMPT_FILE=path replaces the sentence with the file's
+    // text and GUFO_LAGUNA_DFLASH_NCTX=n keeps the first n tokens (default 8),
+    // so a prompt longer than the 512-token window can be compared too.
+    std::string text =
+        "The capital of France is Paris, and the capital of Germany is Berlin.";
+    if (const char* pf = std::getenv("GUFO_LAGUNA_DFLASH_PROMPT_FILE");
+        pf != nullptr && *pf != '\0') {
+      std::ifstream in(pf);
+      Require(static_cast<bool>(in), "cannot read the prompt file");
+      text.assign(std::istreambuf_iterator<char>(in),
+                  std::istreambuf_iterator<char>());
+    }
+    std::size_t n_ctx = 8;
+    if (const char* nc = std::getenv("GUFO_LAGUNA_DFLASH_NCTX");
+        nc != nullptr && *nc != '\0') {
+      n_ctx = static_cast<std::size_t>(std::stoul(nc));
+    }
+    auto prompt = tokenizer->Encode(text, encode);
+    Require(prompt.size() >= n_ctx, "prompt has fewer tokens than NCTX");
+    prompt.resize(n_ctx);
     std::vector<std::int32_t> tokens(prompt.begin(), prompt.end());
-    std::cout << "prompt (8):";
+    std::cout << "prompt (" << n_ctx << "):";
     for (const auto t : tokens) {
       std::cout << " " << t << "<" << tokenizer->DecodeToken(t) << ">";
     }
@@ -151,7 +167,7 @@ int main() {
 
     // Drafter: context = the 8 prompt rows at positions 0..7, block at 8.
     std::vector<std::int32_t> ctx_pos;
-    for (std::int32_t p = 0; p < 8; ++p) {
+    for (std::int32_t p = 0; p < static_cast<std::int32_t>(n_ctx); ++p) {
       ctx_pos.push_back(p);
     }
     std::vector<std::int32_t> block(
@@ -159,7 +175,9 @@ int main() {
     block[0] = static_cast<std::int32_t>(anchor);
     // Drafter-only knobs, to mimic llama.cpp's CPU arithmetic when diffing
     // against the fork: GUFO_LAGUNA_DFLASH_ACT=cpu (Q8_K/Q8_0 activations) and
-    // GUFO_LAGUNA_DFLASH_KVF16=1 (F16 K/V cache).
+    // GUFO_LAGUNA_DFLASH_KVF16=1 (F16 K/V cache) and
+    // GUFO_LAGUNA_DFLASH_FA16ACC=1 (the fork's CPU flash-attention F16 V
+    // accumulator).
     rf::Options drafter_options = options;
     if (const char* act = std::getenv("GUFO_LAGUNA_DFLASH_ACT");
         act != nullptr && std::string(act) == "cpu") {
@@ -168,6 +186,10 @@ int main() {
     if (const char* kv = std::getenv("GUFO_LAGUNA_DFLASH_KVF16");
         kv != nullptr && std::string(kv) == "1") {
       drafter_options.round_kv_f16 = true;
+    }
+    if (const char* fa = std::getenv("GUFO_LAGUNA_DFLASH_FA16ACC");
+        fa != nullptr && std::string(fa) == "1") {
+      drafter_options.fa_f16_accumulator = true;  // CPU fork's flash attention
     }
     const rf::DFlashModel drafter_model(*drafter, *target, drafter_options);
     const auto t2 = std::chrono::steady_clock::now();
@@ -180,8 +202,9 @@ int main() {
       tap_writer.emplace(td);
       tap_fn = std::ref(*tap_writer);
     }
-    const std::vector<float> logits =
-        drafter_model.Forward({taps.features, ctx_pos, block, 8}, tap_fn);
+    const std::vector<float> logits = drafter_model.Forward(
+        {taps.features, ctx_pos, block, static_cast<std::int32_t>(n_ctx)},
+        tap_fn);
     if (tap_writer.has_value()) {
       Require(tap_writer->Finish(&error), "tap write: " + error);
     }
@@ -207,11 +230,15 @@ int main() {
       meta << ctx_pos.size() << " " << anchor << " " << dc.block_size << " "
            << dc.mask_token_id << " " << vocab << "\n";
     }
+    if (std::getenv("GUFO_LAGUNA_DFLASH_DUMP_ONLY") != nullptr) {
+      std::cout << "DUMP_ONLY: stopping before the teacher-forced check\n";
+      return 0;
+    }
     const auto drafts = rf::RowArgmax(logits, vocab);
     std::cout << "drafter forward: "
               << std::chrono::duration<double>(t3 - t2).count() << " s\n"
               << "drafter top-1 for positions 9..23 (draft[r] predicts the "
-                 "token at position 8 + r + 1):\n";
+                 "token at position n_ctx + r + 1):\n";
     for (std::size_t i = 0; i < drafts.size(); ++i) {
       std::cout << "  " << (9 + i) << ": " << drafts[i] << "<"
                 << tokenizer->DecodeToken(static_cast<int>(drafts[i])) << ">\n";
@@ -232,7 +259,7 @@ int main() {
                  "draft prefix):\n";
     std::vector<std::uint32_t> greedy;
     for (std::size_t i = 0; i < drafts.size(); ++i) {
-      greedy.push_back(Argmax(v.logits.data() + (8 + i) * vocab, vocab));
+      greedy.push_back(Argmax(v.logits.data() + (n_ctx + i) * vocab, vocab));
       const bool match = greedy[i] == drafts[i];
       still = still && match;
       accepted += still ? 1 : 0;

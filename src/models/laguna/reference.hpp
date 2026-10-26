@@ -81,6 +81,13 @@ struct Options {
   /// Round K (after RoPE) and V through F16 before attention, as llama.cpp's
   /// default F16 KV cache does.
   bool round_kv_f16{false};
+  /// DFlash drafter only: attention as llama.cpp's CPU flash-attention kernel
+  /// computes it (ggml_compute_forward_flash_attn_ext_f16): Q, K and V in F16,
+  /// F32 scores, online softmax, and the V accumulator kept in F16 (rounded
+  /// after every rescale and every key). Implies the F16 rounding of
+  /// `round_kv_f16`. The fork's GPU kernels accumulate in F32, so this models
+  /// the CPU fork build only; it is a comparison mode, not a quality target.
+  bool fa_f16_accumulator{false};
   /// Compute result_output only for the last token (the other rows are not
   /// returned). Saves most of the output projection for long prompts.
   bool last_row_logits_only{false};

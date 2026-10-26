@@ -3,10 +3,78 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace gufo::models::laguna::reference {
+
+namespace {
+
+// llama.cpp CPU flash attention (ggml_compute_forward_flash_attn_ext_f16, F16
+// K and V): Q, K, V are already F16-rounded by the caller. Per (row, head) it
+// walks the visible keys in cache order with an online softmax whose V
+// accumulator is F16: rescale by exp(Mold - M) on a new maximum, else add
+// v * exp(s - M), each element rounded to F16 after every step. The sum S and
+// the scores stay F32.
+void CpuFlashAttnF16(const float* q, std::span<const std::int32_t> q_positions,
+                     const float* k, const float* v,
+                     std::span<const std::int32_t> k_positions,
+                     std::uint32_t heads, std::uint32_t kv_heads,
+                     std::uint32_t head_dim, std::uint32_t window, float scale,
+                     float* out) {
+  const std::uint32_t group = heads / kv_heads;
+  const std::size_t q_row = static_cast<std::size_t>(heads) * head_dim;
+  const std::size_t kv_row = static_cast<std::size_t>(kv_heads) * head_dim;
+  std::vector<float> acc(head_dim);
+  for (std::size_t p = 0; p < q_positions.size(); ++p) {
+    const std::int64_t qp = q_positions[p];
+    for (std::uint32_t h = 0; h < heads; ++h) {
+      const float* qh = q + p * q_row + static_cast<std::size_t>(h) * head_dim;
+      const std::size_t kvh = h / group;
+      std::fill(acc.begin(), acc.end(), 0.0F);
+      float sum = 0.0F;
+      float top = -std::numeric_limits<float>::infinity();
+      for (std::size_t j = 0; j < k_positions.size(); ++j) {
+        const std::int64_t kp = k_positions[j];
+        if (!(kp <= qp && (window == 0 || qp - kp < window))) {
+          continue;
+        }
+        const float* kj = k + j * kv_row + kvh * head_dim;
+        float dot = 0.0F;
+        for (std::uint32_t d = 0; d < head_dim; ++d) {
+          dot += qh[d] * kj[d];
+        }
+        const float s = dot * scale;
+        float ms = 1.0F;
+        float vs = 1.0F;
+        if (s > top) {
+          ms = std::exp(top - s);
+          top = s;
+          for (float& a : acc) {
+            a = RoundToF16(a * ms);
+          }
+        } else {
+          vs = std::exp(s - top);
+        }
+        const float* vj = v + j * kv_row + kvh * head_dim;
+        for (std::uint32_t d = 0; d < head_dim; ++d) {
+          acc[d] = RoundToF16(acc[d] + vj[d] * vs);
+        }
+        sum = sum * ms + vs;
+      }
+      float* oh = out + p * q_row + static_cast<std::size_t>(h) * head_dim;
+      const float inv = sum == 0.0F ? 0.0F : 1.0F / sum;
+      for (std::uint32_t d = 0; d < head_dim; ++d) {
+        oh[d] = acc[d] * inv;
+      }
+    }
+  }
+}
+
+}  // namespace
 
 DFlashModel::DFlashModel(const DFlashWeights& drafter,
                          const ModelWeights& target, Options options)
@@ -172,7 +240,7 @@ std::vector<float> DFlashModel::Forward(const DFlashInputs& in,
     std::copy(bk.begin(), bk.end(), k_all.begin() + N * kv_dim);
     std::copy(bv.begin(), bv.end(), v_all.begin() + N * kv_dim);
 
-    if (options_.round_kv_f16) {
+    if (options_.round_kv_f16 || options_.fa_f16_accumulator) {
       // llama.cpp's CPU flash attention also converts Q to F16 (K is F16).
       for (float& value : q) {
         value = RoundToF16(value);
@@ -187,10 +255,17 @@ std::vector<float> DFlashModel::Forward(const DFlashInputs& in,
 
     // Causal sliding-window attention over [context ; block].
     std::vector<float> attn(B * q_dim);
-    GqaAttentionAt(q.data(), block_positions, k_all.data(), v_all.data(),
-                   key_positions, static_cast<std::uint32_t>(heads),
-                   static_cast<std::uint32_t>(kvh), c.head_dim,
-                   c.sliding_window, kq_scale, attn.data());
+    if (options_.fa_f16_accumulator) {
+      CpuFlashAttnF16(q.data(), block_positions, k_all.data(), v_all.data(),
+                      key_positions, static_cast<std::uint32_t>(heads),
+                      static_cast<std::uint32_t>(kvh), c.head_dim,
+                      c.sliding_window, kq_scale, attn.data());
+    } else {
+      GqaAttentionAt(q.data(), block_positions, k_all.data(), v_all.data(),
+                     key_positions, static_cast<std::uint32_t>(heads),
+                     static_cast<std::uint32_t>(kvh), c.head_dim,
+                     c.sliding_window, kq_scale, attn.data());
+    }
 
     // Per-head softplus gate from the same normed input, then output proj.
     std::vector<float> gate(B * heads);

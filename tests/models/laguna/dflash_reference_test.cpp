@@ -391,6 +391,30 @@ int main() {
       }
     }
     {
+      // The CPU-fork attention mode (F16 Q/K/V, F16 V accumulator) stays close
+      // to the F32 oracle, is not identical to it, and honours the window.
+      rf::Options fa;
+      fa.fa_f16_accumulator = true;
+      rf::Options kv;
+      kv.round_kv_f16 = true;
+      for (const std::size_t n : {5U, 9U}) {  // inside and past the window (6)
+        const Run run = MakeRun(n, 5, 0, 1200 + n);
+        const auto base = Oracle(d, target, run);
+        const auto fast =
+            rf::DFlashModel(d.weights, target.weights(), fa)
+                .Forward({run.features, run.ctx_pos, run.block, run.block_pos});
+        const auto kvr =
+            rf::DFlashModel(d.weights, target.weights(), kv)
+                .Forward({run.features, run.ctx_pos, run.block, run.block_pos});
+        const double e_fa = Diff(fast, base);
+        Require(e_fa > 1e-6 && e_fa < 5e-2,
+                "fa_f16_accumulator differs from F32 but stays close: " +
+                    std::to_string(e_fa));
+        Require(Diff(kvr, base) > 1e-6, "round_kv_f16 differs from F32");
+        ++cases;
+      }
+    }
+    {
       // Context positions with holes (a restored or trimmed cache), block
       // further on. The injected K/V must use these positions, not indexes.
       Run run = MakeRun(6, 5, 0, 900);
