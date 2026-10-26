@@ -1083,11 +1083,12 @@ def check_long_context(client, model, checks, context, vision=False, server_log=
                     **extra, "chat_template_kwargs": {
                         "enable_thinking": True, "preserve_thinking": True}}}
     limited = chat("long_thinking_token_limit", thinking, True)
-    assert limited["finish"] == "length" and reasoning_mode_matches(
-        limited["reasoning"], True, sampling_preset), limited
-    # An adaptive model that closed reasoning streams its answer instead;
-    # cancel that stream at the same point.
+    assert reasoning_mode_matches(limited["reasoning"], True, sampling_preset), limited
+    # An adaptive model that closed reasoning answers in the schema's short
+    # JSON, which can end within the limit; it streams that answer instead,
+    # and the stream is cancelled at the same point.
     adaptive = not limited["reasoning"]
+    assert limited["finish"] == "length" or (adaptive and limited["finish"] == "stop"), limited
     # Switching thinking changes the template's leading instructions; that
     # frontier may legitimately miss. Subsequent same-mode continuation must hit.
     count = 0
