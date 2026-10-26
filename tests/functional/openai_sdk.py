@@ -1088,7 +1088,12 @@ def check_long_context(client, model, checks, context, vision=False, server_log=
     # JSON, which can end within the limit; it streams that answer instead,
     # and the stream is cancelled at the same point.
     adaptive = not limited["reasoning"]
-    assert limited["finish"] == "length" or (adaptive and limited["finish"] == "stop"), limited
+    if limited["finish"] == "stop":
+        # Only that completed answer may stop early: never an empty reply.
+        assert adaptive and limited["text"], limited
+        assert json.loads(limited["text"]) == {"keyword": "LANTERN"}, limited
+    else:
+        assert limited["finish"] == "length", limited
     # Switching thinking changes the template's leading instructions; that
     # frontier may legitimately miss. Subsequent same-mode continuation must hit.
     count = 0

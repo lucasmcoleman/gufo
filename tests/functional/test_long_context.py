@@ -82,5 +82,67 @@ class LongContextRetryTest(unittest.TestCase):
                 self.run_replay(replay, cold=refusal())
 
 
+class LimitChecked(Exception):
+    """Stop after the long-context thinking-limit assertions."""
+
+
+def run_thinking_limit(limited, preset):
+    """Runs check_long_context through the thinking-limit request."""
+    answer = '{"keyword":"LANTERN"}'
+    sampled = SimpleNamespace(
+        status="completed", output_text=answer, to_dict=dict,
+        usage=SimpleNamespace(input_tokens_details=SimpleNamespace(cached_tokens=3143)))
+    events = [SimpleNamespace(response=sampled)]
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=Mock(
+            side_effect=lambda **body: contextlib.nullcontext(events)
+            if body.get("stream") else sampled)),
+        chat=SimpleNamespace(completions=SimpleNamespace(
+            create=Mock(side_effect=LimitChecked))))
+    replies = [response(0, 3143), response(3143, 0), {"usage": {}, **limited}]
+    with patch.object(openai_sdk, "chat_result",
+                      side_effect=lambda *_: deepcopy(replies.pop(0))), \
+            patch.object(openai_sdk, "check_events"), \
+            contextlib.redirect_stderr(io.StringIO()):
+        try:
+            openai_sdk.check_long_context(client, "fixture", {}, 8192,
+                                          sampling_preset=preset)
+        except LimitChecked:
+            return True
+    raise AssertionError("long-context did not reach the thinking stream")
+
+
+class LongThinkingLimitTest(unittest.TestCase):
+    """An adaptive early stop must be the completed short JSON answer."""
+
+    def limited(self, reasoning="", text="", finish="stop"):
+        return {"reasoning": reasoning, "text": text, "tools": [], "finish": finish}
+
+    def test_laguna_early_stop_requires_the_expected_answer(self):
+        self.assertTrue(run_thinking_limit(
+            self.limited(text='{"keyword": "LANTERN"}'), "laguna"))
+        self.assertTrue(run_thinking_limit(self.limited(finish="length"), "laguna"))
+        # Review #976: an empty completed reply was accepted.
+        for limited in (self.limited(),
+                        self.limited(text='{"keyword": "WRONG"}'),
+                        self.limited(text='{"keyword": "LANTERN"}', finish=None)):
+            with self.subTest(limited=limited), self.assertRaises(AssertionError):
+                run_thinking_limit(limited, "laguna")
+
+    def test_other_presets_still_require_reasoning_up_to_the_limit(self):
+        for preset in (None, "qwen38", "deepseek4"):
+            with self.subTest(preset=preset):
+                self.assertTrue(run_thinking_limit(
+                    self.limited(reasoning="x", finish="length"), preset))
+                for limited in (self.limited(),
+                                self.limited(text='{"keyword": "LANTERN"}'),
+                                self.limited(reasoning="x",
+                                             text='{"keyword": "LANTERN"}'),
+                                self.limited(finish="length")):
+                    with self.subTest(limited=limited), \
+                            self.assertRaises(AssertionError):
+                        run_thinking_limit(limited, preset)
+
+
 if __name__ == "__main__":
     unittest.main()
