@@ -1,11 +1,13 @@
 # Laguna-S-2.1 DFlash drafter in gufo (phase 6 spec)
 
 Status 2026-10-26: spec, the CPU config and weight index (6a), the CPU oracle
-(6b, checked against Poolside's fork), the verify-cost decision data (6b-0)
-and the drafter's GPU operators with a composed GPU drafter forward (6c, see
+(6b, checked against Poolside's fork), the verify-cost decision data (6b-0),
+the drafter's GPU operators with a composed GPU drafter forward (6c, see
 "What phase 6c added"; `src/models/laguna/kernels/dflash_ops.*`, tests
-`laguna.dflash_ops` and `laguna.dflash_gpu_real`). The target side (6d) and
-end to end (6e, 6f) are not done; their items below are proposals. Target
+`laguna.dflash_ops` and `laguna.dflash_gpu_real`) and the target side (6d,
+see "What phase 6d added"; `kernels/dflash_session.*`, tests
+`laguna.dflash_target` and `laguna.dflash_target_real`). End to end (6e, 6f)
+is not done; its items below are proposals. Target
 phases 1 to 5 are complete (PLAN.md); this document is the "own feature-layer
 and mask verification" that PLAN.md item 6 asks for.
 
@@ -497,3 +499,132 @@ Open after 6c:
    synthetic features. Real long-context taps come with 6d.
 5. Row 11 of the fixture block is a near tie on every comparison so far (fork,
    oracle modes, GPU).
+
+## What phase 6d added (2026-10-26, GPU, target side; no speculative loop)
+
+Code (laguna only; no shared code changed):
+
+- `Executor` (`kernels/executor.*`): `Forward(tokens, rows, logits,
+  ForwardArgs)` with a per-call `path` (rule 3: a verify of up to 32 rows on
+  the vector path while 512-row prefill stays batched; 33 vector rows are
+  refused up front) and `features`, a device buffer that receives the outputs
+  of the layers set by `SetFeatureTaps` (F32, `[T][taps x hidden]`) through
+  one copy kernel per tapped layer on the executor's stream, with no
+  synchronize. `RewindTo(position)` (rules 1 and 2) is host bookkeeping that
+  checks every layer with `KvCache::RejectContinue(position, 0)`, the same
+  function `AttnOps` now validates every call with (factored out of
+  `AttnOps::Run`, messages unchanged), and refuses touching nothing.
+  `DecodeBatch` refuses an executor with feature taps (rule 6).
+- `DrafterKv::RejectContinue` and `RewindTo` (the drafter ring's own
+  retained-history rule, also used by `DFlashOps` for every block);
+  `DrafterSession::InjectDevice` (device features, no copy, no synchronize).
+- `DFlashSession` (`kernels/dflash_session.*`): one session's executor
+  (borrowed) and drafter (owned, on the executor's stream, so capture and
+  injection are ordered by the stream alone). `Prefill` injects only the last
+  511 rows a block can read; `Verify` runs on the vector path and injects every
+  row; `Commit` rewinds both; `Propose` drafts on the batched path (pinned, so
+  shorter blocks stay prefixes; see the timing below). Rule 4: a target call
+  that fails after its append poisons the executor and drops the drafter; a
+  drafter failure (device error in an injection or block, refused rewind, a
+  non-finite tap row) drops only the drafter and the target continues as
+  plain decode until `Reset`. Non-finite taps (rule 8) are flagged by a device
+  kernel as rows are injected, because the drafter's activation quantization
+  turns a NaN row into zeros and drafts would otherwise look normal (found by
+  the test: an argmax check alone does not catch it).
+
+Tests (`ctest -R '^laguna\.dflash_target'`, under the GPU lock):
+
+- `laguna.dflash_target` (tiny random target with window 512 and a tiny
+  drafter of the real head geometry; nothing skipped): captured taps equal the
+  debug layer tap bit for bit for prefill (batched), decode and verify
+  (vector) rows across 511/512/513; capture leaves logits and untapped reruns
+  bit-identical; taps one layer early fail. A 16-row vector verify equals the
+  same tokens decoded alone bit for bit and `RewindTo` at every depth 0..16
+  gives a continuation equal to a twin that never saw the rejected rows
+  (logits and retained K/V bytes), 425 cases at starts 480..528 and 1040..1056
+  with chunk 16 (the smallest chunk that admits a 16-row verify; ring 528) and
+  495..1024 with chunk 512; a batched verify is told apart. Refused without
+  touching anything (bookkeeping and K/V bytes): rewind ahead, one past the
+  ring's depth, past evicted keys, a chained rewind (10 then 8) that needs a
+  lost key, a poisoned executor, 33 vector rows. Drafter ring: a rewound ring
+  drafts exactly as one that never held the rejected rows (25 cases around
+  511/512/513 and 600); positions outside `[floor, committed]`, evicted
+  context and an invalid ring are refused. `DFlashSession`: drafts from
+  device-captured taps equal drafts from the same taps uploaded from the host
+  with another injection chunking (prompts 9, 600, 1030, four propose, verify,
+  commit steps); the failure rules above; `DecodeBatch` exclusion; two
+  sessions on two threads equal their solo runs.
+- `laguna.dflash_target_real` (real target and drafter; skips 77 without the
+  files). Fixture (9-token capital prompt, oracle in CPU activation mode):
+  prefill taps 4e-3 to 1.5e-2 relative rms from the oracle's `l_out-1, 10, 19,
+  29, 38, 47`, decode-row taps the same (9.4e-5 from the prefill taps); taps
+  one layer early, and an executor tapping layers 0, 9, ..., are 7.8x to 2e5x
+  farther. GPU top-1 340 = oracle. Drafts from the GPU taps against drafts
+  from the oracle's taps (both through the GPU drafter): 10/15 (rows 6, 10,
+  11, 12, 14; logits 0.19 relative rms; the drafter amplifies the 1e-2 tap
+  noise: decode-row and prefill taps, 1e-4 apart, agree on 14/15). Long
+  context (700 real tokens of the 6b-0 code text, prefill 512 + 188, rows
+  189..699 injected; CPU oracle `--act-quant gpu --kv-f16 --taps l_out`,
+  `/server/staging/laguna/dflash-6d/oracle-long700`): per-row relative rms,
+  median over rows, taps 1..47 = 8e-4, 1.0e-2, 3.6e-2, 7.7e-2, 9.0e-2, 0.12
+  (decode-path GPU vs oracle), against 9.6e-4 ... 0.12 between the GPU's own
+  prefill and decode roundings, so the oracle is no farther from the GPU than
+  the GPU's two roundings are from each other (asserted within 1.25x); one
+  layer early 0.25 to 0.93. The large rows are runs of a repeated token (id
+  328, a separator line), not position 512. Drafts: GPU prefill taps vs
+  oracle taps 13/15, decode-path taps vs oracle 13/15, prefill vs decode-path
+  13/15; device-injected drafts equal host-uploaded drafts bit for bit. The
+  first 16-row verify at 700 equals the same tokens decoded alone bit for bit.
+  Four greedy steps accepted 1, 10, 0, 0 of 15 (one text; not an acceptance
+  measurement, that is 6f).
+- Drafter cost (`laguna_dflash_cost`, real drafter and head, 511 real
+  captured context rows, block at 700; unprofiled wall time of `Propose`
+  including the host embedding gather and the drafts' download; 30 reps after
+  5 warm-up, two process loads, medians load 1 / load 2):
+
+  | B | vector path | batched path |
+  | --- | --- | --- |
+  | 4 | 8.03 / 8.26 ms | 9.14 / 9.23 ms |
+  | 8 | 14.56 / 14.90 ms | 9.17 / 9.43 ms |
+  | 16 | 28.75 / 29.39 ms | 9.76 / 9.79 ms |
+
+  Injecting a verify's 16 rows (vector) 1.72 / 1.75 ms, one row 0.48 / 0.49
+  ms. This replaces 6b-0's 6.2 ms bandwidth estimate: about 9.5 ms per pass
+  plus 1.7 ms of injection per step, so the 6b-0 tables' 6.2 ms column is
+  optimistic by about 5 ms per step (still far below the 18.7 ms margin
+  column). Verify on the real model took 267 to 370 ms per 16-row step at
+  700 (capture and injection included, first step with scratch growth).
+- Regression: the full `ctest -R '^laguna\.'` at the 6d code commits (built
+  at 9f47cf20, same code as this commit): 27 passed, 2 skipped
+  (`dflash_real_smoke` and `functional` are opt-in); log
+  `final-ctest-9f47cf20.log`.
+- GPU use: 10:35 to 10:54 EDT 2026-10-26 in short runs (15 s to 70 s, one
+  process at a time under the lock; the CPU oracle 10:26 to 10:35 under the
+  lock); a Scriberr job held the lock 10:38 to 10:40 and was waited out. Logs
+  in `/server/staging/laguna/dflash-6d/` (`gpu-windows.log`).
+
+Decisions recorded for 6e:
+
+1. Snapshots (rule 5) are not implemented: a target `RestoreSnapshot`
+   desynchronizes the drafter, and `DFlashSession` drops it on the next call
+   that finds the ring out of step (`Prefill` re-arms it from the rows it can
+   see). Snapshotting the drafter ring (13 MiB at the 544-row ring) is 6e.
+2. Batched decode (rule 6): implemented as a refusal in `DecodeBatch`;
+   the runner must route speculating sessions to `Forward`.
+3. Drafter blocks on the batched path (measured above); injections on the
+   vector path (1.7 ms per 16 rows, chunking-invariant).
+4. A speculating session needs `max_chunk >= B`; rewinds deeper than
+   `max_chunk` are refused even when the ring still holds the keys (the
+   existing conservative check), so commit depth is bounded by the chunk.
+
+Open after 6d:
+
+1. The drafter is sensitive to tap rounding: 1e-2 tap differences change 2 to
+   5 of 15 drafts (the later block rows). Whether prefill-path versus
+   decode-path rounding of the injected rows costs acceptance is a 6f
+   measurement.
+2. The vector path is not warmed up on a batched-chunk executor; the first
+   verify grows scratch (370 ms against 270 ms). Warm both paths in 6e.
+3. `LagunaSpeculativeTarget` (`ISpeculativeTargetExecutor` adapter with a
+   rewind commit), sampling, serve wiring: 6e.
+

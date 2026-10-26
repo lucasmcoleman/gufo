@@ -71,9 +71,10 @@ llama.cpp-named taps diffed against `llama-eval-callback` dumps.
    5, with its own feature-layer and mask verification.
    Spec, evidence and test plan: `DFLASH.md`. Done: config and weight index
    (6a, CPU), the CPU oracle checked against Poolside's fork (6b, 6b-ref),
-   the verify-cost decision data (6b-0) and the drafter's GPU operators with
-   a composed drafter forward (6c, no target integration). Next: target tap
-   capture and rewind (6d), then end to end (6e, 6f).
+   the verify-cost decision data (6b-0), the drafter's GPU operators with
+   a composed drafter forward (6c) and the target side: tap capture, per-call
+   verify path, rewind, failure rules and the drafter's measured cost (6d).
+   Next: end to end (6e, 6f).
 
 Lessons source: codexms #965 review of #ai-dev-gufo 12015-16101,
 `/server/staging/laguna/codexms-965-RESULT.txt`. Reference build:
