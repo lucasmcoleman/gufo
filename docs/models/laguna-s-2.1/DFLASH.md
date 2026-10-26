@@ -1,11 +1,13 @@
 # Laguna-S-2.1 DFlash drafter in gufo (phase 6 spec)
 
-Status 2026-10-26: spec plus the CPU-only config and weight index
-(`src/models/laguna/dflash.{hpp,cpp}`, tests `laguna.dflash_contract` and
-`laguna.dflash`). No GPU work was done or is specified as done: every GPU item
-below is a proposal. Target phases 1 to 5 are complete (PLAN.md); this
-document is the "own feature-layer and mask verification" that PLAN.md item 6
-asks for.
+Status 2026-10-26: spec, the CPU config and weight index (6a), the CPU oracle
+(6b, checked against Poolside's fork), the verify-cost decision data (6b-0)
+and the drafter's GPU operators with a composed GPU drafter forward (6c, see
+"What phase 6c added"; `src/models/laguna/kernels/dflash_ops.*`, tests
+`laguna.dflash_ops` and `laguna.dflash_gpu_real`). The target side (6d) and
+end to end (6e, 6f) are not done; their items below are proposals. Target
+phases 1 to 5 are complete (PLAN.md); this document is the "own feature-layer
+and mask verification" that PLAN.md item 6 asks for.
 
 ## Evidence and confidence
 
@@ -288,7 +290,7 @@ Status column: done, CPU (can run now), GPU (needs the paused GPU window).
 | 6b-0 | Decision data before any GPU kernel: (a) routing overlap for verify windows of 2, 4, 8, 16 consecutive tokens on real code/chat generations from the CPU oracle (`ffn_moe_probs_biased` top-10 per layer, distinct experts per window); (b) with Poolside's acceptance lengths (4.2 to 6.8 at n 15) and Myric's 27.8%, compute the break-even step-cost ratio; (c) target verify cost at w = 2, 4, 8, 16, vector path, per context depth. (a) and (b) are CPU. (c) is the first GPU item and is a plain `Forward` timing, no drafter | (a) (b) CPU; (c) GPU |
 | 6b | CPU oracle `DFlashReference` in `reference.*` style: F32 dequantized weights and a Q8-activation-aware mode (kernel arithmetic versus expected quantization error, as phase 2). Taps named after the fork's callbacks: `enc_aux_norm`, `fc_out`, `enc_norm_out`, `kv_inp_normed-N`, `Kcur_injected-N`, `Vcur_injected-N`, `noise_norm-N`, `Qcur-N`, `Kcur-N`, `attn_gate_softplus-N`, `attn_gated-N`, `ffn_out-N`, `l_out-N`, `result_norm`, `result_output`. Tiny random fixtures with unequal dimensions (so a transposed projection or a swapped tap cannot pass), including a block at the window edge (anchor at 511/512/513, rows crossing the ring wrap) and a single-tap case. Real feature fixture: the oracle run above already holds `l_out-1, 10, 19, 29, 38, 47` for 9 tokens | CPU |
 | 6b-ref | Independent reference for the semantics: a small harness over the fork's `libllama` (CPU) that loads the drafter plus the target (mmap touches only `token_embd` and `output`), feeds recorded features through `llama_encode`/`llama_decode` and dumps the callback taps. Diff 6b against it layer by layer. This is what turns "read the fork" into "confirmed"; it needs no GPU and no target forward. Pin its revision (06f8cebd7) and build it under `/server/staging/laguna/dflash-ref/` | CPU |
-| 6c | GPU operators one at a time against 6b: encoder (per-tap RMSNorm, `fc` Q4_K 18432 to 3072, norm); K/V injection (norm, K/V, K-norm, RoPE, ring write; positions 511/512/513, wrap); block attention (GQA 9, window plus causal block, row `r` sees `511 - r` context rows, ring capacity, shorter blocks equal prefixes of longer ones); gate softplus; SwiGLU with Q4_K and Q6_K; final norm, head and argmax; every projection both vector and batched path. Reuse the `qfn_mmq` raw kernels with one expert and zero ids, as the target's head does | GPU |
+| 6c | GPU operators one at a time against 6b: encoder (per-tap RMSNorm, `fc` Q4_K 18432 to 3072, norm); K/V injection (norm, K/V, K-norm, RoPE, ring write; positions 511/512/513, wrap); block attention (GQA 9, window plus causal block, row `r` sees `511 - r` context rows, ring capacity, shorter blocks equal prefixes of longer ones); gate softplus; SwiGLU with Q4_K and Q6_K; final norm, head and argmax; every projection both vector and batched path. Reuse the `qfn_mmq` raw kernels with one expert and zero ids, as the target's head does | done, GPU |
 | 6d | Target side: device-side tap capture of the six layers for prefill, decode and verify rows (untapped reruns too: debug taps hide stream races); `Forward(kAll)` with the pinned vector path equals the same tokens decoded alone, bit for bit, across 511/512/513 and ring wrap; `RewindTo` at every depth 0 to 16 at those boundaries; rewind past retained history is refused and leaves the cache untouched; an injected failure after the append poisons target and drops the drafter, and a drafter failure leaves the target usable | GPU |
 | 6e | End to end, exact greedy: speculative output equals plain greedy output token for token (same binary, same pinned path) on a prompt set that straddles the window (lengths 509 to 515, 2k, 32k), thinking on and off, tool-call grammar, stop tokens (EOS 2, EOT 24) inside a draft, `max_tokens` inside a draft, cancel mid-step, snapshot and restore mid-request, retry, two and eight sessions with speculating and plain sessions mixed, load and unload. Any divergence is explained by logit gap before it is waved through | GPU |
 | 6f | Acceptance and speed: acceptance per position and mean accepted per step against the fork on the same prompts (the fork is deterministic at temperature 0; run it on the same APEX target file; both sides report `draft_n_accepted / draft_n` the same way); set the tolerance from the fork's own run-to-run spread, not from a guess. Speed: unprofiled, counterbalanced A/B against plain decode on matched Release binaries, per concurrency, as PLAN.md phase 5 requires. Include the sampled path (temperature 1.0, top_k 20) once the lossless verifier is wired | GPU |
@@ -379,3 +381,119 @@ say the drafter can pay.
   15/15, 600 tokens (window 512 in play) 14/15 (row 11, logit gap 0.23 at 2 to
   3 percent logit noise). Four prompts, one drafter file: this confirms the
   graph and the numerics, not the acceptance rate.
+
+## What phase 6c added (2026-10-26, GPU, no target integration)
+
+Code (`src/models/laguna/kernels/dflash_ops.{hpp,hip.cpp}`, laguna only; no
+shared code changed):
+
+- `DeviceDrafter::Upload`: the drafter on the device (Q4_K/Q6_K projections
+  with ggml's 512-column row padding, F32 norms), and `DrafterWeights`, a plain
+  device view (tests copy it and change one field to prove the checks notice).
+- `DrafterKv`: one F16 ring per layer, capacity `window + max(max_rows,
+  block_size)` (544 at 32-row injections, 528 at 16), with the target cache's
+  retained-history bookkeeping (`committed`, `retained_begin`, `valid`) plus
+  `floor`, the first position the session injected: keys below it never
+  existed and are not attended, as in the fork's cache, which holds only
+  injected rows. A failure after a write invalidates the ring until `Reset`.
+- `DFlashOps` (one per stream, all scratch per instance, allocate before free):
+  `Encode` (per-tap RMSNorm with the `aux_norm` rows, `fc`, norm), `InjectKv`
+  and `Inject` (attn_norm, K/V, K norm, NeoX RoPE theta 500000, F16 store at the
+  target positions; a start below `committed` overwrites, as trimming rejected
+  rows will), `Attention` (Q/K/V/gate projections, norms, RoPE, the block's K/V
+  written into the ring at `n .. n + B - 1`, GQA attention where row `r` reads
+  keys `max(p + 1 - window, floor) .. p`, the softplus gate, the output
+  projection), `Ffn` (SwiGLU, Q6_K down in layers 2 and 5), `Head` (output
+  norm, the target's head on rows 1..B-1, first-maximum argmax) and `Block`
+  (the composed block, 2 <= B <= 16). Every projection is `qfn_mmq_moe_vec` or
+  `qfn_mmq_q{4,6}_K_moe_raw` with one expert and zero ids, on either path. The
+  attention kernel is the target's tiled online-softmax kernel with the
+  drafter's key range, so a row's sum order depends on its position only.
+- KV contract as the fork: a block pass leaves `committed()` at `n` (the next
+  injection overwrites its rows) and records in `retained_begin()` what its
+  rows evicted; the ring's spare rows (`max(16, chunk)`) are what keeps the
+  block from evicting a key any block row reads.
+- `DrafterSession`: the composed drafter forward without the target. It owns
+  its `DFlashOps`, ring and device buffers on the caller's stream, injects host
+  features (device-side capture is 6d), gathers `[anchor, MASK x (B - 1)]`
+  from the target's mapped `token_embd` on the host, as the executor does, and
+  returns the drafts and logits.
+
+Tests (`ctest -R '^laguna\.dflash_(ops|gpu_real)$'`, run under the GPU lock):
+
+- `laguna.dflash_ops`, 124 cases, nothing skipped: tiny random drafters with
+  unequal dimensions (hidden 512/768, FFN 768/512, GQA 9 over 2 KV heads and GQA
+  4 over 3, taps 3/2, window 512/37, theta 500000/10000, vocabulary 1000/777,
+  Q6_K `attn_v`/`ffn_down` in the last layer). Every projection is checked
+  against the oracle's exact product of its captured, independently validated
+  Q8 input within the float accumulation bound (worst 6.8e-2 of the bound), so
+  kernel arithmetic is judged against the expected quantization and nothing
+  else; projections of one input must share one quantization. Norms, rope
+  (2e-7 to 3e-7 of the head's largest element), stored K/V (half an F16 ulp),
+  attention against a double oracle over the ring as stored (1.7e-6 to 5.5e-6
+  of rms, within 3x plain float), gate, SwiGLU and residuals (bitwise) are checked
+  from the GPU's own upstream stages. Window 511/513 and non-causal probes lie
+  3e4 to 3e6 times further from the GPU than the correct mask. Covered: anchors
+  at 9, 36/37/38, 511, 512, 513, 600, 700; injections crossing 511/512/513 and
+  wrapping the ring; a session floor; blocks of 1 to 16 rows (shorter blocks
+  equal the prefix of 16 bit for bit, on one path); overwrite equal to direct
+  injection; injection over a block's rows equal to a ring that never held
+  them; untapped and repeated runs bitwise; refused scratch growth; two
+  sessions on two streams concurrently equal to their solo runs. 22
+  mutations fail as they must (swapped taps, rotated aux_norm rows, swapped
+  norm weight, halved theta, theta 10000, swapped K/V, rows one position late,
+  window 511 and 513, non-causal block; each on both paths) and 11 bad
+  arguments are refused without touching the ring (gap, start below floor,
+  oversized chunk or block, 33 vector rows, other window, layer out of range,
+  evicted keys after a rewind, block of 1 or 17, head of another hidden size,
+  invalid ring).
+- End to end the two sides quantize their own intermediates, which differ by
+  float noise, so codes at rounding ties flip and the flips compound: on one
+  stage with identical input the GPU is about 1e-7 of rms from the oracle in
+  its mode (up to 2.4e-4 where a tie flips; Q8 noise 1e-2), after one layer
+  0.4 to 0.7 of the noise, after three 0.6 to 1.1 of it, as the oracle's own
+  Q8_1 and MMQ modes drift apart. The composed bound is therefore a noise-scale sanity bound (twice the
+  larger of the noise and the Q8_1-vs-MMQ distance); the stage checks judge the
+  arithmetic.
+- `laguna.dflash_gpu_real` (skips 77 without the files): the real drafter
+  (0.61 GiB on the device) and the target's head (0.24 GiB) with `token_embd`
+  from the mapping, fed the CPU oracle's recorded `l_out-1, 10, 19, 29, 38,
+  47` of the 9-token capital prompt (`oracle-20261025-capital-cpuq8`, anchor
+  340 = its top-1) and a 600-row context built from those rows (cycled, 3 %
+  noise; real long-context taps need 6d), both paths, all stage checks as
+  above (projections within 2.3e-2 of their bound, attention 4.9e-6 to 7.0e-6
+  of rms). Logits against the oracle
+  in the same mode: 2.2e-2 relative rms (fixture vector 2.2e-2, batched
+  2.7e-2; long 2.2e-2 both), max 0.33 to 0.44 logits, against 2.3e-2 to
+  3.0e-2 of quantization noise and 2.2e-2 between the oracle's own two modes.
+  Drafts: fixture 14/15 on both paths (row 11: GPU 81, oracle 395, oracle
+  gap 0.080 vector and 0.40 batched, GPU gap 0.02; the 6b fork comparison
+  also had its only miss at row 11 of the long prompt), long context 15/15 on
+  both paths. For scale, GPU against the F32 oracle: 12 to 14 of 15. The
+  session's untapped result equals the tapped block bit for bit; blocks of 4
+  and 8 equal the prefix of 16.
+- Regression: the whole `ctest -R '^laguna\.'` at a0158ead, 25 passed, 2
+  skipped (`dflash_real_smoke` and `functional` are opt-in). The laguna test
+  helper `tests/models/laguna/ffn_gpu.hpp` gained Q4_K in `RandomQuant`;
+  `ffn_ops`, `ffn_real`, `attention_ops` and `attention_real` rerun and pass.
+- GPU use: 09:34 to 10:05 EDT 2026-10-26 in short runs (seconds to five
+  minutes each, one process at a time under the GPU admission lock); logs in
+  `/server/staging/laguna/dflash-6c/`.
+
+Open after 6c:
+
+1. No timing was taken. The drafter's cost (6b-0 estimated 6.2 ms per pass
+   from bandwidth) is unmeasured; the operators favour clarity (separate Q, K,
+   V, gate and gate/up projections, each quantizing its input; host embedding
+   gather and a synchronizing feature upload in `DrafterSession`).
+2. A K/V row's rounding depends on the path that injected it: prompt rows
+   injected in batched chunks and verify rows injected on the vector path
+   round differently (each is a valid quantization; drafts, not outputs,
+   depend on it). Within one path injection is chunking-invariant.
+3. Under `Path::kAuto` blocks of 9 to 16 rows take the batched path and
+   shorter ones the vector path, so a block of 16 is not the prefix-extension
+   of a block of 8 across that switch. Pin the path per call in 6e.
+4. Real-weight coverage has 9 recorded tap rows only; the 600-row case uses
+   synthetic features. Real long-context taps come with 6d.
+5. Row 11 of the fixture block is a near tie on every comparison so far (fork,
+   oracle modes, GPU).
