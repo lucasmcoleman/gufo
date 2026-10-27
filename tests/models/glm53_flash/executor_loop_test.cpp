@@ -449,14 +449,16 @@ void CheckRefusals(const Model& m) {
 
 // (h) A pass longer than the 256-row logits buffer (Executor::HeadLogits
 // projects the head in row blocks): per-token logits of one 300-token pass
-// match 16-token passes (batch-dependent GEMM routes: F32 rounding).
+// match 100-token passes. Both stay on the >= 64-token Q8_1 prefill GEMM
+// route (PrefillQuantGemm); passes under 64 tokens take the exact F32 route
+// and differ by the activation quantization (~1e-2 rel), not by blocking.
 void CheckLongPassLogits(const Model& m) {
   glm::stand_in::HostOps long_ops(m.config);
   glm::stand_in::HostOps short_ops(m.config);
   std::string error;
   glm::ExecutorOptions lo = Options(300);
   lo.capacity = 512;
-  glm::ExecutorOptions so = Options(16);
+  glm::ExecutorOptions so = Options(100);
   so.capacity = 512;
   auto one = glm::Executor::Create(m.weights, lo, long_ops.Bind(), &error);
   auto many = glm::Executor::Create(m.weights, so, short_ops.Bind(), &error);
@@ -472,7 +474,7 @@ void CheckLongPassLogits(const Model& m) {
   Check("short passes " + error, many->Forward(ids, true, &b, nullptr, &error));
   Check("long pass logits rows",
         a.logits.size() == ids.size() * m.config.vocab_size);
-  CheckRel("300-token pass vs 16-token passes: logits", a.logits, b.logits);
+  CheckRel("300-token pass vs 100-token passes: logits", a.logits, b.logits);
 }
 
 // (g) GUFO_GLM53_DECODE_GRAPH: replayed position-independent half-layer
@@ -548,7 +550,7 @@ void CheckDecodeGraph(const Model& m) {
       const auto one = token(20 + r);
       const bool step = graph->ForwardLast(one, true, &got, nullptr, &error) &&
                         eager->ForwardLast(one, true, &want, nullptr, &error);
-      Check("after rollback " + std::to_string(r) + tag,
+      Check("after rollback " + std::to_string(r) + tag + " " + error,
             step && same(got.logits, want.logits));
       cycle_logits.insert(cycle_logits.end(), got.logits.begin(),
                           got.logits.end());

@@ -193,6 +193,9 @@ private:
     std::vector<float> q_a_norm, kv_a_norm, k_norm, k_norm_bias, ape;
     // ReferenceModel's MlaLayerState.
     std::vector<float> latent, pooled, tail_keys, tail_gates;
+    // Every token's indexer key and gate, so a position rewind (Executor
+    // Rollback after a verify) can rebuild the pool tail.
+    std::vector<float> keys, gates;
   };
   struct FfnHost {
     bool loaded{false};
@@ -265,6 +268,20 @@ private:
       h.pooled.clear();
       h.tail_keys.clear();
       h.tail_gates.clear();
+      h.keys.clear();
+      h.gates.clear();
+    }
+    if (h.latent.size() > std::size_t{pos0} * kv_lora) {
+      // Rewound (Executor::Rollback): drop the later tokens. Completed pools
+      // before pos0 are unchanged; the tail is rebuilt from the history.
+      const std::size_t pools = pos0 / kpool;
+      h.latent.resize(std::size_t{pos0} * kv_lora);
+      h.keys.resize(std::size_t{pos0} * idim);
+      h.gates.resize(std::size_t{pos0} * idim);
+      h.pooled.resize(pools * idim);
+      const auto tail = static_cast<std::ptrdiff_t>(pools * kpool * idim);
+      h.tail_keys.assign(h.keys.begin() + tail, h.keys.end());
+      h.tail_gates.assign(h.gates.begin() + tail, h.gates.end());
     }
     if (h.latent.size() != std::size_t{pos0} * kv_lora) {
       throw std::runtime_error("MLA stand-in: pos0 does not continue state");
@@ -298,9 +315,12 @@ private:
       LayerNorm(tmp.data(), h.k_norm.data(), h.k_norm_bias.data(), idim,
                 c.norm_eps, key.data());
       h.tail_keys.insert(h.tail_keys.end(), key.begin(), key.end());
+      h.keys.insert(h.keys.end(), key.begin(), key.end());
       MatVec(h.idx_gate, hidden, xt, tmp.data());
       h.tail_gates.insert(h.tail_gates.end(), tmp.begin(),
                           tmp.begin() + static_cast<std::ptrdiff_t>(idim));
+      h.gates.insert(h.gates.end(), tmp.begin(),
+                     tmp.begin() + static_cast<std::ptrdiff_t>(idim));
       if (h.tail_keys.size() == kpool * idim) {
         PoolKeys(h.tail_keys.data(), h.tail_gates.data(), h.ape.data(), kpool,
                  idim, pooled.data());

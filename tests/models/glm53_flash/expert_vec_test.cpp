@@ -211,8 +211,10 @@ void Run(GgmlType type, std::uint32_t cols, std::uint32_t tokens, bool pair,
   Hip(hipMemcpy(act.data(), dscratch.p, act.size(), hipMemcpyDeviceToHost),
       "act");
 
-  // The GPU's quantization vs the host rule (a .5 tie may round either way
-  // under -ffast-math division; allow one step, on few values).
+  // The GPU's quantization vs the host rule. The kernel is built with
+  // -ffast-math, so amax / 127 is a reciprocal multiply: allow the scale one
+  // ulp, and a .5 tie may round either way (one step, on few values). The
+  // dot products below use the GPU's own scales and values.
   std::size_t off_by_one = 0;
   const std::size_t arow = ev::ActivationRowBytes(cols);
   for (std::uint32_t r = 0; r < act_rows; ++r) {
@@ -226,7 +228,9 @@ void Run(GgmlType type, std::uint32_t cols, std::uint32_t tokens, bool pair,
       float gd;
       std::memcpy(&gd, act.data() + (r * arow) + cols + (blk * sizeof(float)),
                   sizeof(gd));
-      Check(name + " activation scale", gd == d);
+      Check(name + " activation scale",
+            gd == d || gd == std::nextafter(d, 0.0F) ||
+                gd == std::nextafter(d, INFINITY));
       for (int i = 0; i < 32; ++i) {
         const int want =
             ev::QuantizeValue(x[(std::size_t{r} * cols) + (blk * 32) + i], d);
