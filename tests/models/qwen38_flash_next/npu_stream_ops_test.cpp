@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -207,18 +208,34 @@ void CheckStreamConv(std::uint32_t n_tokens) {
   // The history buffer is read, not advanced.
   Require(d_history.Read() == history, "SsmConv4Streams wrote its history");
   if (n_tokens % 32 == 0) {
-    // The F16 output is the F32 result rounded (the same kernel computes
-    // both).
+    // The F16 output is the F32 result rounded. The two outputs come from
+    // separate template instantiations, so FMA contraction and fast-math
+    // SiLU can move the F32 value by an ulp before rounding: allow one F16
+    // step, and check the F16 output against the CPU reference as well.
     Device<__half> half(std::size_t{n_tokens} * kChannels);
     q::SsmConv4Streams(d_table.get(), kStride, kStreamTokens, d_w.get(),
                        d_history.get(), half.get(), n_tokens, kChannels,
                        nullptr, true);
     const auto h = half.Read();
+    std::size_t off_by_one = 0;
     for (std::size_t i = 0; i < h.size(); ++i) {
       const __half expected = __float2half_rn(f32[i]);
-      Require(std::memcmp(&expected, &h[i], sizeof(__half)) == 0,
-              "SsmConv4Streams F16 output is not the rounded F32 output");
+      std::uint16_t e = 0;
+      std::uint16_t g = 0;
+      std::memcpy(&e, &expected, sizeof(e));
+      std::memcpy(&g, &h[i], sizeof(g));
+      const int steps = std::abs(static_cast<int>(e) - static_cast<int>(g));
+      Require(steps <= 1 && ((e ^ g) & 0x8000) == 0,
+              "SsmConv4Streams F16 output is more than one F16 step from the "
+              "rounded F32 output");
+      off_by_one += steps;
+      const double got = __half2float(h[i]);
+      const double ref = f32[i];
+      Require(std::abs(got - ref) <= std::max(1e-3, 1e-3 * std::abs(ref)),
+              "SsmConv4Streams F16 output differs from the F32 output");
     }
+    std::cout << "stream conv F16: " << off_by_one << " of " << h.size()
+              << " one step off the rounded F32\n";
   }
   std::cout << "stream conv n=" << n_tokens << ": worst " << worst << "\n";
 }
