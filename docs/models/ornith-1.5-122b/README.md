@@ -9,7 +9,8 @@ per token (expert width 1024) plus one shared expert (width 1024); the hidden
 size is 3072. The GGUF carries one MTP layer that Gufo uses as a speculative
 draft. Native context is 262144 tokens; 65536 is the longest context tested.
 
-The tested GGUF is `Ornith-1.5-122B-Q4_K_M.gguf` (70.6 GiB). Most routed
+The tested GGUF is [`Ornith-1.5-122B-Q4_K_M.gguf`](https://huggingface.co/ornith-ai/Ornith-1.5-122B-GGUF/blob/8d5893d767c449a4f18dd08f4bb6d0d6d4426175/Ornith-1.5-122B-Q4_K_M.gguf)
+(70.6 GiB, SHA-256 in [model identities](artifacts/model-identities.json)). Most routed
 experts are Q4_K, and the down projections of 25 layers are Q6_K. A loaded
 server at context 65536 with MTP held about 85 GB of GTT.
 
@@ -25,7 +26,7 @@ MODEL=path/to/Ornith-1.5-122B-Q4_K_M.gguf
 ./result/bin/gufo prompt --model "$MODEL" --prompt "Explain virtual memory." --temperature 0
 ```
 
-Images need the projector, `mmproj-Ornith-1.5-122B-BF16.gguf`, passed with
+Images need the projector, [`mmproj-Ornith-1.5-122B-BF16.gguf`](https://huggingface.co/ornith-ai/Ornith-1.5-122B-GGUF/blob/8d5893d767c449a4f18dd08f4bb6d0d6d4426175/mmproj-Ornith-1.5-122B-BF16.gguf), passed with
 `--mmproj`. It fits the existing Qwen vision tower at projection width 3072.
 
 The model ships its own chat template. Gufo recognizes it by its SHA-256 and

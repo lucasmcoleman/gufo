@@ -1,40 +1,83 @@
 # Ornith 1.5 122B benchmarks
 
-AMD Strix Halo `gfx1151`, 128 GB unified memory. Gufo host builds with ROCm
-7.2.2 unless noted, `Ornith-1.5-122B-Q4_K_M.gguf`. Measured October 21, 2026,
-with each comparison inside one GPU admission hold so no other model shared
-the GPU. llama.cpp is `23f7aab` (`llama-bench -ngl 999 -fa 1`).
+AMD Strix Halo `gfx1151`, 128 GB unified memory. Gufo (Strycast `staging`
+plus this model's commits) versus llama.cpp `68d9053a`, the revision Strycast
+pins, on `Ornith-1.5-122B-Q4_K_M.gguf` ([files and revisions](README.md)).
+Both were compiled with host ROCm 7.2.2, not the pinned 7.2.3, and llama.cpp
+with the same `--amdgpu-unroll-threshold-local=600` HIP flag as the pinned
+recipe. HTTP through `tools/bench/model-bench.py`, greedy, thinking off.
+Measured October 28, 2026, inside one GPU admission hold so no other model
+shared the GPU.
 
-The first repetition in a fresh Gufo process is often slow (clock ramp and
-first-touch faults). Rows marked "clean" either drop it or come from rounds
-where it did not occur; treat any row with a large ± as unreliable.
+Gufo drafts 2 MTP tokens from the GGUF's own MTP layer. llama.cpp's
+`draft-mtp` loads the whole 72 GiB GGUF a second time as its draft model,
+which does not fit in 128 GB, so its MTP cells are N/A.
 
-## Prefill and decode, MTP off
+Positive gain favors Gufo.
+[Quality and measurement details](QUALITY.md)
 
-| Workload | Gufo | llama.cpp |
-| --- | ---: | ---: |
-| pp512 (t/s) | about 680 | about 510 |
-| tg128 (t/s) | 28.2 | 27.2 |
+## Single user, autoregressive
 
-Gufo at the commit that routes Q4_K routed experts to the MMQ vector kernels.
-Three later A/B rounds of the full stack measured tg128 28.11 to 28.18 and
-pp512 689 to 695.
+Approximately pp2048 / tg128; depth is the cached prefix in tokens. Depth
+131,072 is not measured yet.
 
-## Decode at context depth, MTP off
+<!-- bench:single-ar-q4km -->
+| Ornith 122B Q4_K_M AR<br>Depth (tokens) | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain | Gufo tg (tok/s) | llama.cpp tg (tok/s) | Gain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1014.29 | 368.06 | +175.6% | 28.14 | 26.70 | +5.4% |
+| 4,096 | 949.21 | 344.41 | +175.6% | 27.38 | 25.92 | +5.6% |
+| 8,192 | 886.06 | 327.77 | +170.3% | 26.63 | 25.18 | +5.8% |
+| 16,384 | 790.15 | 298.75 | +164.5% | 25.12 | 23.75 | +5.8% |
+| 32,768 | 648.42 | 252.70 | +156.6% | 22.72 | 21.48 | +5.8% |
+| 65,536 | 466.88 | 193.55 | +141.2% | 18.89 | 18.00 | +4.9% |
+<!-- /bench -->
 
-tg64 after the prompt is prepared to the given depth.
+## Single user, MTP
 
-| Depth | Gufo, generic attention | Gufo, 16-head shared KV | llama.cpp |
-| ---: | ---: | ---: | ---: |
-| 0 | about 28.3 | about 28.3 | 26.7 to 27.2 |
-| 16384 | 24.77 / 24.68 | 25.39 | 24.35 / 24.34 |
-| 32768 | 21.79 / 21.65 | 22.91 / 22.85 | 22.10 / 22.08 |
+Same workload as above with 2 MTP draft tokens. The mixed rows decode prose,
+the repetitive rows copy text. MTP stops paying off with depth: at 32,768
+mixed decode is 3% ahead of AR and repetitive is behind it, and at 65,536 both
+are slower than AR (18.28 and 18.36 against 18.89 tok/s). llama.cpp's cells
+are N/A because its `draft-mtp` loads the whole GGUF again as the draft model,
+which does not fit.
 
-Without the shared-KV variant, Gufo's split-K partials took 1069 us per call
-at depth 32768, against 889 us for llama.cpp's `flash_attn_tile`. Clean rounds
-only; one round of each arm had a slow repetition and is excluded.
+<!-- bench:single-mtp-q4km -->
+| Ornith 122B Q4_K_M MTP<br>Depth (tokens) | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain pp | Gufo tg mixed (tok/s) | llama.cpp tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | llama.cpp tg repetitive (tok/s) | Gain repetitive |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 987.93 | N/A | N/A | 31.37 | N/A | N/A | 32.20 | N/A | N/A |
+| 4,096 | 898.76 | N/A | N/A | 29.77 | N/A | N/A | 33.27 | N/A | N/A |
+| 8,192 | 830.84 | N/A | N/A | 30.98 | N/A | N/A | 31.20 | N/A | N/A |
+| 16,384 | 740.91 | N/A | N/A | 28.31 | N/A | N/A | 25.74 | N/A | N/A |
+| 32,768 | 624.95 | N/A | N/A | 23.32 | N/A | N/A | 21.78 | N/A | N/A |
+| 65,536 | 463.00 | N/A | N/A | 18.28 | N/A | N/A | 18.36 | N/A | N/A |
+<!-- /bench -->
 
-## MTP draft depth
+## Loading time
+
+<!-- bench:loading -->
+| Ornith 122B<br>Target | Gufo ready (s) | llama.cpp ready (s) | Gain |
+| --- | ---: | ---: | ---: |
+| Q4_K_M | 19.48 | 19.85 | +1.9% |
+<!-- /bench -->
+
+## Memory occupation
+
+Gufo holds 6 to 8 GiB more than llama.cpp at these context settings.
+
+<!-- bench:memory-q4km -->
+| Ornith 122B Q4_K_M AR<br>Workload | Gufo GiB | llama.cpp GiB | Gain |
+| --- | ---: | ---: | ---: |
+| pp2048 + tg128 | 77.48 | 71.15 | -8.2% |
+| 16K prefix, pp4096 + tg128 | 79.47 | 71.15 | -10.5% |
+<!-- /bench -->
+
+## Earlier measurements
+
+The sections below were measured October 21 to 23, 2026 on the gufo-org
+#299 base, before the rebase onto Strycast, and are kept for the MTP and
+weight-placement results they record.
+
+### MTP draft depth
 
 Fresh server per arm, six prompts of 256 tokens at temperature 0, thinking
 off, 4 GiB RAM cache.
@@ -47,7 +90,7 @@ off, 4 GiB RAM cache.
 Replies were identical across all arms. MTP-off tg128 on the same build was
 about 27.3 t/s.
 
-## Sampled requests with MTP
+### Sampled requests with MTP
 
 Six prompts of 256 tokens at temperature 0.6, top-p 0.95, top-k 20, fixed
 seeds, thinking off; the 12-token first prompt is excluded. Median decode rate
@@ -59,7 +102,7 @@ after the first token.
 | With sampled proposals | 2 | 31.4 | 637 / 1102 (58%) |
 | MTP off | | 27.8 | |
 
-## First token after load
+### First token after load
 
 Three fresh loads per arm, eight chat requests each (six distinct prompts of
 16 to 19 tokens, two exact repeats), MTP depth 2.
@@ -75,20 +118,7 @@ one routed-expert GEMM that normally takes about 1 ms ran for 2 to 7 s. The
 device-memory runs had 1.1 million pages migrated during their uncached
 requests and no stall. Cache hits answered in 3 to 5 ms in both arms.
 
-## Prefill at context depth
-
-pp512 after the prompt is prepared to the given depth, MTP off, two
-alternating rounds of three repetitions each (October 22, 2026, Gufo
-with the Ornith code at `277bed2d`, measured before rebasing onto `0928f63e`).
-
-| Depth | Gufo (t/s) | llama.cpp (t/s) |
-| ---: | ---: | ---: |
-| 0 | 713.8 / 707.4 | 492.8 / 516.0 |
-| 16384 | 517.8 / 514.7 | 381.5 / 376.6 |
-| 32768 | 428.0 / 426.6 | 310.0 / 308.2 |
-
 ## Not measured
 
-- The repository benchmark driver (`tools/bench/model-bench.py`) and its
-  pp2048 prose and copying workloads.
+- Depth 131,072, single user.
 - Concurrency above one session.
