@@ -385,13 +385,15 @@ bool Project(const DeviceMatrix& w, const float* x, const std::int32_t* ids,
 /// GUFO_GLM53_ROUTER_GEMM=sgemm: prefill router logits (F32 [experts x
 /// hidden]) as one hipBLAS SGEMM instead of FloatProjectWave<float>'s
 /// Kahan-compensated wave per output. Plain F32 accumulation, so near-tied
-/// top-8 choices can flip: quality-gated, off by default. Decode (<= 8
-/// tokens) and GUFO_GLM53_EXACT_PREFILL keep the wave kernel. Idea from the
-/// router GEMM of mikealanni/gufo 06094a2b / 92f05df6 (MIT, Mike Alani).
+/// top-8 choices can flip. On by default since the 2026-10-28 GPU A/B
+/// (prefill -2.5%, NLL within noise); GUFO_GLM53_ROUTER_GEMM=wave restores the
+/// wave kernel. Decode (<= 8 tokens) and GUFO_GLM53_EXACT_PREFILL keep the
+/// wave kernel. Idea from the router GEMM of mikealanni/gufo 06094a2b /
+/// 92f05df6 (MIT, Mike Alani).
 bool RouterSgemmEnabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("GUFO_GLM53_ROUTER_GEMM");
-    return v != nullptr && std::string_view(v) == "sgemm";
+    return v == nullptr || *v == '\0' || std::string_view(v) == "sgemm";
   }();
   return enabled;
 }

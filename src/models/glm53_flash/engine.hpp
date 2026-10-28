@@ -45,8 +45,10 @@ struct ModelOptions {
   /// Positions per sequence (MLA cache capacity). 0 = the GGUF's context
   /// length.
   std::uint32_t max_context{4096};
-  /// Tokens per executor pass; longer prefills run in several passes.
-  std::uint32_t prefill_chunk{256};
+  /// Tokens per executor pass; longer prefills run in several passes. 2048
+  /// since the 2026-10-28 chunk x MoE-tile sweep (2048-token prompt 13.4 s ->
+  /// 10.2 s, NLL within noise; EXPERIMENTS.md). Changes logits vs 256.
+  std::uint32_t prefill_chunk{2048};
   /// Compute the last prompt token's logits inside the final prefill pass
   /// (Executor::ForwardLast) rather than in an extra one-token pass. The
   /// environment variable GUFO_GLM53_FUSED_LAST_LOGITS=0 turns it off for A/B

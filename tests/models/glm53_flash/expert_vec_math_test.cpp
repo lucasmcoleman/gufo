@@ -105,8 +105,8 @@ void CheckParseMode() {
   const auto is = [](ev::Mode m, bool g, bool d) {
     return m.gate_up == g && m.down == d;
   };
-  Check("mode unset", is(ev::ParseMode(nullptr), false, false));
-  Check("mode empty", is(ev::ParseMode(""), false, false));
+  Check("mode unset", is(ev::ParseMode(nullptr), true, true));
+  Check("mode empty", is(ev::ParseMode(""), true, true));
   Check("mode 0", is(ev::ParseMode("0"), false, false));
   Check("mode 1", is(ev::ParseMode("1"), true, true));
   Check("mode all", is(ev::ParseMode("all"), true, true));

@@ -280,12 +280,13 @@ __global__ void MatmulQ6KHeadsRowsKernel(const std::uint8_t* w, const float* x,
   }
 }
 
-/// Rows per wave of MatmulQ6KHeadsRowsKernel (GUFO_GLM53_MLA_HEADS_ROWS: 4,
-/// or 2), 1 (the original kernel) by default.
+/// Rows per wave of MatmulQ6KHeadsRowsKernel (GUFO_GLM53_MLA_HEADS_ROWS: 4
+/// by default since the 2026-10-28 GPU A/B, bitwise and -1.5% prefill; 2, or
+/// 1 for the original kernel).
 unsigned HeadsRowsPerWave() {
   static const unsigned rows = [] {
     const char* v = std::getenv("GUFO_GLM53_MLA_HEADS_ROWS");
-    const int n = v != nullptr ? std::atoi(v) : 1;
+    const int n = v != nullptr && *v != '\0' ? std::atoi(v) : 4;
     return n == 4 ? 4U : n == 2 ? 2U : 1U;
   }();
   return rows;

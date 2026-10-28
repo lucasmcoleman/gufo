@@ -43,11 +43,13 @@ struct Mode {
   bool down{false};
 };
 
-/// Parses a GUFO_GLM53_EXPERT_VEC value: unset, empty, "0" or anything
-/// unknown is off; "1" / "all" both, "gateup" or "down" one of them.
+/// Parses a GUFO_GLM53_EXPERT_VEC value: unset or empty is both (the
+/// default since the 2026-10-28 GPU A/B, decode +5.2% / MTP +6.4%, NLL within
+/// noise); "0" or anything unknown is off; "1" / "all" both, "gateup" or
+/// "down" one of them.
 inline Mode ParseMode(const char* value) noexcept {
-  if (value == nullptr) {
-    return {};
+  if (value == nullptr || *value == '\0') {
+    return {.gate_up = true, .down = true};
   }
   if (std::strcmp(value, "1") == 0 || std::strcmp(value, "all") == 0) {
     return {.gate_up = true, .down = true};

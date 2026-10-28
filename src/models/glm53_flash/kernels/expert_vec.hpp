@@ -8,8 +8,8 @@
 // kernel over executor scratch, not a patch of his code. Block arithmetic:
 // expert_vec_math.hpp.
 //
-// Switch: GUFO_GLM53_EXPERT_VEC = 0 (default, the DS4 vendored mmvq path),
-// 1 / all (gate/up pair and down), gateup, down.
+// Switch: GUFO_GLM53_EXPERT_VEC = unset / 1 / all (default: gate/up pair
+// and down), gateup, down, or 0 (the DS4 vendored mmvq path).
 
 #include <cstddef>
 #include <cstdint>

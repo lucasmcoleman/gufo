@@ -47,11 +47,10 @@ launch remains for other shapes. No environment switch was added.
 This differs from the earlier rejected grid-striding experiment: the new
 list removes empty expert/column combinations from the launch bound.
 
-## Ideas ported from mikealanni/gufo, 2026-10-26 (unmeasured)
+## Ideas ported from mikealanni/gufo, 2026-10-26
 
-Source-only round (job 989): built, CPU-tested, not yet run on the GPU.
-Every switch is off by default; none changes the default path. The GPU
-round decides each one by an unprofiled A/B plus the quality gate.
+Source round (job 989, 2026-10-26), then a GPU round (2026-10-28, below)
+that decided each switch by an unprofiled A/B plus the quality gate.
 
 | Switch | What it does | Numerics |
 | --- | --- | --- |
@@ -62,6 +61,29 @@ round decides each one by an unprofiled A/B plus the quality gate.
 | `GUFO_GLM53_MLA_HEADS_ROWS=4` (or 2) | k_b / v_b head kernel with 4 rows per wave | expected bitwise |
 | `GUFO_GLM53_ROUTER_GEMM=sgemm` | Prefill router logits as one hipBLAS SGEMM | plain F32: quality gate |
 | `GUFO_GLM53_PREFILL_CHUNK=N` | Overrides the prefill chunk (1..8192) for the chunk x MoE tile sweep; the head projects at most 256 rows at a time | chunk != 256 changes logits |
+
+### GPU round result, 2026-10-28 (job 989)
+
+Unprofiled, counterbalanced runs on gfx1151 with Maya-S-v2 IQ2_XXS, one
+GPU job at a time. Logs and tables: /server/staging/glm53-borrow/gpu-round
+(RESULT.md). NLL deltas are paired, 95% CI.
+
+| Switch | Result | Verdict |
+| --- | --- | --- |
+| `GUFO_GLM53_EXPERT_VEC` | decode +5.2% plain, +6.4% MTP; NLL -0.0043 [-0.0191, +0.0097] (64 x 8-token passes) | on by default (`0` turns it off) |
+| `GUFO_GLM53_KDA_LOWRANK` | prefill -3.8%; NLL -0.0063 [-0.0210, +0.0076] | on by default (`0` off) |
+| `GUFO_GLM53_ROUTER_GEMM` | prefill -2.5%; NLL -0.0090 [-0.0309, +0.0060] | `sgemm` by default (`wave` off) |
+| `GUFO_GLM53_MLA_HEADS_ROWS` | prefill -1.5%, bitwise | 4 by default (`1` off) |
+| `prefill_chunk` | 2048-token prompt 13.4 s (256, MoE tile 16) -> 10.2 s (2048, tile 16); NLL on one 2048-token text -0.0068 [-0.0165, +0.0008] | 2048 by default |
+| `GUFO_GLM53_DECODE_GRAPH` | bitwise on the real model, 0.0% / -0.1% | dropped (stays off) |
+| `GUFO_GLM53_MLA_F16_QABS` | bitwise, -0.4% (noise) | dropped (stays off) |
+
+All five keepers together vs the old defaults (same session, rounds 2-3):
+decode plain 16.75 -> 17.62 tok/s (+5.2%), MTP 21.69 -> 24.37 tok/s
+(+12.3%); 2048-token prefill 13.69 -> 9.15 s (-33%); NLL on two 2048-token
+texts +0.0025 [-0.0070, +0.0106]. Prefill with MoE tile 64 at chunk 2048
+was another -5% but is not the default (wider quality CI, untested stacked).
+Not measured: prompts between 256 and 2048 tokens, and serve under load.
 
 Ideas are from Mike Alani's fork (MIT), commits c338778f, 5a394170,
 8808f1a0, 5b505adf, e5490fee, 3ec04be3, 2a9e953c, 3ba034e2, 92f05df6 and

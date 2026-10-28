@@ -227,13 +227,14 @@ std::size_t LayoutKdaScratch(const Config& config, std::uint32_t tokens,
   return offset;
 }
 
-/// GUFO_GLM53_KDA_LOWRANK=1: prefill f_b / g_b (Q8_0, D = 128 columns)
-/// through rocm::KdaLowRankQ8 instead of gufo's batched quant GEMM. Off by
-/// default until a GPU A/B; decode-sized passes keep the GEMM.
+/// GUFO_GLM53_KDA_LOWRANK (default on, =0 off): prefill f_b / g_b (Q8_0,
+/// D = 128 columns) through rocm::KdaLowRankQ8 instead of gufo's batched
+/// quant GEMM. On since the 2026-10-28 GPU A/B (prefill -3.8%, NLL within
+/// noise); decode-sized passes keep the GEMM.
 bool KdaLowRankEnabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("GUFO_GLM53_KDA_LOWRANK");
-    return v != nullptr && *v != '\0' && *v != '0';
+    return v == nullptr || *v == '\0' || *v != '0';
   }();
   return enabled;
 }
